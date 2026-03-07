@@ -358,6 +358,22 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
     el.dispatchEvent(new Event("input", {{ bubbles: true }}));
   }}
 
+  function dispatchSubmitClick(el) {{
+    if (!el) return;
+    try {{
+      el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true }}));
+      el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}));
+      el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true }}));
+      el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}));
+    }} catch (_) {{}}
+    try {{
+      el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true }}));
+    }} catch (_) {{}}
+    try {{
+      el.click();
+    }} catch (_) {{}}
+  }}
+
   const inputSelectors = [
     'textarea[placeholder*="message" i]',
     'textarea',
@@ -414,8 +430,7 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
   }}
 
   if (submitButton) {{
-    submitButton.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true }}));
-    submitButton.click();
+    dispatchSubmitClick(submitButton);
     return encode({{
       ok: true,
       submitted: true,
@@ -438,6 +453,9 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
   }}
 
   input.dispatchEvent(new KeyboardEvent("keydown", {{
+    key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true
+  }}));
+  input.dispatchEvent(new KeyboardEvent("keypress", {{
     key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true
   }}));
   input.dispatchEvent(new KeyboardEvent("keyup", {{
@@ -1854,12 +1872,19 @@ def cdp_fallback_submit(
     submit_mode = "none"
     if submit:
         if send_point and click_tools:
-            click_args = with_agent_variants(
-                [{"x": send_point[0], "y": send_point[1]}],
-                agent_id=agent_id,
-            )
-            click_tool, _ = call_tool_variants(client, click_tools, click_args, "cdp click submit")
-            submit_mode = f"{type_tool}+{click_tool}"
+            try:
+                click_args = with_agent_variants(
+                    [{"x": send_point[0], "y": send_point[1]}],
+                    agent_id=agent_id,
+                )
+                click_tool, _ = call_tool_variants(client, click_tools, click_args, "cdp click submit")
+                submit_mode = f"{type_tool}+{click_tool}"
+            except MCPError:
+                newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
+                enter_tool, _ = call_tool_variants(
+                    client, type_tools, newline_args, "cdp submit newline fallback"
+                )
+                submit_mode = f"{type_tool}+{enter_tool}"
         else:
             newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
             enter_tool, _ = call_tool_variants(
