@@ -2461,6 +2461,23 @@ def cdp_fallback_submit(
 
     submit_mode = "none"
     if submit:
+        def submit_via_newline(newline_label: str) -> Tuple[str, str]:
+            if input_point and click_tools:
+                try:
+                    focus_args = with_agent_variants(
+                        [{"x": input_point[0], "y": input_point[1]}],
+                        agent_id=agent_id,
+                    )
+                    call_tool_variants(client, click_tools, focus_args, "cdp refocus input")
+                    time.sleep(0.15)
+                except MCPError:
+                    pass
+            newline_args_local = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
+            enter_tool_local, _ = call_tool_variants(
+                client, type_tools, newline_args_local, newline_label
+            )
+            return type_tool, enter_tool_local
+
         if send_point and click_tools:
             try:
                 click_args = with_agent_variants(
@@ -2490,22 +2507,13 @@ def cdp_fallback_submit(
                         expected_prompt=prompt,
                     )
                 if (not submit_confirmed) and input_text_after_click:
-                    newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
-                    enter_tool, _ = call_tool_variants(
-                        client, type_tools, newline_args, "cdp submit newline fallback"
-                    )
+                    _, enter_tool = submit_via_newline("cdp submit newline fallback")
                     submit_mode = f"{submit_mode}+{enter_tool}"
             except MCPError:
-                newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
-                enter_tool, _ = call_tool_variants(
-                    client, type_tools, newline_args, "cdp submit newline fallback"
-                )
+                _, enter_tool = submit_via_newline("cdp submit newline fallback")
                 submit_mode = f"{type_tool}+{enter_tool}"
         else:
-            newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
-            enter_tool, _ = call_tool_variants(
-                client, type_tools, newline_args, "cdp submit newline"
-            )
+            _, enter_tool = submit_via_newline("cdp submit newline")
             submit_mode = f"{type_tool}+{enter_tool}"
 
     return {
@@ -2629,50 +2637,60 @@ def dispatch_prompt(
             poll_interval_s=poll_interval_s,
             debug=show_dispatch_details,
         )
-        if (not user_submitted) and (not response_text) and type_tools:
-            final_retry_probe = read_assistant_probe(
+        if (not user_submitted) and type_tools:
+            pre_retry_probe = read_assistant_probe(
                 client=client,
                 agent_id=agent_id,
                 js_tools=js_tools,
-                label="final-retry pre-fallback probe",
+                label="submit verification probe",
             )
-            retry_status = cdp_fallback_submit(
-                client=client,
-                agent_id=agent_id,
-                prompt=prompt,
-                js_tools=js_tools,
-                click_tools=click_tools,
-                type_tools=type_tools,
-                ddm_tools=ddm_tools,
-                layout_text=layout_text,
-                submit=submit,
-                baseline_probe=final_retry_probe,
-            )
-            fallback_used = True
-            turn_result["fallback_used"] = True
-            if echo_result and show_dispatch_details:
-                print(f"[final-retry] {json.dumps(retry_status)}")
-
-            retry_baseline = read_assistant_probe(
-                client=client,
-                agent_id=agent_id,
-                js_tools=js_tools,
-                label="final-retry baseline",
-            )
-            response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
-                client=client,
-                agent_id=agent_id,
-                js_tools=js_tools,
-                baseline_count=int((retry_baseline or {}).get("assistant_count") or 0),
-                baseline_hash=str((retry_baseline or {}).get("latest_hash") or ""),
-                baseline_user_count=int((retry_baseline or {}).get("user_count") or 0),
-                baseline_user_hash=str((retry_baseline or {}).get("latest_user_hash") or ""),
+            if probe_indicates_submit(
+                baseline_probe=baseline_probe,
+                probe=pre_retry_probe,
                 expected_prompt=prompt,
-                timeout_s=min(20, max(8, wait_timeout_s)),
-                poll_interval_s=poll_interval_s,
-                debug=show_dispatch_details,
-            )
-            capture_baseline_hash = str((retry_baseline or {}).get("latest_hash") or capture_baseline_hash)
+            ):
+                user_submitted = True
+                maybe_latest = str((pre_retry_probe or {}).get("latest_text") or "").strip()
+                if maybe_latest:
+                    response_text = maybe_latest
+            else:
+                retry_status = cdp_fallback_submit(
+                    client=client,
+                    agent_id=agent_id,
+                    prompt=prompt,
+                    js_tools=js_tools,
+                    click_tools=click_tools,
+                    type_tools=type_tools,
+                    ddm_tools=ddm_tools,
+                    layout_text=layout_text,
+                    submit=submit,
+                    baseline_probe=pre_retry_probe,
+                )
+                fallback_used = True
+                turn_result["fallback_used"] = True
+                if echo_result and show_dispatch_details:
+                    print(f"[final-retry] {json.dumps(retry_status)}")
+
+                retry_baseline = read_assistant_probe(
+                    client=client,
+                    agent_id=agent_id,
+                    js_tools=js_tools,
+                    label="final-retry baseline",
+                )
+                response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
+                    client=client,
+                    agent_id=agent_id,
+                    js_tools=js_tools,
+                    baseline_count=int((retry_baseline or {}).get("assistant_count") or 0),
+                    baseline_hash=str((retry_baseline or {}).get("latest_hash") or ""),
+                    baseline_user_count=int((retry_baseline or {}).get("user_count") or 0),
+                    baseline_user_hash=str((retry_baseline or {}).get("latest_user_hash") or ""),
+                    expected_prompt=prompt,
+                    timeout_s=min(20, max(8, wait_timeout_s)),
+                    poll_interval_s=poll_interval_s,
+                    debug=show_dispatch_details,
+                )
+                capture_baseline_hash = str((retry_baseline or {}).get("latest_hash") or capture_baseline_hash)
         if not user_submitted:
             raise MCPError(
                 "Prompt submit was not confirmed (no new user turn detected). "
