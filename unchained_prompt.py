@@ -489,6 +489,50 @@ def parse_dispatch_status_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def build_input_state_expression() -> str:
+    return """
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function currentInputText(el) {
+    if (!el) return "";
+    if ("value" in el) return String(el.value || "");
+    return String(el.textContent || "");
+  }
+
+  const inputSelectors = [
+    'textarea[placeholder*="message" i]',
+    'textarea',
+    '[contenteditable="true"][role="textbox"]',
+    'div[role="textbox"][contenteditable="true"]',
+    'div[contenteditable="true"]'
+  ];
+
+  let input = null;
+  for (const sel of inputSelectors) {
+    const candidates = Array.from(document.querySelectorAll(sel));
+    input = candidates.find(visible);
+    if (input) break;
+  }
+
+  if (!input) {
+    return JSON.stringify({ ok: false, text_after: "" });
+  }
+  return JSON.stringify({
+    ok: true,
+    text_after: currentInputText(input),
+    focused: document.activeElement === input
+  });
+})()
+""".strip()
+
+
 def build_assistant_probe_expression() -> str:
     return """
 (() => {
@@ -1052,6 +1096,29 @@ def read_assistant_probe(
     return probe
 
 
+def read_visible_input_text(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> str:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_input_state_expression(),
+            label="input state probe",
+        )
+    except MCPError:
+        return ""
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("text_after") or "")
+
+
 def capture_final_assistant_text(
     client: MCPClient,
     agent_id: str,
@@ -1193,6 +1260,28 @@ def probe_has_new_user_turn(
     return expected_norm[:80] in current_norm or current_norm[:80] in expected_norm
 
 
+def probe_indicates_submit(
+    baseline_probe: Optional[Dict[str, Any]],
+    probe: Optional[Dict[str, Any]],
+    expected_prompt: str,
+) -> bool:
+    if not probe:
+        return False
+    if probe_has_new_user_turn(baseline_probe, probe, expected_prompt):
+        return True
+
+    baseline_count = int((baseline_probe or {}).get("assistant_count") or 0)
+    baseline_hash = str((baseline_probe or {}).get("latest_hash") or "")
+    current_count = int((probe or {}).get("assistant_count") or 0)
+    current_hash = str((probe or {}).get("latest_hash") or "")
+    generating = bool((probe or {}).get("generating"))
+    if generating:
+        return True
+    return (current_count > baseline_count) or (
+        current_hash and baseline_hash and current_hash != baseline_hash
+    )
+
+
 def wait_for_assistant_response(
     client: MCPClient,
     agent_id: str,
@@ -1262,18 +1351,23 @@ def wait_for_assistant_response(
             current_user_hash and baseline_user_hash and current_user_hash != baseline_user_hash
         )
         if user_changed:
-            expected_norm = normalize_for_match(expected_prompt)
-            user_norm = normalize_for_match(current_user_text)
-            if not expected_norm:
+            if current_user_count > baseline_user_count:
                 user_submitted = True
-            elif user_norm and (
-                expected_norm[:80] in user_norm or user_norm[:80] in expected_norm
-            ):
-                user_submitted = True
+            else:
+                expected_norm = normalize_for_match(expected_prompt)
+                user_norm = normalize_for_match(current_user_text)
+                if not expected_norm:
+                    user_submitted = True
+                elif user_norm and (
+                    expected_norm[:80] in user_norm or user_norm[:80] in expected_norm
+                ):
+                    user_submitted = True
 
         # Some pages don't expose user turns reliably; when generation clearly started and
         # assistant output changed, treat prompt as submitted to avoid false negatives.
         if saw_generating and changed and current_text and not user_submitted and elapsed >= 6:
+            user_submitted = True
+        if (not user_submitted) and changed and current_text and elapsed >= 8:
             user_submitted = True
 
         if current_hash and current_hash == last_hash_seen:
@@ -1812,6 +1906,7 @@ def cdp_fallback_submit(
     ddm_tools: Sequence[str],
     layout_text: str,
     submit: bool,
+    baseline_probe: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     fresh_layout_text = layout_text
     if ddm_tools:
@@ -1846,8 +1941,18 @@ def cdp_fallback_submit(
             label="fallback js fill",
         )
         if fill_status is None or bool(fill_status.get("ok")):
-            typed_ok = True
-            type_tool = "js_fill"
+            input_after_fill = read_visible_input_text(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
+            expected_norm = normalize_for_match(prompt)
+            actual_norm = normalize_for_match(input_after_fill)
+            if expected_norm and actual_norm and (
+                expected_norm[:120] in actual_norm or actual_norm[:120] in expected_norm
+            ):
+                typed_ok = True
+                type_tool = "js_fill"
 
     # If JS fill is unavailable/failed, try coordinate click + cdp_type.
     if not typed_ok:
@@ -1862,6 +1967,20 @@ def cdp_fallback_submit(
         type_tool, type_result = call_tool_variants(client, type_tools, type_args, "cdp type prompt")
         typed_text = extract_text(type_result).lower()
         typed_ok = "no input focused" not in typed_text
+        if typed_ok:
+            input_after_type = read_visible_input_text(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
+            expected_norm = normalize_for_match(prompt)
+            actual_norm = normalize_for_match(input_after_type)
+            if expected_norm and actual_norm:
+                typed_ok = (
+                    expected_norm[:120] in actual_norm or actual_norm[:120] in expected_norm
+                )
+            elif expected_norm and (not actual_norm):
+                typed_ok = False
         time.sleep(0.35)
 
     if not typed_ok:
@@ -1879,6 +1998,32 @@ def cdp_fallback_submit(
                 )
                 click_tool, _ = call_tool_variants(client, click_tools, click_args, "cdp click submit")
                 submit_mode = f"{type_tool}+{click_tool}"
+                time.sleep(0.35)
+
+                input_text_after_click = read_visible_input_text(
+                    client=client,
+                    agent_id=agent_id,
+                    js_tools=js_tools,
+                ).strip()
+                submit_confirmed = False
+                if baseline_probe:
+                    probe_after_click = read_assistant_probe(
+                        client=client,
+                        agent_id=agent_id,
+                        js_tools=js_tools,
+                        label="fallback post-click probe",
+                    )
+                    submit_confirmed = probe_indicates_submit(
+                        baseline_probe=baseline_probe,
+                        probe=probe_after_click,
+                        expected_prompt=prompt,
+                    )
+                if (not submit_confirmed) and input_text_after_click:
+                    newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
+                    enter_tool, _ = call_tool_variants(
+                        client, type_tools, newline_args, "cdp submit newline fallback"
+                    )
+                    submit_mode = f"{submit_mode}+{enter_tool}"
             except MCPError:
                 newline_args = with_agent_variants([{"text": "\n"}], agent_id=agent_id)
                 enter_tool, _ = call_tool_variants(
@@ -1956,6 +2101,7 @@ def dispatch_prompt(
                 ddm_tools=ddm_tools,
                 layout_text=layout_text,
                 submit=submit,
+                baseline_probe=baseline_probe,
             )
             if echo_result and show_dispatch_details:
                 print(f"[{tool}] {result_text}")
@@ -1986,6 +2132,7 @@ def dispatch_prompt(
                 ddm_tools=ddm_tools,
                 layout_text=layout_text,
                 submit=submit,
+                baseline_probe=post_dispatch_probe,
             )
             fallback_used = True
             turn_result["fallback_used"] = True
@@ -2012,6 +2159,12 @@ def dispatch_prompt(
             debug=show_dispatch_details,
         )
         if (not user_submitted) and (not response_text) and type_tools:
+            final_retry_probe = read_assistant_probe(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+                label="final-retry pre-fallback probe",
+            )
             retry_status = cdp_fallback_submit(
                 client=client,
                 agent_id=agent_id,
@@ -2022,6 +2175,7 @@ def dispatch_prompt(
                 ddm_tools=ddm_tools,
                 layout_text=layout_text,
                 submit=submit,
+                baseline_probe=final_retry_probe,
             )
             fallback_used = True
             turn_result["fallback_used"] = True
