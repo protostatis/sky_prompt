@@ -1930,17 +1930,33 @@ def choose_input_point(points: Sequence[Tuple[str, int, int]]) -> Optional[Tuple
     ranked: List[Tuple[int, int, int]] = []
     for label, x, y in points:
         lower = label.lower()
+        if any(
+            blocked in lower
+            for blocked in (
+                "edit message",
+                "copy",
+                "share",
+                "good response",
+                "bad response",
+                "open conversation options",
+                "previous response",
+                "next response",
+                "send",
+                "cancel",
+            )
+        ):
+            continue
         score = -1
         if label.startswith(">"):
             score = 100
         elif "ask anything" in lower:
             score = 95
-        elif "message" in lower:
+        elif "textarea" in lower or "textbox" in lower:
+            score = 90
+        elif lower.startswith("message") or "message chatgpt" in lower:
             score = 85
         elif "prompt" in lower and "send" not in lower:
             score = 70
-        elif "textbox" in lower:
-            score = 65
         if score >= 0:
             ranked.append((score, x, y))
     if not ranked:
@@ -2462,7 +2478,13 @@ def cdp_fallback_submit(
     submit_mode = "none"
     if submit:
         def submit_via_newline(newline_label: str) -> Tuple[str, str]:
-            if input_point and click_tools:
+            current_input_text = read_visible_input_text(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            ).strip()
+            should_refocus = not current_input_text
+            if should_refocus and input_point and click_tools:
                 try:
                     focus_args = with_agent_variants(
                         [{"x": input_point[0], "y": input_point[1]}],
