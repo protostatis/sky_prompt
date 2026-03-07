@@ -808,7 +808,8 @@ def build_assistant_snapshot_expression() -> str:
       if (DROP_LINE_SET.has(lower)) {
         continue;
       }
-      if (LANGUAGE_LINE_SET.has(lower)) {
+      const languageTagMatch = lower.match(/^(python|bash|shell|javascript|typescript|json|csv|sql|plain text)[\\s:.-]*$/);
+      if (LANGUAGE_LINE_SET.has(lower) || !!languageTagMatch) {
         const prev = i > 0 ? lines[i - 1].trim() : "";
         const next = i + 1 < lines.length ? lines[i + 1].trim() : "";
         if (looksLikeCodeLine(prev) || looksLikeCodeLine(next)) {
@@ -818,6 +819,10 @@ def build_assistant_snapshot_expression() -> str:
       filtered.push(line);
     }
     let joined = filtered.join("\\n");
+    // Merge list markers that can be split by nested block elements.
+    joined = joined.replace(/(^|\\n)([-*]|\\d+\\.)\\s*\\n(?=\\S)/g, "$1$2 ");
+    // Preserve spacing between adjacent inline fragments that lost whitespace.
+    joined = joined.replace(/([A-Za-z0-9\\)])\\(/g, "$1 (");
     joined = joined.replace(/\\n{3,}/g, "\\n\\n");
     return cleanText(joined);
   }
@@ -929,9 +934,15 @@ def build_assistant_snapshot_expression() -> str:
         return;
       }
       let chunk = collapsed.trim();
-      if (pendingSpace && parts.length) {
+      if (parts.length) {
         const prev = parts[parts.length - 1];
-        if (prev && !prev.endsWith("\\n") && !prev.endsWith(" ")) {
+        const needsGapFromBoundary =
+          !!prev &&
+          !prev.endsWith("\\n") &&
+          !prev.endsWith(" ") &&
+          /[A-Za-z0-9\\)]$/.test(prev) &&
+          /^[A-Za-z0-9\\(]/.test(chunk);
+        if ((pendingSpace || needsGapFromBoundary) && prev && !prev.endsWith("\\n") && !prev.endsWith(" ")) {
           chunk = " " + chunk;
         }
       }
