@@ -113,6 +113,8 @@ Interactive shell mode (default when no prompt is passed):
 ./unchained
 ```
 
+Inside `-i`, Up/Down arrows recall your previous prompts (saved in `~/.sky_prompt_history`).
+
 Explicit flags:
 
 ```bash

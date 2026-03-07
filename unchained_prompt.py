@@ -17,6 +17,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 DEFAULT_ENDPOINT = "https://api.unchainedsky.com/mcp"
 DEFAULT_URL = "https://chatgpt.com"
 DEFAULT_AGENT_ENV_PATH = Path.home() / "unchained-agent" / ".env"
+DEFAULT_REPL_HISTORY_PATH = Path.home() / ".sky_prompt_history"
+DEFAULT_REPL_HISTORY_LIMIT = 1000
 DEFAULT_WAIT_TIMEOUT = 180
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_RENDER_STABLE_POLLS = 3
@@ -1630,6 +1632,68 @@ def history_preview(text: str, limit: int = 96) -> str:
     return collapsed[: max(8, limit - 1)] + "…"
 
 
+def setup_repl_readline_history(
+    history_path: Path = DEFAULT_REPL_HISTORY_PATH,
+) -> Tuple[Optional[Any], Optional[Path]]:
+    try:
+        import readline  # type: ignore
+    except Exception:
+        return None, None
+
+    try:
+        doc = str(getattr(readline, "__doc__", "") or "").lower()
+        if "libedit" in doc:
+            readline.parse_and_bind("bind ^[[A ed-search-prev-history")
+            readline.parse_and_bind("bind ^[[B ed-search-next-history")
+        else:
+            readline.parse_and_bind('"\e[A": previous-history')
+            readline.parse_and_bind('"\e[B": next-history')
+    except Exception:
+        pass
+
+    try:
+        if history_path.is_file():
+            readline.read_history_file(str(history_path))
+    except Exception:
+        pass
+    return readline, history_path
+
+
+def add_repl_history_entry(readline_mod: Optional[Any], line: str) -> None:
+    if not readline_mod:
+        return
+    entry = str(line or "").strip()
+    if not entry:
+        return
+    try:
+        current_len = int(readline_mod.get_current_history_length())
+        if current_len > 0:
+            last_entry = readline_mod.get_history_item(current_len)
+            if isinstance(last_entry, str) and last_entry.strip() == entry:
+                return
+        readline_mod.add_history(entry)
+    except Exception:
+        return
+
+
+def flush_repl_history(
+    readline_mod: Optional[Any],
+    history_path: Optional[Path],
+    limit: int = DEFAULT_REPL_HISTORY_LIMIT,
+) -> None:
+    if not readline_mod or not history_path:
+        return
+    try:
+        readline_mod.set_history_length(int(limit))
+    except Exception:
+        pass
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        readline_mod.write_history_file(str(history_path))
+    except Exception:
+        return
+
+
 def normalize_for_match(value: str) -> str:
     return " ".join(str(value or "").lower().split())
 
@@ -2127,6 +2191,7 @@ def run_repl(
     submit_enabled = submit
     output_mode = output_format
     history: List[Dict[str, Any]] = []
+    readline_mod, readline_history_path = setup_repl_readline_history()
     current_layout_text = navigate_current_page(
         client, agent_id, current_url, navigate_tools, verbose=debug
     )
@@ -2177,125 +2242,129 @@ def run_repl(
             }
         )
 
-    while True:
-        try:
-            line = input("> ").strip()
-        except EOFError:
-            print()
-            break
-        if not line:
-            continue
-        lower = line.lower()
-        if lower in {"quit", "exit", ":q", "/exit", "/quit"}:
-            break
-        if lower in {"/help", "/h"}:
-            print(
-                "/url <url> | /submit on|off | /format markdown|plain|json | "
-                "/history [n] | /last | /ddm | /exit"
-            )
-            continue
-        if lower.startswith("/url "):
-            next_url = line[5:].strip()
-            if not next_url:
-                print("usage: /url https://example.com")
+    try:
+        while True:
+            try:
+                line = input("> ").strip()
+            except EOFError:
+                print()
+                break
+            if not line:
                 continue
-            current_url = next_url
-            current_layout_text = navigate_current_page(
-                client, agent_id, current_url, navigate_tools, verbose=debug
-            )
-            continue
-        if lower.startswith("/submit "):
-            mode = line.split(None, 1)[1].strip().lower()
-            if mode in {"on", "true", "1"}:
-                submit_enabled = True
-                print("submit: on")
-            elif mode in {"off", "false", "0"}:
-                submit_enabled = False
-                print("submit: off")
-            else:
-                print("usage: /submit on|off")
-            continue
-        if lower == "/ddm":
-            maybe_show_ddm(client, agent_id, ddm_tools)
-            continue
-        if lower.startswith("/format "):
-            mode = line.split(None, 1)[1].strip().lower()
-            if mode in SUPPORTED_OUTPUT_FORMATS:
-                output_mode = mode
-                print(f"format: {output_mode}")
-            else:
-                print("usage: /format markdown|plain|json")
-            continue
-        if lower == "/last":
-            if not history:
-                print("history: empty")
+            add_repl_history_entry(readline_mod, line)
+            lower = line.lower()
+            if lower in {"quit", "exit", ":q", "/exit", "/quit"}:
+                break
+            if lower in {"/help", "/h"}:
+                print(
+                    "/url <url> | /submit on|off | /format markdown|plain|json | "
+                    "/history [n] | /last | /ddm | /exit"
+                )
                 continue
-            entry = history[-1]
-            print("user>")
-            print(str(entry.get("prompt") or ""))
-            assistant_text = str(entry.get("assistant_text") or "").strip()
-            if not assistant_text:
-                print("assistant> (no response captured)")
+            if lower.startswith("/url "):
+                next_url = line[5:].strip()
+                if not next_url:
+                    print("usage: /url https://example.com")
+                    continue
+                current_url = next_url
+                current_layout_text = navigate_current_page(
+                    client, agent_id, current_url, navigate_tools, verbose=debug
+                )
                 continue
-            rendered = format_assistant_output(
-                text=assistant_text,
-                output_format=output_mode,
-                snapshot=None,
-            )
-            if output_mode == "json":
-                print(rendered)
-            else:
-                print("assistant>")
-                print(rendered)
-            continue
-        if lower == "/history" or lower.startswith("/history "):
-            parts = line.split()
-            limit = 10
-            if len(parts) == 2:
-                try:
-                    limit = max(1, int(parts[1]))
-                except ValueError:
+            if lower.startswith("/submit "):
+                mode = line.split(None, 1)[1].strip().lower()
+                if mode in {"on", "true", "1"}:
+                    submit_enabled = True
+                    print("submit: on")
+                elif mode in {"off", "false", "0"}:
+                    submit_enabled = False
+                    print("submit: off")
+                else:
+                    print("usage: /submit on|off")
+                continue
+            if lower == "/ddm":
+                maybe_show_ddm(client, agent_id, ddm_tools)
+                continue
+            if lower.startswith("/format "):
+                mode = line.split(None, 1)[1].strip().lower()
+                if mode in SUPPORTED_OUTPUT_FORMATS:
+                    output_mode = mode
+                    print(f"format: {output_mode}")
+                else:
+                    print("usage: /format markdown|plain|json")
+                continue
+            if lower == "/last":
+                if not history:
+                    print("history: empty")
+                    continue
+                entry = history[-1]
+                print("user>")
+                print(str(entry.get("prompt") or ""))
+                assistant_text = str(entry.get("assistant_text") or "").strip()
+                if not assistant_text:
+                    print("assistant> (no response captured)")
+                    continue
+                rendered = format_assistant_output(
+                    text=assistant_text,
+                    output_format=output_mode,
+                    snapshot=None,
+                )
+                if output_mode == "json":
+                    print(rendered)
+                else:
+                    print("assistant>")
+                    print(rendered)
+                continue
+            if lower == "/history" or lower.startswith("/history "):
+                parts = line.split()
+                limit = 10
+                if len(parts) == 2:
+                    try:
+                        limit = max(1, int(parts[1]))
+                    except ValueError:
+                        print("usage: /history [n]")
+                        continue
+                elif len(parts) > 2:
                     print("usage: /history [n]")
                     continue
-            elif len(parts) > 2:
-                print("usage: /history [n]")
-                continue
 
-            if not history:
-                print("history: empty")
+                if not history:
+                    print("history: empty")
+                    continue
+                start = max(0, len(history) - limit)
+                for idx, entry in enumerate(history[start:], start=start + 1):
+                    user_preview = history_preview(str(entry.get("prompt") or ""), limit=72)
+                    assistant_preview = history_preview(str(entry.get("assistant_text") or ""), limit=88)
+                    if not assistant_preview:
+                        assistant_preview = "(no response captured)"
+                    print(f"[{idx}] user: {user_preview}")
+                    print(f"    assistant: {assistant_preview}")
                 continue
-            start = max(0, len(history) - limit)
-            for idx, entry in enumerate(history[start:], start=start + 1):
-                user_preview = history_preview(str(entry.get("prompt") or ""), limit=72)
-                assistant_preview = history_preview(str(entry.get("assistant_text") or ""), limit=88)
-                if not assistant_preview:
-                    assistant_preview = "(no response captured)"
-                print(f"[{idx}] user: {user_preview}")
-                print(f"    assistant: {assistant_preview}")
-            continue
-        result = dispatch_prompt(
-            client=client,
-            agent_id=agent_id,
-            prompt=line,
-            js_tools=js_tools,
-            click_tools=click_tools,
-            type_tools=type_tools,
-            ddm_tools=ddm_tools,
-            submit=submit_enabled,
-            output_format=output_mode,
-            layout_text=current_layout_text,
-            echo_result=True,
-            wait_for_response=submit_enabled,
-            wait_timeout_s=wait_timeout_s,
-            poll_interval_s=poll_interval_s,
-            show_dispatch_details=debug,
-        )
-        history.append(
-            {
-                "prompt": line,
-                "assistant_text": str(result.get("assistant_text") or ""),
-            }
-        )
+            result = dispatch_prompt(
+                client=client,
+                agent_id=agent_id,
+                prompt=line,
+                js_tools=js_tools,
+                click_tools=click_tools,
+                type_tools=type_tools,
+                ddm_tools=ddm_tools,
+                submit=submit_enabled,
+                output_format=output_mode,
+                layout_text=current_layout_text,
+                echo_result=True,
+                wait_for_response=submit_enabled,
+                wait_timeout_s=wait_timeout_s,
+                poll_interval_s=poll_interval_s,
+                show_dispatch_details=debug,
+            )
+            history.append(
+                {
+                    "prompt": line,
+                    "assistant_text": str(result.get("assistant_text") or ""),
+                }
+            )
+    finally:
+        flush_repl_history(readline_mod, readline_history_path)
 
 
 def cdp_fallback_submit(
