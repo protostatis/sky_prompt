@@ -1231,14 +1231,14 @@ def wait_for_assistant_response(
         changed = (current_count > baseline_count) or (
             current_hash and baseline_hash and current_hash != baseline_hash
         )
+        if current_text and changed:
+            last_text = current_text
         generating = bool(probe.get("generating"))
         if generating:
             saw_generating = True
             generating_stopped_at = None
         elif changed and current_text and generating_stopped_at is None:
             generating_stopped_at = time.time()
-        if current_text:
-            last_text = current_text
 
         user_changed = (current_user_count > baseline_user_count) or (
             current_user_hash and baseline_user_hash and current_user_hash != baseline_user_hash

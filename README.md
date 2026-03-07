@@ -12,6 +12,69 @@ Minimal terminal CLI to send prompts into a real browser tab (for sites like `ht
 - Falls back to native MCP actions (`cdp_type` + `cdp_click`) if JS submit is not confirmed
 - Shows a terminal thinking indicator and waits for render completion before final response capture
 
+## Install
+
+```bash
+git clone https://github.com/protostatis/sky_prompt.git
+cd sky_prompt
+./unchained --help
+```
+
+Optional alias setup (recommended):
+
+```bash
+./unchained --setup-alias sky
+sky --help
+```
+
+## Quickstart
+
+1. Start Unchained agent:
+
+```bash
+curl -fsSL https://api.unchainedsky.com/install.sh | bash
+cd ~/unchained-agent
+./start.sh --daemon
+```
+
+2. Export credentials:
+
+```bash
+export UNCHAINED_API_KEY="uc_live_..."
+export UNCHAINED_AGENT_ID="claude-xxxxxxxx"
+```
+
+3. Run one-shot prompt:
+
+```bash
+sky -p "Explain MCP in one paragraph"
+```
+
+4. Run interactive mode:
+
+```bash
+sky -i
+```
+
+## Demo
+
+One-shot on ChatGPT:
+
+```bash
+sky --url https://chatgpt.com -p "Write a 5-line Python script for a Poisson PMF"
+```
+
+Interactive demo with format switching:
+
+```bash
+sky -i
+# then inside shell:
+/format markdown
+show me a numpy ascii chart for poisson(lambda=4)
+/format plain
+now summarize in 3 bullets
+```
+
 ## Prerequisites
 
 1. Install and run the Unchained agent on your Mac:
