@@ -24,6 +24,99 @@ DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
+LANGUAGE_ALIASES: Dict[str, str] = {
+    "py": "python",
+    "python3": "python",
+    "shell": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "console": "bash",
+}
+RUNNER_BY_LANGUAGE: Dict[str, str] = {
+    "python": "python",
+    "bash": "bash",
+    "javascript": "node",
+    "js": "node",
+    "typescript": "ts-node",
+    "ts": "ts-node",
+    "ruby": "ruby",
+    "perl": "perl",
+}
+SHELL_PREFIXES: Tuple[str, ...] = (
+    "pip ",
+    "python ",
+    "python3 ",
+    "uv ",
+    "npm ",
+    "pnpm ",
+    "yarn ",
+    "brew ",
+    "apt ",
+    "apt-get ",
+    "conda ",
+    "git ",
+    "curl ",
+    "wget ",
+    "chmod ",
+    "chown ",
+    "ls ",
+    "cd ",
+    "mkdir ",
+    "rm ",
+    "cp ",
+    "mv ",
+    "echo ",
+    "./",
+    "bash ",
+    "sh ",
+    "zsh ",
+    "node ",
+    "npx ",
+    "docker ",
+    "kubectl ",
+    "poetry ",
+    "pytest ",
+    "make ",
+    "cargo ",
+    "go ",
+)
+SHELL_BINARIES: set = {
+    "pip",
+    "python",
+    "python3",
+    "uv",
+    "npm",
+    "pnpm",
+    "yarn",
+    "brew",
+    "apt",
+    "apt-get",
+    "conda",
+    "git",
+    "curl",
+    "wget",
+    "chmod",
+    "chown",
+    "ls",
+    "cd",
+    "mkdir",
+    "rm",
+    "cp",
+    "mv",
+    "echo",
+    "bash",
+    "sh",
+    "zsh",
+    "node",
+    "npx",
+    "docker",
+    "kubectl",
+    "poetry",
+    "pytest",
+    "make",
+    "cargo",
+    "go",
+}
 PREFERRED_NAVIGATE_TOOLS = ("cdp_navigate", "navigate")
 PREFERRED_JS_TOOLS = ("js_eval", "execute_js")
 PREFERRED_CLICK_TOOLS = ("cdp_click", "click")
@@ -1187,6 +1280,313 @@ def markdown_to_plain_text(markdown_text: str) -> str:
     return text.strip()
 
 
+def normalize_code_language(language: str) -> str:
+    raw = str(language or "").strip().lower()
+    if not raw:
+        return ""
+    return LANGUAGE_ALIASES.get(raw, raw)
+
+
+def infer_language_from_code(content: str) -> str:
+    stripped = str(content or "").strip()
+    if not stripped:
+        return ""
+    first_line = stripped.splitlines()[0].strip()
+    if first_line.startswith("#!/") and "python" in first_line:
+        return "python"
+    if first_line.startswith("#!/") and any(x in first_line for x in ("bash", "sh", "zsh")):
+        return "bash"
+
+    lowered = stripped.lower()
+    if any(lowered.startswith(prefix) for prefix in SHELL_PREFIXES):
+        return "bash"
+
+    python_markers = (
+        "import ",
+        "from ",
+        "def ",
+        "class ",
+        "print(",
+        "np.",
+        "pd.",
+    )
+    if any(marker in lowered for marker in python_markers):
+        return "python"
+    return ""
+
+
+def language_runner(language: str) -> Optional[str]:
+    normalized = normalize_code_language(language)
+    return RUNNER_BY_LANGUAGE.get(normalized)
+
+
+def split_markdown_with_fenced_blocks(markdown_text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    pattern = re.compile(r"```([A-Za-z0-9_.+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+    segments: List[Dict[str, Any]] = []
+    code_blocks: List[Dict[str, Any]] = []
+    last_end = 0
+    text_id = 1
+    code_id = 1
+
+    for match in pattern.finditer(markdown_text):
+        prefix = markdown_text[last_end : match.start()]
+        if prefix.strip():
+            segments.append({"id": f"text_{text_id}", "type": "text", "text": prefix.strip()})
+            text_id += 1
+
+        declared = normalize_code_language(match.group(1))
+        content = str(match.group(2) or "").strip("\n")
+        inferred = infer_language_from_code(content)
+        language = declared or inferred or "text"
+        runner = language_runner(language)
+        block = {
+            "id": f"code_{code_id}",
+            "type": "code_block",
+            "source": "fenced",
+            "language": language,
+            "declared_language": declared or None,
+            "inferred_language": inferred or None,
+            "runner": runner,
+            "executable": bool(runner),
+            "content": content,
+        }
+        code_blocks.append(block)
+        segments.append(
+            {
+                "id": block["id"],
+                "type": "code",
+                "language": language,
+                "text": content,
+            }
+        )
+        code_id += 1
+        last_end = match.end()
+
+    suffix = markdown_text[last_end:]
+    if suffix.strip():
+        segments.append({"id": f"text_{text_id}", "type": "text", "text": suffix.strip()})
+
+    if not segments and markdown_text.strip():
+        segments.append({"id": "text_1", "type": "text", "text": markdown_text.strip()})
+    return segments, code_blocks
+
+
+def normalize_shell_candidate_line(raw_line: str) -> str:
+    line = str(raw_line or "").strip()
+    line = re.sub(r"^\s*[-*]\s+", "", line)
+    line = re.sub(r"^\s*\d+\.\s+", "", line)
+    if line.startswith("$ "):
+        line = line[2:].strip()
+    return line
+
+
+def looks_like_shell_command_line(raw_line: str) -> bool:
+    line = normalize_shell_candidate_line(raw_line)
+    if not line:
+        return False
+    if line.startswith("#"):
+        return False
+    lower = line.lower()
+    if any(lower.startswith(prefix) for prefix in SHELL_PREFIXES):
+        return True
+
+    first = line.split()[0].lower()
+    if first in SHELL_BINARIES:
+        return True
+    if first.startswith("./") or "/" in first:
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", first) and len(line.split()) > 1 and first in SHELL_BINARIES:
+        return True
+    return False
+
+
+def extract_command_blocks_from_text(text: str, start_index: int) -> List[Dict[str, Any]]:
+    lines = str(text or "").splitlines()
+    blocks: List[Dict[str, Any]] = []
+    i = 0
+    index = start_index
+    while i < len(lines):
+        if not looks_like_shell_command_line(lines[i]):
+            i += 1
+            continue
+        commands: List[str] = []
+        while i < len(lines) and looks_like_shell_command_line(lines[i]):
+            candidate = normalize_shell_candidate_line(lines[i])
+            if candidate:
+                commands.append(candidate)
+            i += 1
+        if not commands:
+            continue
+        block = {
+            "id": f"command_{index}",
+            "type": "command_block",
+            "language": "bash",
+            "runner": "bash",
+            "executable": True,
+            "commands": commands,
+            "content": "\n".join(commands),
+        }
+        blocks.append(block)
+        index += 1
+    return blocks
+
+
+def looks_like_python_code_line(raw_line: str) -> bool:
+    line = str(raw_line or "").rstrip()
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    if re.match(r"^(from|import|def|class|for|while|if|elif|else|try|except|with|return|yield|assert)\b", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped):
+        return True
+    if re.search(r"\b(np|pd|plt)\.[A-Za-z_]", stripped):
+        return True
+    if stripped.endswith(":") and re.match(r"^(for|while|if|elif|else|def|class|try|except|with)\b", stripped):
+        return True
+    return False
+
+
+def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[str, Any]]:
+    lines = str(text or "").splitlines()
+    blocks: List[Dict[str, Any]] = []
+    i = 0
+    index = start_index
+
+    while i < len(lines):
+        if not looks_like_python_code_line(lines[i]):
+            i += 1
+            continue
+        start = i
+        collected: List[str] = []
+        strong_markers = 0
+        while i < len(lines):
+            current = lines[i]
+            if looks_like_python_code_line(current):
+                collected.append(current.rstrip())
+                trimmed = current.strip()
+                if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed:
+                    strong_markers += 1
+                i += 1
+                continue
+            if current.strip() == "" and collected:
+                collected.append("")
+                i += 1
+                continue
+            break
+
+        while collected and not collected[0].strip():
+            collected.pop(0)
+        while collected and not collected[-1].strip():
+            collected.pop()
+        non_empty = [line for line in collected if line.strip()]
+        if len(non_empty) >= 3 and strong_markers >= 1:
+            content = "\n".join(collected)
+            blocks.append(
+                {
+                    "id": f"code_inferred_{index}",
+                    "type": "code_block",
+                    "source": "inferred_text",
+                    "language": "python",
+                    "declared_language": None,
+                    "inferred_language": "python",
+                    "runner": "python",
+                    "executable": True,
+                    "content": content,
+                }
+            )
+            index += 1
+            continue
+
+        i = start + 1
+    return blocks
+
+
+def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
+    text = str(markdown_text or "").strip()
+    segments, fenced_code_blocks = split_markdown_with_fenced_blocks(text)
+    command_blocks: List[Dict[str, Any]] = []
+    inferred_code_blocks: List[Dict[str, Any]] = []
+    command_index = 1
+    inferred_index = 1
+
+    for segment in segments:
+        if segment.get("type") != "text":
+            continue
+        segment_text = str(segment.get("text") or "")
+        extracted_commands = extract_command_blocks_from_text(segment_text, command_index)
+        command_blocks.extend(extracted_commands)
+        command_index += len(extracted_commands)
+
+        extracted_python = extract_python_blocks_from_text(segment_text, inferred_index)
+        inferred_code_blocks.extend(extracted_python)
+        inferred_index += len(extracted_python)
+
+    code_blocks = fenced_code_blocks + inferred_code_blocks
+    copy_items: List[Dict[str, Any]] = []
+    for block in code_blocks:
+        copy_items.append(
+            {
+                "id": block["id"],
+                "kind": "code_block",
+                "language": block.get("language"),
+                "content": block.get("content", ""),
+            }
+        )
+    for block in command_blocks:
+        copy_items.append(
+            {
+                "id": block["id"],
+                "kind": "command_block",
+                "language": "bash",
+                "content": block.get("content", ""),
+                "commands": block.get("commands", []),
+            }
+        )
+
+    tool_hints: List[Dict[str, Any]] = []
+    for block in code_blocks:
+        runner = str(block.get("runner") or "").strip()
+        if not runner:
+            continue
+        command = ""
+        if runner == "python":
+            command = "python <script.py>"
+        elif runner == "bash":
+            command = "bash <script.sh>"
+        elif runner == "node":
+            command = "node <script.js>"
+        if command:
+            tool_hints.append(
+                {
+                    "kind": "script",
+                    "source_id": block["id"],
+                    "runner": runner,
+                    "command": command,
+                }
+            )
+    for block in command_blocks:
+        for command in block.get("commands", []):
+            tool_hints.append(
+                {
+                    "kind": "shell_command",
+                    "source_id": block["id"],
+                    "runner": "bash",
+                    "command": command,
+                }
+            )
+
+    return {
+        "segments": segments,
+        "code_blocks": code_blocks,
+        "command_blocks": command_blocks,
+        "copy_items": copy_items,
+        "tool_hints": tool_hints[:64],
+    }
+
+
 def format_assistant_output(
     text: Optional[str],
     output_format: str,
@@ -1199,10 +1599,12 @@ def format_assistant_output(
         return markdown_to_plain_text(normalized_text)
 
     if mode == "json":
+        artifacts = build_response_artifacts(normalized_text)
         payload: Dict[str, Any] = {
             "ok": bool(normalized_text),
             "format": "json",
             "text": normalized_text,
+            "artifacts": artifacts,
         }
         if isinstance(snapshot, dict):
             for key in (

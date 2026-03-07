@@ -153,6 +153,12 @@ Choose output formatting:
 ./unchained --output-format json "Explain MCP"
 ```
 
+`json` mode includes structured artifacts for automation:
+- `artifacts.code_blocks` detected scripts
+- `artifacts.command_blocks` runnable shell command groups
+- `artifacts.copy_items` copy-ready chunks
+- `artifacts.tool_hints` suggested runner commands
+
 ## Custom Alias Setup
 
 Install any command name you want (for example `sky`):
