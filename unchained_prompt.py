@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import difflib
 import json
 import os
@@ -17,13 +18,14 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 DEFAULT_ENDPOINT = "https://api.unchainedsky.com/mcp"
 DEFAULT_URL = "https://chatgpt.com"
 DEFAULT_AGENT_ENV_PATH = Path.home() / "unchained-agent" / ".env"
 DEFAULT_REPL_HISTORY_PATH = Path.home() / ".sky_prompt_history"
 DEFAULT_REPL_HISTORY_LIMIT = 1000
+_FOREGROUND_BROWSER_CONTEXT_STACK: List[str] = []
 DEFAULT_WAIT_TIMEOUT = 180
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_RENDER_STABLE_POLLS = 3
@@ -493,7 +495,7 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
   function currentInputText(el) {{
     if (!el) return "";
     if ("value" in el) return String(el.value || "");
-    return String(el.textContent || "");
+    return String(el.innerText || el.textContent || "");
   }}
 
   function setTextValue(el, text) {{
@@ -515,8 +517,56 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
       return;
     }}
 
+    const isContentEditable = String(el.getAttribute("contenteditable") || "").toLowerCase() === "true";
+    if (isContentEditable) {{
+      try {{
+        el.focus();
+      }} catch (_) {{}}
+      try {{
+        const selection = window.getSelection();
+        if (selection) {{
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }}
+      }} catch (_) {{}}
+
+      let inserted = false;
+      try {{
+        inserted = document.execCommand("insertText", false, text);
+      }} catch (_) {{}}
+      if (!inserted) {{
+        try {{
+          el.dispatchEvent(new InputEvent("beforeinput", {{
+            bubbles: true,
+            cancelable: true,
+            inputType: "insertText",
+            data: text
+          }}));
+        }} catch (_) {{}}
+        el.textContent = text;
+      }}
+      try {{
+        el.dispatchEvent(new InputEvent("input", {{
+          bubbles: true,
+          inputType: "insertText",
+          data: text
+        }}));
+      }} catch (_) {{
+        el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+      }}
+      el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+      return;
+    }}
+
     el.textContent = text;
-    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    try {{
+      el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: text }}));
+    }} catch (_) {{
+      el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    }}
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
   }}
 
   function dispatchSubmitClick(el) {{
@@ -561,33 +611,34 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
     return encode({{ ok: true, submitted: false }});
   }}
 
-  const submitSelectorsRaw = [
-    'button[data-testid*="send" i]',
-    'button[aria-label*="send" i]',
-    'button[aria-label*="prompt" i]',
-    'button[title*="send" i]',
-    'button[type="submit"]',
-    '[aria-label*="send" i]',
-    '[data-testid*="send" i]'
-  ];
   const submitCandidates = [];
-  for (const sel of submitSelectorsRaw) {{
-    const found = Array.from(document.querySelectorAll(sel));
-    for (const node of found) {{
-      const actionable =
-        node.matches("button,[role='button']") ? node : (node.closest("button,[role='button']") || node);
-      if (actionable && !submitCandidates.includes(actionable)) {{
-        submitCandidates.push(actionable);
-      }}
+  for (const node of Array.from(document.querySelectorAll("button,[role='button']"))) {{
+    const label = String(
+      node.getAttribute("aria-label") ||
+      node.innerText ||
+      node.getAttribute("title") ||
+      ""
+    ).toLowerCase();
+    if (!/(send prompt|send|submit)/.test(label)) continue;
+    if (!submitCandidates.includes(node)) {{
+      submitCandidates.push(node);
     }}
   }}
 
   let submitButton = null;
+  let fallbackSubmitButton = null;
   for (const candidate of submitCandidates) {{
-    if (visible(candidate) && !isDisabled(candidate)) {{
+    if (!visible(candidate)) continue;
+    if (!fallbackSubmitButton) {{
+      fallbackSubmitButton = candidate;
+    }}
+    if (!isDisabled(candidate)) {{
       submitButton = candidate;
       break;
     }}
+  }}
+  if (!submitButton) {{
+    submitButton = fallbackSubmitButton;
   }}
 
   if (submitButton) {{
@@ -734,6 +785,27 @@ def build_assistant_probe_expression() -> str:
     return cleanText(node.innerText || node.textContent || "");
   }
 
+  function assistantActionAnchors() {
+    const labels = new Set([
+      "copy",
+      "good response",
+      "bad response",
+      "share",
+      "more actions",
+      "read aloud",
+    ]);
+    return Array.from(document.querySelectorAll('main button, main [role="button"]')).filter((node) => {
+      if (!visible(node)) return false;
+      const label = cleanText(
+        node.innerText ||
+        node.getAttribute("aria-label") ||
+        node.getAttribute("title") ||
+        ""
+      ).toLowerCase();
+      return labels.has(label);
+    });
+  }
+
   function extractAssistantTexts() {
     const texts = [];
 
@@ -753,7 +825,33 @@ def build_assistant_probe_expression() -> str:
       }
     }
 
+    if (!texts.length) {
+      for (const anchor of assistantActionAnchors()) {
+        const block = anchor.closest('[data-testid^="conversation-turn-"], article, section, div');
+        const t = nodeText(block || anchor.parentElement || anchor);
+        if (t.length >= 8) pushUnique(texts, t);
+      }
+    }
+
     return texts;
+  }
+
+  function countAssistantShells() {
+    return Array.from(document.querySelectorAll('[data-message-author-role="assistant"]')).filter((node) => {
+      const el = node instanceof Element ? node : null;
+      return visible(el);
+    }).length;
+  }
+
+  function countResponseNavButtons() {
+    return Array.from(document.querySelectorAll('button, [role="button"]')).filter((node) => {
+      const el = node instanceof Element ? node : null;
+      if (!visible(el)) return false;
+      const label = cleanText(
+        (el && (el.innerText || el.getAttribute("aria-label") || el.getAttribute("title"))) || ""
+      ).toLowerCase();
+      return label === "previous response" || label === "next response";
+    }).length;
   }
 
   function extractUserTexts() {
@@ -793,6 +891,8 @@ def build_assistant_probe_expression() -> str:
   }
 
   const assistantTexts = extractAssistantTexts();
+  const assistantShellCount = countAssistantShells();
+  const responseNavCount = countResponseNavButtons();
   const userTexts = extractUserTexts();
   const latestAssistant = assistantTexts.length ? assistantTexts[assistantTexts.length - 1] : "";
   const latestUser = userTexts.length ? userTexts[userTexts.length - 1] : "";
@@ -800,6 +900,9 @@ def build_assistant_probe_expression() -> str:
   return JSON.stringify({
     ok: true,
     assistant_count: assistantTexts.length,
+    assistant_shell_count: assistantShellCount,
+    response_nav_count: responseNavCount,
+    empty_assistant_shell: assistantShellCount > 0 && assistantTexts.length === 0,
     latest_text: latestAssistant,
     latest_hash: simpleHash(latestAssistant),
     user_count: userTexts.length,
@@ -1108,6 +1211,27 @@ def build_assistant_snapshot_expression() -> str:
     if (!target.includes(normalized)) target.push(normalized);
   }
 
+  function assistantActionAnchors() {
+    const labels = new Set([
+      "copy",
+      "good response",
+      "bad response",
+      "share",
+      "more actions",
+      "read aloud",
+    ]);
+    return Array.from(document.querySelectorAll('main button, main [role="button"]')).filter((node) => {
+      if (!isVisibleElement(node)) return false;
+      const label = cleanText(
+        node.innerText ||
+        node.getAttribute("aria-label") ||
+        node.getAttribute("title") ||
+        ""
+      ).toLowerCase();
+      return labels.has(label);
+    });
+  }
+
   function extractAssistantTexts() {
     const texts = [];
 
@@ -1128,16 +1252,13 @@ def build_assistant_snapshot_expression() -> str:
 
       const candidate =
         explicitAssistant ||
-        turn.querySelector('.markdown, [class*="markdown"], pre, p, li, div');
+        turn.querySelector('.markdown, [class*="markdown"], pre, p, li');
       const message = nodeToMarkdownLikeText(candidate || turn);
       if (message && message.length >= 8) pushUnique(texts, message);
     }
 
     // 3) copy-button anchored blocks often map to assistant responses
-    const copyAnchors = Array.from(
-      document.querySelectorAll('main button[aria-label*="copy" i], main [data-testid*="copy" i]')
-    );
-    for (const anchor of copyAnchors) {
+    for (const anchor of assistantActionAnchors()) {
       const block = anchor.closest('[data-testid^="conversation-turn-"], article, section, div');
       const message = nodeToMarkdownLikeText(block || anchor.parentElement || anchor);
       if (message && message.length >= 8) pushUnique(texts, message);
@@ -1234,14 +1355,25 @@ def call_js_expression(
     expression: str,
     label: str,
 ) -> Tuple[str, Dict[str, Any], str, Optional[Dict[str, Any]]]:
-    base_args: List[Dict[str, Any]] = [{"expression": expression}]
-    if any(tool_name.lower() == "execute_js" for tool_name in js_tools):
-        base_args.extend([{"script": expression}, {"js": expression}, {"code": expression}])
-    js_args = with_agent_variants(base_args, agent_id=agent_id)
-    tool, result = call_tool_variants(client, js_tools, js_args, label)
-    result_text = extract_text(result).strip()
-    status = parse_dispatch_status_text(result_text)
-    return tool, result, result_text, status
+    context_mode = current_foreground_browser_context_mode()
+    browser_app: Optional[str] = None
+    terminal_app: Optional[str] = None
+    if context_mode == "pulse":
+        browser_app = browser_application_name_from_env()
+        terminal_app = terminal_application_name_from_env()
+        activate_application(browser_app)
+    try:
+        base_args: List[Dict[str, Any]] = [{"expression": expression}]
+        if any(tool_name.lower() == "execute_js" for tool_name in js_tools):
+            base_args.extend([{"script": expression}, {"js": expression}, {"code": expression}])
+        js_args = with_agent_variants(base_args, agent_id=agent_id)
+        tool, result = call_tool_variants(client, js_tools, js_args, label)
+        result_text = extract_text(result).strip()
+        status = parse_dispatch_status_text(result_text)
+        return tool, result, result_text, status
+    finally:
+        if browser_app and terminal_app and terminal_app != browser_app:
+            activate_application(terminal_app)
 
 
 def read_assistant_probe(
@@ -2721,6 +2853,133 @@ result = a + b
             self.assertIsNone(timeout_s)
             self.assertIn("no current cell", str(error or ""))
 
+        def test_browser_foreground_mode_defaults_to_submit(self) -> None:
+            self.assertEqual(browser_foreground_mode({}), "submit")
+            self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
+            self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
+
+        def test_terminal_application_name_from_env_maps_apple_terminal(self) -> None:
+            self.assertEqual(
+                terminal_application_name_from_env({"TERM_PROGRAM": "Apple_Terminal"}),
+                "Terminal",
+            )
+
+        def test_foreground_browser_context_hold_activates_browser_then_terminal(self) -> None:
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch.dict(
+                    os.environ,
+                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                    clear=False,
+                ):
+                    with foreground_browser_context("hold"):
+                        pass
+            self.assertEqual(
+                activate_mock.call_args_list,
+                [mock.call("Google Chrome"), mock.call("Terminal")],
+            )
+
+        def test_foreground_browser_context_pulse_scope_does_not_activate_apps(self) -> None:
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch.dict(
+                    os.environ,
+                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                    clear=False,
+                ):
+                    with foreground_browser_context("pulse"):
+                        pass
+            self.assertEqual(activate_mock.call_args_list, [])
+
+        def test_call_js_expression_pulses_browser_in_pulse_context(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                        clear=False,
+                    ):
+                        with foreground_browser_context("pulse"):
+                            call_js_expression(
+                                client=client,
+                                js_tools=["js_eval"],
+                                agent_id="agent-test",
+                                expression="1 + 1",
+                                label="js test",
+                            )
+            self.assertEqual(
+                activate_mock.call_args_list,
+                [mock.call("Google Chrome"), mock.call("Terminal")],
+            )
+
+        def test_call_js_expression_does_not_pulse_browser_in_hold_context(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                        clear=False,
+                    ):
+                        with foreground_browser_context("hold"):
+                            call_js_expression(
+                                client=client,
+                                js_tools=["js_eval"],
+                                agent_id="agent-test",
+                                expression="1 + 1",
+                                label="js test",
+                            )
+            self.assertEqual(
+                activate_mock.call_args_list,
+                [mock.call("Google Chrome"), mock.call("Terminal")],
+            )
+
+        def test_probe_expression_includes_assistant_action_anchor_fallback(self) -> None:
+            expr = build_assistant_probe_expression()
+            self.assertIn("assistantActionAnchors", expr)
+            self.assertIn("good response", expr)
+            self.assertIn("more actions", expr)
+            self.assertIn("assistant_shell_count", expr)
+            self.assertIn("response_nav_count", expr)
+            self.assertIn("empty_assistant_shell", expr)
+
+        def test_snapshot_expression_uses_action_anchors_and_avoids_generic_div_candidate(self) -> None:
+            expr = build_assistant_snapshot_expression()
+            self.assertIn("assistantActionAnchors", expr)
+            self.assertIn("good response", expr)
+            self.assertIn(".markdown, [class*=\"markdown\"], pre, p, li", expr)
+            self.assertNotIn(".markdown, [class*=\"markdown\"], pre, p, li, div", expr)
+
+        def test_prompt_expression_uses_contenteditable_insert_text(self) -> None:
+            expr = build_prompt_expression("hello", submit=True)
+            self.assertIn('document.execCommand("insertText", false, text)', expr)
+            self.assertIn('range.selectNodeContents(el)', expr)
+            self.assertIn('inputType: "insertText"', expr)
+            self.assertNotIn("range.collapse(false)", expr)
+            self.assertIn("fallbackSubmitButton", expr)
+            self.assertIn("/(send prompt|send|submit)/", expr)
+
+        def test_summarize_missing_assistant_response_prefers_empty_shell_messages(self) -> None:
+            self.assertEqual(
+                summarize_missing_assistant_response(
+                    {"empty_assistant_shell": True, "response_nav_count": 2},
+                    timed_out=True,
+                    fallback_used=True,
+                    render_complete=False,
+                ),
+                "assistant> (ChatGPT created empty response variants without rendered text)",
+            )
+            self.assertEqual(
+                summarize_missing_assistant_response(
+                    {"empty_assistant_shell": True, "response_nav_count": 0},
+                    timed_out=True,
+                    fallback_used=False,
+                    render_complete=False,
+                ),
+                "assistant> (ChatGPT created an empty assistant turn without rendered text)",
+            )
+
         def test_mcp_client_next_rpc_id_is_unique(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
             ids = {client._next_rpc_id("tool-call-js_eval") for _ in range(8)}
@@ -3452,6 +3711,88 @@ def flush_repl_history(
         return
 
 
+def browser_foreground_mode(env: Optional[Mapping[str, str]] = None) -> str:
+    values = env or os.environ
+    raw = str(values.get("SKY_FOREGROUND_BROWSER", "submit") or "").strip().lower()
+    if raw in {"0", "false", "off", "no", "none"}:
+        return "off"
+    if raw in {"1", "true", "on", "yes", "poll", "always", "aggressive"}:
+        return "poll"
+    if raw in {"submit", "once", "minimal"}:
+        return "submit"
+    return "submit"
+
+
+def browser_foreground_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    return browser_foreground_mode(env) != "off"
+
+
+def browser_application_name_from_env(env: Optional[Mapping[str, str]] = None) -> str:
+    values = env or os.environ
+    return str(values.get("SKY_BROWSER_APP") or "Google Chrome").strip() or "Google Chrome"
+
+
+def terminal_application_name_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    values = env or os.environ
+    term_program = str(values.get("TERM_PROGRAM") or "").strip()
+    mapping = {
+        "Apple_Terminal": "Terminal",
+        "iTerm.app": "iTerm2",
+        "WarpTerminal": "Warp",
+        "Warp": "Warp",
+        "vscode": "Visual Studio Code",
+        "WezTerm": "WezTerm",
+        "Hyper": "Hyper",
+    }
+    return mapping.get(term_program) or None
+
+
+def activate_application(application_name: Optional[str], timeout_s: int = 3) -> bool:
+    name = str(application_name or "").strip()
+    if not name or sys.platform != "darwin":
+        return False
+    script = f'tell application "{name.replace(chr(34), chr(92) + chr(34))}" to activate'
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(1, int(timeout_s)),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return int(proc.returncode) == 0
+
+
+def current_foreground_browser_context_mode() -> str:
+    if _FOREGROUND_BROWSER_CONTEXT_STACK:
+        return str(_FOREGROUND_BROWSER_CONTEXT_STACK[-1] or "off")
+    return "off"
+
+
+@contextmanager
+def foreground_browser_context(mode: str) -> Iterable[None]:
+    resolved_mode = str(mode or "off").strip().lower()
+    if resolved_mode not in {"off", "hold", "pulse"}:
+        resolved_mode = "off"
+    if resolved_mode == "off":
+        yield
+        return
+    browser_app = browser_application_name_from_env()
+    terminal_app = terminal_application_name_from_env()
+    if resolved_mode == "hold":
+        activate_application(browser_app)
+    _FOREGROUND_BROWSER_CONTEXT_STACK.append(resolved_mode)
+    try:
+        yield
+    finally:
+        if _FOREGROUND_BROWSER_CONTEXT_STACK:
+            _FOREGROUND_BROWSER_CONTEXT_STACK.pop()
+        if resolved_mode == "hold" and terminal_app and terminal_app != browser_app:
+            activate_application(terminal_app)
+
+
 def normalize_for_match(value: str) -> str:
     return " ".join(str(value or "").lower().split())
 
@@ -3642,6 +3983,32 @@ def wait_for_assistant_response(
             flush=True,
         )
         time.sleep(max(0.1, poll_interval_s))
+
+
+def summarize_missing_assistant_response(
+    probe: Optional[Dict[str, Any]],
+    *,
+    timed_out: bool,
+    fallback_used: bool,
+    render_complete: bool,
+) -> str:
+    details = probe or {}
+    empty_assistant_shell = bool(details.get("empty_assistant_shell"))
+    response_nav_count = int(details.get("response_nav_count") or 0)
+
+    if empty_assistant_shell and response_nav_count > 0:
+        return "assistant> (ChatGPT created empty response variants without rendered text)"
+    if empty_assistant_shell:
+        return "assistant> (ChatGPT created an empty assistant turn without rendered text)"
+    if timed_out and fallback_used:
+        return "assistant> (timed out waiting after fallback submit)"
+    if timed_out:
+        return "assistant> (timed out waiting for render completion)"
+    if not render_complete:
+        return "assistant> (response capture incomplete before timeout)"
+    if fallback_used:
+        return "assistant> (timed out waiting after fallback submit)"
+    return "assistant> (no final response captured before timeout)"
 
 
 def parse_layout_points(layout_text: str) -> List[Tuple[str, int, int]]:
@@ -4717,110 +5084,66 @@ def dispatch_prompt(
         "timed_out": False,
         "fallback_used": False,
     }
+    response_text: Optional[str] = None
+    final_snapshot: Optional[Dict[str, Any]] = None
+    render_complete = False
+    timed_out = False
     baseline_probe = None
     fallback_used = False
-    if wait_for_response and submit:
-        baseline_probe = read_assistant_probe(
-            client=client,
-            agent_id=agent_id,
-            js_tools=js_tools,
-            label="assistant baseline probe",
-        )
-
-    expression = build_prompt_expression(prompt, submit=submit)
-    tool, _, result_text, status = call_js_expression(
-        client=client,
-        js_tools=js_tools,
-        agent_id=agent_id,
-        expression=expression,
-        label="js prompt dispatch",
-    )
-    if status and status.get("ok") is False:
-        if type_tools:
-            fallback_status = cdp_fallback_submit(
-                client=client,
-                agent_id=agent_id,
-                prompt=prompt,
-                js_tools=js_tools,
-                click_tools=click_tools,
-                type_tools=type_tools,
-                ddm_tools=ddm_tools,
-                layout_text=layout_text,
-                submit=submit,
-                baseline_probe=baseline_probe,
-            )
-            if echo_result and show_dispatch_details:
-                print(f"[{tool}] {result_text}")
-                print(f"[fallback] {json.dumps(fallback_status)}")
-            status = fallback_status
-            fallback_used = True
-            turn_result["fallback_used"] = True
-        else:
-            raise MCPError(f"Prompt dispatch failed: {status}")
-    elif echo_result and show_dispatch_details:
-        print(f"[{tool}] {result_text}")
-
-    if submit and type_tools:
-        post_dispatch_probe = read_assistant_probe(
-            client=client,
-            agent_id=agent_id,
-            js_tools=js_tools,
-            label="post-submit probe",
-        )
-        if not probe_has_new_user_turn(baseline_probe, post_dispatch_probe, prompt):
-            retry_status = cdp_fallback_submit(
-                client=client,
-                agent_id=agent_id,
-                prompt=prompt,
-                js_tools=js_tools,
-                click_tools=click_tools,
-                type_tools=type_tools,
-                ddm_tools=ddm_tools,
-                layout_text=layout_text,
-                submit=submit,
-                baseline_probe=post_dispatch_probe,
-            )
-            fallback_used = True
-            turn_result["fallback_used"] = True
-            if echo_result and show_dispatch_details:
-                print(f"[retry-fallback] {json.dumps(retry_status)}")
-
-    if wait_for_response and submit:
-        baseline_count = int((baseline_probe or {}).get("assistant_count") or 0)
-        baseline_hash = str((baseline_probe or {}).get("latest_hash") or "")
-        capture_baseline_hash = baseline_hash
-        baseline_user_count = int((baseline_probe or {}).get("user_count") or 0)
-        baseline_user_hash = str((baseline_probe or {}).get("latest_user_hash") or "")
-        response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
-            client=client,
-            agent_id=agent_id,
-            js_tools=js_tools,
-            baseline_count=baseline_count,
-            baseline_hash=baseline_hash,
-            baseline_user_count=baseline_user_count,
-            baseline_user_hash=baseline_user_hash,
-            expected_prompt=prompt,
-            timeout_s=wait_timeout_s,
-            poll_interval_s=poll_interval_s,
-            debug=show_dispatch_details,
-        )
-        if (not user_submitted) and type_tools:
-            pre_retry_probe = read_assistant_probe(
+    foreground_mode = browser_foreground_mode() if submit else "off"
+    submit_focus_mode = "hold" if (submit and foreground_mode in {"submit", "poll"}) else "off"
+    poll_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
+    final_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
+    with foreground_browser_context(submit_focus_mode):
+        if wait_for_response and submit:
+            baseline_probe = read_assistant_probe(
                 client=client,
                 agent_id=agent_id,
                 js_tools=js_tools,
-                label="submit verification probe",
+                label="assistant baseline probe",
             )
-            if probe_indicates_submit(
-                baseline_probe=baseline_probe,
-                probe=pre_retry_probe,
-                expected_prompt=prompt,
-            ):
-                user_submitted = True
-                maybe_latest = str((pre_retry_probe or {}).get("latest_text") or "").strip()
-                if maybe_latest:
-                    response_text = maybe_latest
+
+        expression = build_prompt_expression(prompt, submit=submit)
+        tool, _, result_text, status = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=expression,
+            label="js prompt dispatch",
+        )
+        if status and status.get("ok") is False:
+            if type_tools:
+                fallback_status = cdp_fallback_submit(
+                    client=client,
+                    agent_id=agent_id,
+                    prompt=prompt,
+                    js_tools=js_tools,
+                    click_tools=click_tools,
+                    type_tools=type_tools,
+                    ddm_tools=ddm_tools,
+                    layout_text=layout_text,
+                    submit=submit,
+                    baseline_probe=baseline_probe,
+                )
+                if echo_result and show_dispatch_details:
+                    print(f"[{tool}] {result_text}")
+                    print(f"[fallback] {json.dumps(fallback_status)}")
+                status = fallback_status
+                fallback_used = True
+                turn_result["fallback_used"] = True
             else:
+                raise MCPError(f"Prompt dispatch failed: {status}")
+        elif echo_result and show_dispatch_details:
+            print(f"[{tool}] {result_text}")
+
+        if submit and type_tools:
+            post_dispatch_probe = read_assistant_probe(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+                label="post-submit probe",
+            )
+            if not probe_has_new_user_turn(baseline_probe, post_dispatch_probe, prompt):
                 retry_status = cdp_fallback_submit(
                     client=client,
                     agent_id=agent_id,
@@ -4831,12 +5154,67 @@ def dispatch_prompt(
                     ddm_tools=ddm_tools,
                     layout_text=layout_text,
                     submit=submit,
-                    baseline_probe=pre_retry_probe,
+                    baseline_probe=post_dispatch_probe,
                 )
                 fallback_used = True
                 turn_result["fallback_used"] = True
                 if echo_result and show_dispatch_details:
-                    print(f"[final-retry] {json.dumps(retry_status)}")
+                    print(f"[retry-fallback] {json.dumps(retry_status)}")
+
+    if wait_for_response and submit:
+        baseline_count = int((baseline_probe or {}).get("assistant_count") or 0)
+        baseline_hash = str((baseline_probe or {}).get("latest_hash") or "")
+        capture_baseline_hash = baseline_hash
+        baseline_user_count = int((baseline_probe or {}).get("user_count") or 0)
+        baseline_user_hash = str((baseline_probe or {}).get("latest_user_hash") or "")
+        with foreground_browser_context(poll_focus_mode):
+            response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+                baseline_count=baseline_count,
+                baseline_hash=baseline_hash,
+                baseline_user_count=baseline_user_count,
+                baseline_user_hash=baseline_user_hash,
+                expected_prompt=prompt,
+                timeout_s=wait_timeout_s,
+                poll_interval_s=poll_interval_s,
+                debug=show_dispatch_details,
+            )
+        if (not user_submitted) and type_tools:
+            with foreground_browser_context(submit_focus_mode):
+                pre_retry_probe = read_assistant_probe(
+                    client=client,
+                    agent_id=agent_id,
+                    js_tools=js_tools,
+                    label="submit verification probe",
+                )
+                if probe_indicates_submit(
+                    baseline_probe=baseline_probe,
+                    probe=pre_retry_probe,
+                    expected_prompt=prompt,
+                ):
+                    user_submitted = True
+                    maybe_latest = str((pre_retry_probe or {}).get("latest_text") or "").strip()
+                    if maybe_latest:
+                        response_text = maybe_latest
+                else:
+                    retry_status = cdp_fallback_submit(
+                        client=client,
+                        agent_id=agent_id,
+                        prompt=prompt,
+                        js_tools=js_tools,
+                        click_tools=click_tools,
+                        type_tools=type_tools,
+                        ddm_tools=ddm_tools,
+                        layout_text=layout_text,
+                        submit=submit,
+                        baseline_probe=pre_retry_probe,
+                    )
+                    fallback_used = True
+                    turn_result["fallback_used"] = True
+                    if echo_result and show_dispatch_details:
+                        print(f"[final-retry] {json.dumps(retry_status)}")
 
                 retry_baseline = read_assistant_probe(
                     client=client,
@@ -4844,64 +5222,70 @@ def dispatch_prompt(
                     js_tools=js_tools,
                     label="final-retry baseline",
                 )
-                response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
-                    client=client,
-                    agent_id=agent_id,
-                    js_tools=js_tools,
-                    baseline_count=int((retry_baseline or {}).get("assistant_count") or 0),
-                    baseline_hash=str((retry_baseline or {}).get("latest_hash") or ""),
-                    baseline_user_count=int((retry_baseline or {}).get("user_count") or 0),
-                    baseline_user_hash=str((retry_baseline or {}).get("latest_user_hash") or ""),
-                    expected_prompt=prompt,
-                    timeout_s=min(20, max(8, wait_timeout_s)),
-                    poll_interval_s=poll_interval_s,
-                    debug=show_dispatch_details,
-                )
+            if not user_submitted and "retry_baseline" in locals():
+                with foreground_browser_context(poll_focus_mode):
+                    response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
+                        client=client,
+                        agent_id=agent_id,
+                        js_tools=js_tools,
+                        baseline_count=int((retry_baseline or {}).get("assistant_count") or 0),
+                        baseline_hash=str((retry_baseline or {}).get("latest_hash") or ""),
+                        baseline_user_count=int((retry_baseline or {}).get("user_count") or 0),
+                        baseline_user_hash=str((retry_baseline or {}).get("latest_user_hash") or ""),
+                        expected_prompt=prompt,
+                        timeout_s=min(20, max(8, wait_timeout_s)),
+                        poll_interval_s=poll_interval_s,
+                        debug=show_dispatch_details,
+                    )
                 capture_baseline_hash = str((retry_baseline or {}).get("latest_hash") or capture_baseline_hash)
         if not user_submitted:
             raise MCPError(
                 "Prompt submit was not confirmed (no new user turn detected). "
                 "Retry once or run with --debug for details."
             )
-        final_text, final_snapshot = capture_final_assistant_text(
-            client=client,
-            agent_id=agent_id,
-            js_tools=js_tools,
-            fallback_text=response_text,
-            baseline_hash=capture_baseline_hash,
-        )
+        with foreground_browser_context(final_focus_mode):
+            final_text, final_snapshot = capture_final_assistant_text(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+                fallback_text=response_text,
+                baseline_hash=capture_baseline_hash,
+            )
         if final_text:
             response_text = final_text
         turn_result["assistant_text"] = str(response_text or "")
         turn_result["render_complete"] = bool(render_complete)
         turn_result["timed_out"] = bool(timed_out)
         turn_result["artifacts"] = build_response_artifacts(str(response_text or ""))
-        if response_text:
-            output_mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
-            rendered_output = format_assistant_output(
-                text=response_text,
-                output_format=output_mode,
-                snapshot=final_snapshot,
-            )
-            if output_mode == "json":
-                print(rendered_output)
-            else:
-                print("assistant>")
-                print(rendered_output)
-            turn_result["rendered_output"] = rendered_output
-        else:
-            if timed_out and fallback_used:
-                print("assistant> (timed out waiting after fallback submit)")
-            elif timed_out:
-                print("assistant> (timed out waiting for render completion)")
-            elif not render_complete:
-                print("assistant> (response capture incomplete before timeout)")
-            elif fallback_used:
-                print("assistant> (timed out waiting after fallback submit)")
-            else:
-                print("assistant> (no final response captured before timeout)")
-        return turn_result
 
+    if response_text:
+        output_mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
+        rendered_output = format_assistant_output(
+            text=response_text,
+            output_format=output_mode,
+            snapshot=final_snapshot,
+        )
+        if output_mode == "json":
+            print(rendered_output)
+        else:
+            print("assistant>")
+            print(rendered_output)
+        turn_result["rendered_output"] = rendered_output
+    elif wait_for_response and submit:
+        diagnosis_probe = read_assistant_probe(
+            client=client,
+            agent_id=agent_id,
+            js_tools=js_tools,
+            label="missing response diagnosis probe",
+        )
+        print(
+            summarize_missing_assistant_response(
+                diagnosis_probe,
+                timed_out=bool(timed_out),
+                fallback_used=bool(fallback_used),
+                render_complete=bool(render_complete),
+            )
+        )
     return turn_result
 
 
