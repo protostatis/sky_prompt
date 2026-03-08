@@ -1,6 +1,6 @@
 # SkyPrompt
 
-Minimal terminal CLI to send prompts into a real browser tab (for sites like `https://chatgpt.com`) through Unchained MCP.
+Minimal terminal CLI to send prompts into a real browser tab (for sites like `https://chatgpt.com`) through Sky MCP.
 
 ## What It Does
 
@@ -17,7 +17,7 @@ Minimal terminal CLI to send prompts into a real browser tab (for sites like `ht
 ```bash
 git clone https://github.com/protostatis/sky_prompt.git
 cd sky_prompt
-./unchained --help
+./sky --help
 ```
 
 Optional `pyreplab` backend dependency with `uv`:
@@ -26,28 +26,28 @@ Optional `pyreplab` backend dependency with `uv`:
 uv sync --extra pyreplab
 ```
 
-Optional alias setup (recommended):
+Optional alias setup:
 
 ```bash
-./unchained --setup-alias sky
-sky --help
+./sky --setup-alias sk
+sk --help
 ```
 
 ## Quickstart
 
-1. Start Unchained agent:
+1. Start Sky agent:
 
 ```bash
 curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/unchained-agent
+cd ~/sky-agent
 ./start.sh --daemon
 ```
 
 2. Export credentials:
 
 ```bash
-export UNCHAINED_API_KEY="uc_live_..."
-export UNCHAINED_AGENT_ID="claude-xxxxxxxx"
+export SKY_API_KEY="uc_live_..."
+export SKY_AGENT_ID="claude-xxxxxxxx"
 ```
 
 3. Run one-shot prompt:
@@ -83,26 +83,26 @@ now summarize in 3 bullets
 
 ## Prerequisites
 
-1. Install and run the Unchained agent on your Mac:
+1. Install and run the Sky agent on your Mac:
 
 ```bash
 curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/unchained-agent
+cd ~/sky-agent
 ./start.sh --daemon
 ```
 
-2. Export credentials (optional if `~/unchained-agent/.env` already has them):
+2. Export credentials (optional if `~/sky-agent/.env` already has them):
 
 ```bash
-export UNCHAINED_API_KEY="uc_live_..."
-export UNCHAINED_AGENT_ID="claude-xxxxxxxx"
+export SKY_API_KEY="uc_live_..."
+export SKY_AGENT_ID="claude-xxxxxxxx"
 ```
 
 To find your agent id:
 
 ```bash
 curl -sS https://api.unchainedsky.com/api/agents \
-  -H "Authorization: Bearer $UNCHAINED_API_KEY"
+  -H "Authorization: Bearer $SKY_API_KEY"
 ```
 
 ## Quick Usage (Claude-Like)
@@ -110,13 +110,13 @@ curl -sS https://api.unchainedsky.com/api/agents \
 One-shot prompt:
 
 ```bash
-./unchained "Summarize MCP in one paragraph"
+./sky "Summarize MCP in one paragraph"
 ```
 
 Interactive shell mode (default when no prompt is passed):
 
 ```bash
-./unchained
+./sky
 ```
 
 Inside `-i`, Up/Down arrows recall your previous prompts (saved in `~/.sky_prompt_history`).
@@ -124,41 +124,41 @@ Inside `-i`, Up/Down arrows recall your previous prompts (saved in `~/.sky_promp
 Explicit flags:
 
 ```bash
-./unchained -prompt "Hello from prompt mode"
-./unchained -chat
+./sky -prompt "Hello from prompt mode"
+./sky -chat
 ```
 
 Read prompt from stdin:
 
 ```bash
 echo "Write a haiku about browser automation" | \
-./unchained
+./sky
 ```
 
 Fill only, do not submit:
 
 ```bash
-./unchained --no-submit "Draft text only"
+./sky --no-submit "Draft text only"
 ```
 
 Tune response waiting:
 
 ```bash
-./unchained --wait-timeout 240 --poll-interval 1.0 "Long response request"
+./sky --wait-timeout 240 --poll-interval 1.0 "Long response request"
 ```
 
 Use another website:
 
 ```bash
-./unchained --url https://chatgpt.com "What is MCP?"
+./sky --url https://chatgpt.com "What is MCP?"
 ```
 
 Choose output formatting:
 
 ```bash
-./unchained --output-format markdown "Explain MCP"
-./unchained --output-format plain "Explain MCP"
-./unchained --output-format json "Explain MCP"
+./sky --output-format markdown "Explain MCP"
+./sky --output-format plain "Explain MCP"
+./sky --output-format json "Explain MCP"
 ```
 
 `json` mode includes structured artifacts for automation:
@@ -171,7 +171,7 @@ Choose output formatting:
 Run built-in closed-loop self-tests:
 
 ```bash
-./unchained --self-test
+./sky --self-test
 ```
 
 Developer test loop (recommended while iterating):
@@ -183,23 +183,23 @@ Developer test loop (recommended while iterating):
 
 ## Custom Alias Setup
 
-Install any command name you want (for example `sky`):
+Install any command name you want (for example `sk`):
 
 ```bash
-./unchained --setup-alias sky
+./sky --setup-alias sk
 ```
 
 Optional flags:
 
 ```bash
-./unchained --setup-alias sky --alias-dir ~/.local/bin
-./unchained --setup-alias sky --force-alias
+./sky --setup-alias sk --alias-dir ~/.local/bin
+./sky --setup-alias sk --force-alias
 ```
 
 Then run:
 
 ```bash
-sky -p "something short"
+sk -p "something short"
 ```
 
 ## Interactive Commands
@@ -249,14 +249,14 @@ Each `-i` session uses its own isolated pyreplab session directory to avoid cros
 Use an explicit `pyreplab` command path:
 
 ```bash
-./unchained -i --run-backend pyreplab --pyreplab-cmd /Users/zhiminzou/Projects/pyrepl/pyreplab
+./sky -i --run-backend pyreplab --pyreplab-cmd /Users/zhiminzou/Projects/pyrepl/pyreplab
 # or set PYREPLAB_CMD and use /backend pyreplab inside -i
 ```
 
 Fast launch shortcut:
 
 ```bash
-./unchained -i --pyreplab
+./sky -i --pyreplab
 ```
 
 ## Add To PATH
@@ -264,18 +264,20 @@ Fast launch shortcut:
 If you want it globally like `claude`:
 
 ```bash
-ln -sf /Users/zhiminzou/Projects/test_unchainedsky_mcp/unchained ~/.local/bin/unchained
+ln -sf /Users/zhiminzou/Projects/sky_prompt/sky ~/.local/bin/sky
 ```
 
 Then run:
 
 ```bash
-unchained "Explain what an MCP session id is"
+sky "Explain what an MCP session id is"
 ```
 
 ## Notes
 
 - You must already be logged into the target site in your local Chrome session.
+- `sky`, `sky_prompt.py`, `SKY_*`, and `~/sky-agent/.env` are the supported names.
+- On macOS, `SKY_FOREGROUND_BROWSER=submit` (the default) brings Chrome to the foreground for the submit sequence once and then returns focus to the terminal. Set `SKY_FOREGROUND_BROWSER=poll` for aggressive background-safe polling, `SKY_FOREGROUND_BROWSER=0` to disable, or `SKY_BROWSER_APP` to override the browser app name.
 - Different sites use different input DOM patterns; this script targets common chat UIs and may need selector tweaks for edge cases.
 - Use `--debug` to print tool and transport diagnostics.
 - Interactive mode clears stale draft text on startup.

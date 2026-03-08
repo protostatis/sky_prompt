@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple terminal prompt CLI powered by Unchained MCP."""
+"""Simple terminal prompt CLI powered by Sky MCP."""
 
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_ENDPOINT = "https://api.unchainedsky.com/mcp"
 DEFAULT_URL = "https://chatgpt.com"
-DEFAULT_AGENT_ENV_PATH = Path.home() / "unchained-agent" / ".env"
+DEFAULT_AGENT_ENV_PATH = Path.home() / "sky-agent" / ".env"
 DEFAULT_REPL_HISTORY_PATH = Path.home() / ".sky_prompt_history"
 DEFAULT_REPL_HISTORY_LIMIT = 1000
 _FOREGROUND_BROWSER_CONTEXT_STACK: List[str] = []
@@ -40,6 +40,9 @@ ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_DIM = "\033[2m"
 ANSI_CYAN = "\033[36m"
+PRIMARY_API_KEY_ENV = "SKY_API_KEY"
+PRIMARY_AGENT_ID_ENV = "SKY_AGENT_ID"
+PRIMARY_TARGET_URL_ENV = "SKY_TARGET_URL"
 LANGUAGE_ANSI_BY_LANGUAGE: Dict[str, str] = {
     "python": "\033[38;5;75m",
     "bash": "\033[38;5;78m",
@@ -254,7 +257,7 @@ class MCPClient:
             "params": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "unchained-prompt-cli", "version": "0.1.0"},
+                "clientInfo": {"name": "sky-prompt-cli", "version": "0.1.0"},
             },
         }
         response = self._rpc_request(payload, include_session=False, allow_empty=False)
@@ -3587,15 +3590,16 @@ result = a + b
             self.assertIn("PLAYGROUND_FAIL", str(result.get("stderr") or ""))
 
         def test_execute_cell_locally_python_can_import_workspace_module(self) -> None:
-            module_path = Path.cwd() / "_sky_prompt_local_import_probe.py"
+            module_name = f"_sky_prompt_local_import_probe_{os.getpid()}_{int(time.time() * 1000)}"
+            module_path = Path.cwd() / f"{module_name}.py"
             module_path.write_text("VALUE = 7\n", encoding="utf-8")
             try:
                 cell = {
                     "id": "py3",
                     "language": "python",
                     "content": (
-                        "import _sky_prompt_local_import_probe\n"
-                        "print(_sky_prompt_local_import_probe.VALUE)"
+                        f"import {module_name}\n"
+                        f"print({module_name}.VALUE)"
                     ),
                 }
                 result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=10)
@@ -3617,6 +3621,39 @@ result = a + b
             self.assertFalse(bool(result.get("ok")), msg=json.dumps(result))
             self.assertTrue(bool(result.get("cancelled")), msg=json.dumps(result))
             self.assertIn("cancelled", str(result.get("error") or "").lower())
+
+        def test_resolve_credentials_prefers_sky_env_names(self) -> None:
+            module_name = resolve_credentials.__module__
+            with mock.patch.dict(
+                os.environ,
+                {
+                    PRIMARY_API_KEY_ENV: "sky-key",
+                    PRIMARY_AGENT_ID_ENV: "sky-agent",
+                },
+                clear=False,
+            ):
+                with mock.patch(f"{module_name}.parse_env_file", return_value={}):
+                    api_key, agent_id, source = resolve_credentials(
+                        api_key_arg=None,
+                        agent_id_arg=None,
+                        endpoint="https://example.invalid/mcp",
+                        timeout=5,
+                    )
+            self.assertEqual(api_key, "sky-key")
+            self.assertEqual(agent_id, "sky-agent")
+            self.assertEqual(source, "flags/env")
+
+        def test_install_alias_launcher_sets_cli_name(self) -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                alias_path, created = install_alias_launcher(
+                    alias_name="sk",
+                    alias_dir=Path(tmpdir),
+                    target_script=Path.cwd() / "sky_prompt.py",
+                    force=False,
+                )
+                content = alias_path.read_text(encoding="utf-8")
+            self.assertTrue(created)
+            self.assertIn('SKY_CLI_NAME="sk" exec python3 "', content)
 
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
@@ -6124,6 +6161,14 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     return values
 
 
+def getenv_first(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 def infer_agents_endpoint(endpoint: str) -> str:
     clean = endpoint.rstrip("/")
     if clean.endswith("/mcp"):
@@ -6192,7 +6237,7 @@ def install_alias_launcher(
     launcher_body = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        f'exec python3 "{target}" "$@"\n'
+        f'SKY_CLI_NAME="{name}" exec python3 "{target}" "$@"\n'
     )
 
     if alias_path.exists() or alias_path.is_symlink():
@@ -6244,9 +6289,10 @@ def resolve_credentials(
     timeout: int,
 ) -> Tuple[Optional[str], Optional[str], str]:
     env_file_values = parse_env_file(DEFAULT_AGENT_ENV_PATH)
+    env_file_agent_id = env_file_values.get(PRIMARY_AGENT_ID_ENV)
 
-    api_key = api_key_arg or os.getenv("UNCHAINED_API_KEY") or env_file_values.get("UNCHAINED_API_KEY")
-    agent_id = agent_id_arg or os.getenv("UNCHAINED_AGENT_ID") or env_file_values.get("UNCHAINED_AGENT_ID")
+    api_key = api_key_arg or getenv_first(PRIMARY_API_KEY_ENV) or env_file_values.get(PRIMARY_API_KEY_ENV)
+    agent_id = agent_id_arg or getenv_first(PRIMARY_AGENT_ID_ENV) or env_file_agent_id
 
     source = "flags/env"
     if not api_key:
@@ -6256,9 +6302,9 @@ def resolve_credentials(
         agent_id = fetch_agent_id(api_key=api_key, endpoint=endpoint, timeout=timeout)
         if agent_id:
             source = "auto-discovered-from-api"
-        elif env_file_values.get("UNCHAINED_AGENT_ID"):
+        elif env_file_agent_id:
             source = "local-env-file"
-    elif agent_id == env_file_values.get("UNCHAINED_AGENT_ID"):
+    elif agent_id == env_file_agent_id:
         source = "local-env-file"
 
     return api_key, agent_id, source
@@ -7485,7 +7531,8 @@ def maybe_show_ddm(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Simple claude-like terminal prompt CLI for websites via Unchained MCP.",
+        prog=os.getenv("SKY_CLI_NAME") or Path(sys.argv[0] or "sky").name,
+        description="Simple terminal prompt CLI for websites via Sky MCP.",
     )
     parser.add_argument("prompt_args", nargs="*", help="Prompt text (one-shot mode).")
     parser.add_argument(
@@ -7496,12 +7543,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--url",
-        default=os.getenv("UNCHAINED_TARGET_URL", DEFAULT_URL),
+        default=getenv_first(PRIMARY_TARGET_URL_ENV) or DEFAULT_URL,
         help="Target URL (default: https://chatgpt.com).",
     )
     parser.add_argument(
         "--setup-alias",
-        help="Install a custom command alias (example: --setup-alias sky).",
+        help="Install a custom command alias (example: --setup-alias sk).",
     )
     parser.add_argument(
         "--alias-dir",
@@ -7514,7 +7561,7 @@ def main() -> int:
         help="Overwrite existing alias path when using --setup-alias.",
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="MCP server endpoint")
-    parser.add_argument("--api-key", help="Unchained API key")
+    parser.add_argument("--api-key", help="Sky API key")
     parser.add_argument("--agent-id", help="Connected agent_id")
     parser.add_argument(
         "--no-submit",
@@ -7603,13 +7650,13 @@ def main() -> int:
     )
     if not resolved_api_key:
         parser.error(
-            "Missing API key. Pass --api-key, export UNCHAINED_API_KEY, "
-            "or set UNCHAINED_API_KEY in ~/.unchained-agent/.env."
+            "Missing API key. Pass --api-key, export SKY_API_KEY, "
+            "or set SKY_API_KEY in ~/.sky-agent/.env."
         )
     if not resolved_agent_id:
         parser.error(
-            "Missing agent_id. Pass --agent-id, export UNCHAINED_AGENT_ID, "
-            "set UNCHAINED_AGENT_ID in ~/.unchained-agent/.env, or ensure "
+            "Missing agent_id. Pass --agent-id, export SKY_AGENT_ID, set SKY_AGENT_ID "
+            "in ~/.sky-agent/.env, or ensure "
             "https://api.unchainedsky.com/api/agents returns a connected agent."
         )
 

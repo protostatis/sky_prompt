@@ -81,16 +81,16 @@ run_once() {
   echo "[1/4] syntax check"
   python3 - <<'PY'
 from pathlib import Path
-compile(Path("unchained_prompt.py").read_text(encoding="utf-8"), "unchained_prompt.py", "exec")
+compile(Path("sky_prompt.py").read_text(encoding="utf-8"), "sky_prompt.py", "exec")
 print("syntax_ok")
 PY
 
   echo "[2/4] built-in self tests"
-  ./.sky --self-test
+  ./sky --self-test
 
   echo "[3/4] tool-call id uniqueness smoke"
   python3 - <<'PY'
-from unchained_prompt import MCPClient
+from sky_prompt import MCPClient
 c = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
 a = c._next_rpc_id("tool-call-js_eval")
 b = c._next_rpc_id("tool-call-js_eval")
@@ -103,7 +103,7 @@ PY
 import os
 import subprocess
 from pathlib import Path
-import unchained_prompt as up
+import sky_prompt as up
 
 workdir = Path.cwd()
 explicit_cmd = os.getenv("PYREPLAB_CMD", "").strip() or None
