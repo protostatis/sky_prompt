@@ -1503,11 +1503,14 @@ def call_js_expression(
 ) -> Tuple[str, Dict[str, Any], str, Optional[Dict[str, Any]]]:
     context_mode = current_foreground_browser_context_mode()
     browser_app: Optional[str] = None
-    terminal_app: Optional[str] = None
+    restore_app: Optional[str] = None
     if context_mode == "pulse":
         browser_app = browser_application_name_from_env()
-        terminal_app = terminal_application_name_from_env()
-        activate_application(browser_app)
+        original_frontmost_app = current_frontmost_application_name() or terminal_application_name_from_env()
+        if original_frontmost_app and str(original_frontmost_app).strip() != browser_app:
+            restore_app = str(original_frontmost_app).strip()
+        if not original_frontmost_app or str(original_frontmost_app).strip() != browser_app:
+            activate_application(browser_app)
     try:
         base_args: List[Dict[str, Any]] = [{"expression": expression}]
         if any(tool_name.lower() == "execute_js" for tool_name in js_tools):
@@ -1518,8 +1521,8 @@ def call_js_expression(
         status = parse_dispatch_status_text(result_text)
         return tool, result, result_text, status
     finally:
-        if browser_app and terminal_app and terminal_app != browser_app:
-            activate_application(terminal_app)
+        if browser_app and restore_app and restore_app != browser_app:
+            activate_application(restore_app)
 
 
 def read_assistant_probe(
@@ -3093,21 +3096,71 @@ result = a + b
             self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
             self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
 
+        def test_browser_window_parking_enabled_defaults_on_darwin(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                self.assertTrue(browser_window_parking_enabled({}))
+                self.assertFalse(browser_window_parking_enabled({"SKY_FOREGROUND_BROWSER_PARK": "0"}))
+
+        def test_offscreen_window_bounds_keeps_window_size(self) -> None:
+            self.assertEqual(
+                offscreen_window_bounds((100, 50, 500, 450), margin=120),
+                (-520, 50, -120, 450),
+            )
+
         def test_terminal_application_name_from_env_maps_apple_terminal(self) -> None:
             self.assertEqual(
                 terminal_application_name_from_env({"TERM_PROGRAM": "Apple_Terminal"}),
                 "Terminal",
             )
 
-        def test_foreground_browser_context_hold_activates_browser_then_terminal(self) -> None:
+        def test_foreground_browser_context_hold_restores_original_frontmost_app(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
-                with mock.patch.dict(
-                    os.environ,
-                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                    clear=False,
-                ):
-                    with foreground_browser_context("hold"):
-                        pass
+                with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
+                    with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("hold"):
+                                pass
+            self.assertEqual(
+                activate_mock.call_args_list,
+                [mock.call("Google Chrome"), mock.call("Terminal")],
+            )
+
+        def test_foreground_browser_context_hold_does_not_restore_when_browser_already_frontmost(self) -> None:
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                        clear=False,
+                    ):
+                        with foreground_browser_context("hold"):
+                            pass
+            self.assertEqual(activate_mock.call_args_list, [])
+
+        def test_foreground_browser_context_hold_parks_window_offscreen_when_focus_is_stolen(self) -> None:
+            with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
+                    with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=True):
+                        with mock.patch(__name__ + ".front_window_bounds", return_value=(100, 50, 500, 450)):
+                            with mock.patch(__name__ + ".set_front_window_bounds", return_value=True) as bounds_mock:
+                                with mock.patch.dict(
+                                    os.environ,
+                                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                    clear=False,
+                                ):
+                                    with foreground_browser_context("hold"):
+                                        pass
+            self.assertEqual(
+                bounds_mock.call_args_list,
+                [
+                    mock.call("Google Chrome", (-520, 50, -120, 450)),
+                    mock.call("Google Chrome", (100, 50, 500, 450)),
+                ],
+            )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -3115,13 +3168,14 @@ result = a + b
 
         def test_foreground_browser_context_pulse_scope_does_not_activate_apps(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
-                with mock.patch.dict(
-                    os.environ,
-                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                    clear=False,
-                ):
-                    with foreground_browser_context("pulse"):
-                        pass
+                with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                        clear=False,
+                    ):
+                        with foreground_browser_context("pulse"):
+                            pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_call_js_expression_pulses_browser_in_pulse_context(self) -> None:
@@ -3129,19 +3183,20 @@ result = a + b
             fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("pulse"):
-                            call_js_expression(
-                                client=client,
-                                js_tools=["js_eval"],
-                                agent_id="agent-test",
-                                expression="1 + 1",
-                                label="js test",
-                            )
+                    with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("pulse"):
+                                call_js_expression(
+                                    client=client,
+                                    js_tools=["js_eval"],
+                                    agent_id="agent-test",
+                                    expression="1 + 1",
+                                    label="js test",
+                                )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -3152,19 +3207,21 @@ result = a + b
             fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("hold"):
-                            call_js_expression(
-                                client=client,
-                                js_tools=["js_eval"],
-                                agent_id="agent-test",
-                                expression="1 + 1",
-                                label="js test",
-                            )
+                    with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
+                        with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
+                            with mock.patch.dict(
+                                os.environ,
+                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                clear=False,
+                            ):
+                                with foreground_browser_context("hold"):
+                                    call_js_expression(
+                                        client=client,
+                                        js_tools=["js_eval"],
+                                        agent_id="agent-test",
+                                        expression="1 + 1",
+                                        label="js test",
+                                    )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -4056,6 +4113,17 @@ def browser_application_name_from_env(env: Optional[Mapping[str, str]] = None) -
     return str(values.get("SKY_BROWSER_APP") or "Google Chrome").strip() or "Google Chrome"
 
 
+def browser_window_parking_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    values = env or os.environ
+    default = "1" if sys.platform == "darwin" else "0"
+    raw = str(values.get("SKY_FOREGROUND_BROWSER_PARK", default) or "").strip().lower()
+    if raw in {"0", "false", "off", "no", "none"}:
+        return False
+    if raw in {"1", "true", "on", "yes", "auto"}:
+        return sys.platform == "darwin"
+    return sys.platform == "darwin"
+
+
 def terminal_application_name_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     values = env or os.environ
     term_program = str(values.get("TERM_PROGRAM") or "").strip()
@@ -4089,6 +4157,101 @@ def activate_application(application_name: Optional[str], timeout_s: int = 3) ->
     return int(proc.returncode) == 0
 
 
+def current_frontmost_application_name(timeout_s: int = 3) -> Optional[str]:
+    if sys.platform != "darwin":
+        return None
+    script = 'tell application "System Events" to get name of first application process whose frontmost is true'
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_s)),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if int(proc.returncode) != 0:
+        return None
+    name = str(proc.stdout or "").strip()
+    return name or None
+
+
+def front_window_bounds(application_name: Optional[str], timeout_s: int = 3) -> Optional[Tuple[int, int, int, int]]:
+    name = str(application_name or "").strip()
+    if not name or sys.platform != "darwin":
+        return None
+    escaped_name = name.replace(chr(34), chr(92) + chr(34))
+    script = (
+        f'tell application "{escaped_name}"\n'
+        'if it is not running then return ""\n'
+        'if (count of windows) = 0 then return ""\n'
+        'set winBounds to bounds of front window\n'
+        'return (item 1 of winBounds as string) & "," & (item 2 of winBounds as string) & "," & (item 3 of winBounds as string) & "," & (item 4 of winBounds as string)\n'
+        "end tell"
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_s)),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if int(proc.returncode) != 0:
+        return None
+    values = [part.strip() for part in str(proc.stdout or "").split(",")]
+    if len(values) != 4:
+        return None
+    try:
+        left, top, right, bottom = (int(values[0]), int(values[1]), int(values[2]), int(values[3]))
+    except ValueError:
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def set_front_window_bounds(
+    application_name: Optional[str],
+    bounds: Optional[Tuple[int, int, int, int]],
+    timeout_s: int = 3,
+) -> bool:
+    name = str(application_name or "").strip()
+    if not name or sys.platform != "darwin" or not bounds:
+        return False
+    left, top, right, bottom = bounds
+    escaped_name = name.replace(chr(34), chr(92) + chr(34))
+    script = (
+        f'tell application "{escaped_name}"\n'
+        'if it is not running then return false\n'
+        'if (count of windows) = 0 then return false\n'
+        f"set bounds of front window to {{{int(left)}, {int(top)}, {int(right)}, {int(bottom)}}}\n"
+        "return true\n"
+        "end tell"
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(1, int(timeout_s)),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return int(proc.returncode) == 0
+
+
+def offscreen_window_bounds(bounds: Tuple[int, int, int, int], margin: int = 120) -> Tuple[int, int, int, int]:
+    left, top, right, bottom = bounds
+    width = max(1, int(right) - int(left))
+    safe_margin = max(40, int(margin))
+    return (-width - safe_margin, int(top), -safe_margin, int(bottom))
+
+
 def current_foreground_browser_context_mode() -> str:
     if _FOREGROUND_BROWSER_CONTEXT_STACK:
         return str(_FOREGROUND_BROWSER_CONTEXT_STACK[-1] or "off")
@@ -4105,16 +4268,32 @@ def foreground_browser_context(mode: str) -> Iterable[None]:
         return
     browser_app = browser_application_name_from_env()
     terminal_app = terminal_application_name_from_env()
+    original_frontmost_app = current_frontmost_application_name() or terminal_app
+    restore_app = (
+        str(original_frontmost_app or "").strip()
+        if original_frontmost_app and str(original_frontmost_app).strip() != browser_app
+        else None
+    )
+    parked_bounds: Optional[Tuple[int, int, int, int]] = None
     if resolved_mode == "hold":
-        activate_application(browser_app)
+        if restore_app and browser_window_parking_enabled():
+            current_bounds = front_window_bounds(browser_app)
+            if current_bounds:
+                parked_target = offscreen_window_bounds(current_bounds)
+                if set_front_window_bounds(browser_app, parked_target):
+                    parked_bounds = current_bounds
+        if not original_frontmost_app or str(original_frontmost_app).strip() != browser_app:
+            activate_application(browser_app)
     _FOREGROUND_BROWSER_CONTEXT_STACK.append(resolved_mode)
     try:
         yield
     finally:
         if _FOREGROUND_BROWSER_CONTEXT_STACK:
             _FOREGROUND_BROWSER_CONTEXT_STACK.pop()
-        if resolved_mode == "hold" and terminal_app and terminal_app != browser_app:
-            activate_application(terminal_app)
+        if resolved_mode == "hold" and restore_app:
+            activate_application(restore_app)
+        if parked_bounds:
+            set_front_window_bounds(browser_app, parked_bounds)
 
 
 def normalize_for_match(value: str) -> str:
