@@ -43,12 +43,7 @@ cd ~/sky-agent
 ./start.sh --daemon
 ```
 
-2. Export credentials:
-
-```bash
-export SKY_API_KEY="uc_live_..."
-export SKY_AGENT_ID="claude-xxxxxxxx"
-```
+2. Run `sky` and follow the first-run setup if prompted. `install.sh` should already place the API key in `~/.sky-agent/.env`.
 
 3. Run one-shot prompt:
 
@@ -91,12 +86,14 @@ cd ~/sky-agent
 ./start.sh --daemon
 ```
 
-2. Export credentials (optional if `~/sky-agent/.env` already has them):
+2. Credentials are read from `~/sky-agent/.env` or the process environment:
 
 ```bash
 export SKY_API_KEY="uc_live_..."
 export SKY_AGENT_ID="claude-xxxxxxxx"
 ```
+
+On first run, if `SKY_AGENT_ID` is missing but the API key is present, `sky` will guide you through selecting a connected agent and write it back to `~/.sky-agent/.env`.
 
 To find your agent id:
 

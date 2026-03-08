@@ -3643,6 +3643,55 @@ result = a + b
             self.assertEqual(agent_id, "sky-agent")
             self.assertEqual(source, "flags/env")
 
+        def test_extract_agent_choices_prefers_connected_agents(self) -> None:
+            payload = {
+                "agents": [
+                    {"agent_id": "agent-offline", "name": "Offline", "status": "offline"},
+                    {"agent_id": "agent-online", "name": "Online", "status": "connected"},
+                ]
+            }
+            choices = extract_agent_choices(payload)
+            self.assertEqual(len(choices), 2)
+            self.assertEqual(str(choices[0].get("agent_id") or ""), "agent-online")
+            self.assertTrue(bool(choices[0].get("connected")))
+
+        def test_upsert_env_file_value_replaces_existing_assignment(self) -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                env_path = Path(tmpdir) / ".env"
+                env_path.write_text('SKY_API_KEY="old"\nSKY_AGENT_ID="old-agent"\n', encoding="utf-8")
+                upsert_env_file_value(env_path, PRIMARY_AGENT_ID_ENV, "new-agent")
+                payload = env_path.read_text(encoding="utf-8")
+            self.assertIn('SKY_API_KEY="old"', payload)
+            self.assertIn('SKY_AGENT_ID="new-agent"', payload)
+            self.assertNotIn('SKY_AGENT_ID="old-agent"', payload)
+
+        def test_maybe_run_first_call_setup_writes_single_connected_agent(self) -> None:
+            module_name = maybe_run_first_call_setup.__module__
+            env_path = Path("/tmp/sky-setup-test.env")
+            with mock.patch.object(sys.stdin, "isatty", return_value=True):
+                with mock.patch.object(sys.stdout, "isatty", return_value=True):
+                    with mock.patch(f"{module_name}.fetch_agent_choices", return_value=[
+                        {
+                            "agent_id": "agent-123",
+                            "label": "MacBook",
+                            "status": "connected",
+                            "connected": True,
+                        }
+                    ]):
+                        with mock.patch(f"{module_name}.upsert_env_file_value") as write_mock:
+                            with mock.patch("builtins.print"):
+                                api_key, agent_id, source = maybe_run_first_call_setup(
+                                    api_key="sky-key",
+                                    agent_id=None,
+                                    endpoint="https://example.invalid/mcp",
+                                    timeout=5,
+                                    env_path=env_path,
+                                )
+            self.assertEqual(api_key, "sky-key")
+            self.assertEqual(agent_id, "agent-123")
+            self.assertEqual(source, "setup-wizard")
+            write_mock.assert_called_once_with(env_path, PRIMARY_AGENT_ID_ENV, "agent-123")
+
         def test_install_alias_launcher_sets_cli_name(self) -> None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 alias_path, created = install_alias_launcher(
@@ -6215,6 +6264,187 @@ def fetch_agent_id(api_key: str, endpoint: str, timeout: int) -> Optional[str]:
     return extract_first_agent_id(payload)
 
 
+def extract_agent_choices(payload: Any) -> List[Dict[str, Any]]:
+    items: List[Any]
+    if isinstance(payload, list):
+        items = list(payload)
+    elif isinstance(payload, dict):
+        agents = payload.get("agents")
+        if isinstance(agents, list):
+            items = list(agents)
+        else:
+            items = [payload]
+    else:
+        return []
+
+    choices: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        agent_id = item.get("agent_id") or item.get("id")
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            continue
+        agent_id = agent_id.strip()
+        if agent_id in seen_ids:
+            continue
+        seen_ids.add(agent_id)
+        label = (
+            item.get("name")
+            or item.get("label")
+            or item.get("display_name")
+            or item.get("title")
+            or agent_id
+        )
+        status_raw = str(item.get("status") or item.get("state") or "").strip()
+        connected_value = item.get("connected")
+        if isinstance(connected_value, bool):
+            connected = connected_value
+        else:
+            connected = status_raw.lower() in {"connected", "online", "active", "ready"}
+        choices.append(
+            {
+                "agent_id": agent_id,
+                "label": str(label or agent_id).strip() or agent_id,
+                "status": status_raw,
+                "connected": connected,
+            }
+        )
+    choices.sort(key=lambda item: (bool(item.get("connected")), str(item.get("label") or "")), reverse=True)
+    return choices
+
+
+def fetch_agent_choices(api_key: str, endpoint: str, timeout: int) -> List[Dict[str, Any]]:
+    url = infer_agents_endpoint(endpoint)
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read().decode("utf-8", "replace")
+    payload = json.loads(body)
+    return extract_agent_choices(payload)
+
+
+def format_env_assignment(key: str, value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"'
+
+
+def upsert_env_file_value(path: Path, key: str, value: str) -> None:
+    existing_lines: List[str] = []
+    if path.is_file():
+        existing_lines = path.read_text(encoding="utf-8").splitlines()
+    updated_lines: List[str] = []
+    replaced = False
+    for raw_line in existing_lines:
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in raw_line:
+            current_key, _ = raw_line.split("=", 1)
+            if current_key.strip() == key:
+                updated_lines.append(format_env_assignment(key, value))
+                replaced = True
+                continue
+        updated_lines.append(raw_line)
+    if not replaced:
+        if updated_lines and updated_lines[-1].strip():
+            updated_lines.append("")
+        updated_lines.append(format_env_assignment(key, value))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def prompt_for_choice(prompt: str, count: int, default_index: int = 1) -> Optional[int]:
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return default_index
+        if raw.lower() in {"q", "quit", "exit"}:
+            return None
+        try:
+            selected = int(raw)
+        except ValueError:
+            print(f"Enter a number between 1 and {count}, or q to cancel.")
+            continue
+        if 1 <= selected <= count:
+            return selected
+        print(f"Enter a number between 1 and {count}, or q to cancel.")
+
+
+def maybe_run_first_call_setup(
+    api_key: Optional[str],
+    agent_id: Optional[str],
+    endpoint: str,
+    timeout: int,
+    env_path: Path = DEFAULT_AGENT_ENV_PATH,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if api_key and agent_id:
+        return api_key, agent_id, None
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return api_key, agent_id, None
+
+    print("sky setup")
+    print(f"  API key: {'found' if api_key else 'missing'}")
+    print(f"  Agent id: {'found' if agent_id else 'missing'}")
+
+    if not api_key:
+        print(f"Run: curl -fsSL https://api.unchainedsky.com/install.sh | bash")
+        print(f"Then rerun sky. Expected config path: {env_path}")
+        return api_key, agent_id, "setup-instructions"
+
+    if agent_id:
+        return api_key, agent_id, None
+
+    print("Looking for connected agents...")
+    try:
+        agent_choices = fetch_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
+    except Exception as exc:
+        print(f"Agent discovery failed: {exc}")
+        print("Start the Sky agent and rerun sky.")
+        return api_key, agent_id, "setup-instructions"
+
+    connected_choices = [item for item in agent_choices if bool(item.get("connected"))]
+    active_choices = connected_choices or agent_choices
+    if not active_choices:
+        print("No agents found.")
+        print("Start the Sky agent and rerun sky.")
+        return api_key, agent_id, "setup-instructions"
+
+    if len(active_choices) == 1:
+        chosen = active_choices[0]
+        selected_agent_id = str(chosen.get("agent_id") or "")
+        print(f"Using agent: {selected_agent_id}")
+    else:
+        print("Available agents:")
+        for idx, item in enumerate(active_choices, start=1):
+            label = str(item.get("label") or item.get("agent_id") or "").strip()
+            current_agent_id = str(item.get("agent_id") or "").strip()
+            status = str(item.get("status") or "").strip()
+            suffix = f" [{status}]" if status else ""
+            if label and label != current_agent_id:
+                print(f"  {idx}. {label} ({current_agent_id}){suffix}")
+            else:
+                print(f"  {idx}. {current_agent_id}{suffix}")
+        selection = prompt_for_choice(f"Select agent [1-{len(active_choices)}] (default 1): ", len(active_choices))
+        if selection is None:
+            print("setup cancelled")
+            return api_key, agent_id, "setup-cancelled"
+        chosen = active_choices[selection - 1]
+        selected_agent_id = str(chosen.get("agent_id") or "")
+
+    if not selected_agent_id:
+        return api_key, agent_id, "setup-cancelled"
+
+    upsert_env_file_value(env_path, PRIMARY_AGENT_ID_ENV, selected_agent_id)
+    print(f"Wrote {PRIMARY_AGENT_ID_ENV} to {env_path}")
+    return api_key, selected_agent_id, "setup-wizard"
+
+
 def install_alias_launcher(
     alias_name: str,
     alias_dir: Path,
@@ -7648,12 +7878,26 @@ def main() -> int:
         endpoint=args.endpoint,
         timeout=args.timeout,
     )
+    setup_source: Optional[str] = None
+    if not resolved_api_key or not resolved_agent_id:
+        resolved_api_key, resolved_agent_id, setup_source = maybe_run_first_call_setup(
+            api_key=resolved_api_key,
+            agent_id=resolved_agent_id,
+            endpoint=args.endpoint,
+            timeout=args.timeout,
+        )
+        if setup_source:
+            credential_source = setup_source
     if not resolved_api_key:
+        if setup_source in {"setup-instructions", "setup-cancelled"}:
+            return 2
         parser.error(
             "Missing API key. Pass --api-key, export SKY_API_KEY, "
             "or set SKY_API_KEY in ~/.sky-agent/.env."
         )
     if not resolved_agent_id:
+        if setup_source in {"setup-instructions", "setup-cancelled"}:
+            return 2
         parser.error(
             "Missing agent_id. Pass --agent-id, export SKY_AGENT_ID, set SKY_AGENT_ID "
             "in ~/.sky-agent/.env, or ensure "
