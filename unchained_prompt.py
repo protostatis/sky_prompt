@@ -791,6 +791,106 @@ def build_send_button_state_expression() -> str:
 """.strip()
 
 
+def build_network_request_spy_install_expression() -> str:
+    return """
+(() => {
+  if (window.__skyNetworkSpyInstalled) {
+    return JSON.stringify({ ok: true, installed: true, already: true });
+  }
+
+  window.__skyNetworkSpyInstalled = true;
+  window.__skyNetworkSpyLog = [];
+
+  function push(entry) {
+    try {
+      const row = Object.assign({ ts: Date.now() }, entry || {});
+      window.__skyNetworkSpyLog.push(row);
+      if (window.__skyNetworkSpyLog.length > 40) {
+        window.__skyNetworkSpyLog.splice(0, window.__skyNetworkSpyLog.length - 40);
+      }
+    } catch (_) {}
+  }
+
+  const originalFetch = window.fetch;
+  if (typeof originalFetch === "function") {
+    window.fetch = function(...args) {
+      const input = args.length ? args[0] : null;
+      const init = args.length > 1 ? args[1] : null;
+      let url = "";
+      try {
+        url = typeof input === "string" ? input : String((input && input.url) || "");
+      } catch (_) {}
+      let body = "";
+      try {
+        body = init && typeof init.body === "string" ? init.body : "";
+      } catch (_) {}
+      push({
+        kind: "fetch",
+        phase: "request",
+        method: String((init && init.method) || "GET"),
+        url: url,
+        body: body.slice(0, 400)
+      });
+      const result = originalFetch.apply(this, args);
+      if (result && typeof result.then === "function") {
+        return result.then((response) => {
+          push({
+            kind: "fetch",
+            phase: "response",
+            method: String((init && init.method) || "GET"),
+            url: url,
+            status: Number(response && response.status || 0),
+            ok: !!(response && response.ok)
+          });
+          return response;
+        });
+      }
+      return result;
+    };
+  }
+
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this.__skySpyMethod = method;
+    this.__skySpyUrl = url;
+    return originalOpen.call(this, method, url, ...rest);
+  };
+  XMLHttpRequest.prototype.send = function(body) {
+    push({
+      kind: "xhr",
+      phase: "request",
+      method: String(this.__skySpyMethod || ""),
+      url: String(this.__skySpyUrl || ""),
+      body: typeof body === "string" ? body.slice(0, 400) : ""
+    });
+    this.addEventListener("loadend", () => {
+      push({
+        kind: "xhr",
+        phase: "response",
+        method: String(this.__skySpyMethod || ""),
+        url: String(this.__skySpyUrl || ""),
+        status: Number(this.status || 0)
+      });
+    }, { once: true });
+    return originalSend.call(this, body);
+  };
+
+  return JSON.stringify({ ok: true, installed: true, already: false });
+})()
+""".strip()
+
+
+def build_network_request_spy_dump_expression(limit: int = 12) -> str:
+    safe_limit = max(1, int(limit))
+    return f"""
+(() => {{
+  const rows = Array.isArray(window.__skyNetworkSpyLog) ? window.__skyNetworkSpyLog.slice(-{safe_limit}) : [];
+  return JSON.stringify({{ ok: true, log: rows }});
+}})()
+""".strip()
+
+
 def build_assistant_probe_expression() -> str:
     return """
 (() => {
@@ -1512,6 +1612,50 @@ def wait_for_visible_send_button_state(
         if time.time() >= deadline:
             return last_state
         time.sleep(max(0.05, float(poll_interval_s)))
+
+
+def install_page_network_request_spy(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> None:
+    try:
+        call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_network_request_spy_install_expression(),
+            label="network spy install",
+        )
+    except MCPError:
+        return
+
+
+def read_page_network_request_spy_log(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_network_request_spy_dump_expression(limit=limit),
+            label="network spy dump",
+        )
+    except MCPError:
+        return []
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return []
+    rows = state.get("log")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def capture_final_assistant_text(
@@ -3056,6 +3200,32 @@ result = a + b
             self.assertIn('button,[role=\'button\']', expr)
             self.assertIn('/(send prompt|send|submit)/', expr)
             self.assertIn('enabled: !isDisabled(send)', expr)
+
+        def test_network_request_spy_expression_wraps_fetch_and_xhr(self) -> None:
+            expr = build_network_request_spy_install_expression()
+            self.assertIn("window.fetch =", expr)
+            self.assertIn("XMLHttpRequest.prototype.open", expr)
+            self.assertIn("window.__skyNetworkSpyLog", expr)
+
+        def test_read_page_network_request_spy_log_returns_dict_rows(self) -> None:
+            with mock.patch(
+                __name__ + ".call_js_expression",
+                return_value=(
+                    "js_eval",
+                    {},
+                    '{"ok":true,"log":[{"kind":"fetch","url":"https://example.invalid"},{"bad":true},"nope"]}',
+                    {"ok": True, "log": [{"kind": "fetch", "url": "https://example.invalid"}, {"bad": True}, "nope"]},
+                ),
+            ):
+                rows = read_page_network_request_spy_log(
+                    client=mock.Mock(),
+                    agent_id="agent-test",
+                    js_tools=["js_eval"],
+                )
+            self.assertEqual(
+                rows,
+                [{"kind": "fetch", "url": "https://example.invalid"}, {"bad": True}],
+            )
 
         def test_wait_for_visible_send_button_state_retries_until_visible(self) -> None:
             with mock.patch(
@@ -5276,6 +5446,12 @@ def dispatch_prompt(
                 js_tools=js_tools,
                 label="assistant baseline probe",
             )
+        if submit and show_dispatch_details:
+            install_page_network_request_spy(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
 
         if native_submit_default:
             status = cdp_fallback_submit(
@@ -5464,6 +5640,14 @@ def dispatch_prompt(
             print(rendered_output)
         turn_result["rendered_output"] = rendered_output
     elif wait_for_response and submit:
+        if show_dispatch_details:
+            network_rows = read_page_network_request_spy_log(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
+            if network_rows:
+                print(f"[network-log] {json.dumps(network_rows)}")
         diagnosis_probe = read_assistant_probe(
             client=client,
             agent_id=agent_id,
