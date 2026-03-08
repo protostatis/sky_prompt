@@ -86,7 +86,7 @@ print("syntax_ok")
 PY
 
   echo "[2/4] built-in self tests"
-  ./unchained --self-test
+  ./.sky --self-test
 
   echo "[3/4] tool-call id uniqueness smoke"
   python3 - <<'PY'
