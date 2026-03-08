@@ -1693,7 +1693,7 @@ def looks_like_python_continuation_line(raw_line: str) -> bool:
     stripped = str(raw_line or "").strip()
     if not stripped:
         return False
-    if re.match(r"^[\])}]$", stripped):
+    if re.fullmatch(r"[\])}\s,]+", stripped):
         return True
     if stripped.startswith(("[", "]", "(", ")", "{", "}")) and "," in stripped:
         return True
@@ -2469,6 +2469,37 @@ NumPy makes math easy.
             self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
             self.assertIn("a, b = theta", artifacts["code_blocks"][0].get("content", ""))
 
+        def test_inferred_python_keeps_imports_and_array_closer_lines(self) -> None:
+            sample = """import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# Example dataset
+X = np.array([
+    [1, 2],
+    [2, 1],
+    [3, 5],
+    [6, 7],
+    [7, 8],
+    [8, 9]
+])
+
+y = np.array([0, 0, 0, 1, 1, 1])  # labels
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42
+)
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            content = str(artifacts["code_blocks"][0].get("content") or "")
+            self.assertIn("import numpy as np", content)
+            self.assertIn("X = np.array([", content)
+            self.assertIn("])", content)
+            self.assertIn("y = np.array([0, 0, 0, 1, 1, 1])", content)
+
         def test_invalid_math_equation_not_executable_python_cell(self) -> None:
             sample = "y = 2x + 1"
             artifacts = build_response_artifacts(sample)
@@ -2545,6 +2576,18 @@ result = a + b
             self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
             self.assertIn("7", str(result.get("stdout") or ""))
 
+        def test_execute_cell_locally_keyboard_interrupt_returns_cancelled(self) -> None:
+            cell = {
+                "id": "py4",
+                "language": "python",
+                "content": "print('slow')",
+            }
+            with mock.patch("subprocess.run", side_effect=KeyboardInterrupt):
+                result = execute_cell_locally(cell, timeout_s=10)
+            self.assertFalse(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertTrue(bool(result.get("cancelled")), msg=json.dumps(result))
+            self.assertIn("cancelled", str(result.get("error") or "").lower())
+
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
             self.assertEqual(resolved, ["pyreplab", "--workdir", "/tmp/demo"])
@@ -2606,6 +2649,20 @@ result = a + b
             run_env = run_mock.call_args.kwargs.get("env") or {}
             self.assertEqual(run_env.get("PYREPLAB_DIR"), "/tmp/pyreplab/fixed")
 
+        def test_execute_pyreplab_code_keyboard_interrupt_returns_cancelled(self) -> None:
+            with mock.patch(__name__ + ".start_pyreplab_session") as start_mock:
+                with mock.patch("subprocess.run", side_effect=KeyboardInterrupt):
+                    start_mock.return_value = {"ok": True, "command": ["pyreplab", "start"], "exit_code": 0}
+                    result = execute_pyreplab_code(
+                        "print('ok')",
+                        ["pyreplab"],
+                        Path.cwd(),
+                        timeout_s=2,
+                    )
+            self.assertFalse(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertTrue(bool(result.get("cancelled")), msg=json.dumps(result))
+            self.assertIn("cancelled", str(result.get("error") or "").lower())
+
         def test_execute_cell_with_pyreplab_requires_python(self) -> None:
             cell = {"id": "sh1", "language": "bash", "content": "echo hi"}
             result = execute_cell_with_pyreplab(
@@ -2631,6 +2688,38 @@ result = a + b
         def test_extract_cell_preview_line_uses_last_non_empty_line(self) -> None:
             content = "import numpy as np\nx = np.array([1,2,3])\n\nprint(x)\n"
             self.assertEqual(extract_cell_preview_line(content), "print(x)")
+
+        def test_summarize_cell_preview_uses_head_and_tail_lines(self) -> None:
+            content = (
+                "import numpy as np\n"
+                "from sklearn.ensemble import RandomForestClassifier\n"
+                "\n"
+                "pred = model.predict(X_test)\n"
+                "print('Accuracy', pred)\n"
+            )
+            preview = summarize_cell_preview(content, max_head_lines=2, limit=160)
+            self.assertIn("import numpy as np", preview)
+            self.assertIn("from sklearn.ensemble import RandomForestClassifier", preview)
+            self.assertIn("print('Accuracy', pred)", preview)
+            self.assertIn("...", preview)
+
+        def test_resolve_run_request_uses_current_cell_when_omitted(self) -> None:
+            cell_id, timeout_s, error = resolve_run_request(["/run"], current_cell_id="py2")
+            self.assertEqual(cell_id, "py2")
+            self.assertEqual(timeout_s, 30)
+            self.assertIsNone(error)
+
+        def test_resolve_run_request_allows_timeout_without_cell_id(self) -> None:
+            cell_id, timeout_s, error = resolve_run_request(["/run", "45"], current_cell_id="py2")
+            self.assertEqual(cell_id, "py2")
+            self.assertEqual(timeout_s, 45)
+            self.assertIsNone(error)
+
+        def test_resolve_run_request_rejects_missing_current_cell(self) -> None:
+            cell_id, timeout_s, error = resolve_run_request(["/run"], current_cell_id=None)
+            self.assertIsNone(cell_id)
+            self.assertIsNone(timeout_s)
+            self.assertIn("no current cell", str(error or ""))
 
         def test_mcp_client_next_rpc_id_is_unique(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
@@ -2772,6 +2861,7 @@ def print_cell_catalog(
     cell_store: Dict[str, Dict[str, Any]],
     cell_order: Sequence[str],
     limit: Optional[int] = None,
+    current_cell_id: Optional[str] = None,
 ) -> None:
     if not cell_order:
         print("cells: empty")
@@ -2787,12 +2877,12 @@ def print_cell_catalog(
         language = str(cell.get("language") or "text")
         turn = int(cell.get("turn") or 0)
         revision = int(cell.get("revision") or 1)
-        preview = extract_cell_preview_line(str(cell.get("content") or ""))
+        preview = summarize_cell_preview(str(cell.get("content") or ""), limit=96)
+        marker = "*" if current_cell_id and cell_id == current_cell_id else " "
         if preview:
-            preview = history_preview(preview, limit=64)
-            print(f"{cell_id} [{language}] lines={lines} turn={turn} rev={revision} :: {preview}")
+            print(f"{marker} {cell_id} [{language}] lines={lines} turn={turn} rev={revision} :: {preview}")
         else:
-            print(f"{cell_id} [{language}] lines={lines} turn={turn} rev={revision}")
+            print(f"{marker} {cell_id} [{language}] lines={lines} turn={turn} rev={revision}")
 
 
 def extract_cell_preview_line(content: str) -> str:
@@ -2801,6 +2891,22 @@ def extract_cell_preview_line(content: str) -> str:
         if stripped:
             return stripped
     return ""
+
+
+def summarize_cell_preview(
+    content: str,
+    max_head_lines: int = 2,
+    limit: int = 96,
+) -> str:
+    non_empty = [line.strip() for line in str(content or "").splitlines() if line.strip()]
+    if not non_empty:
+        return ""
+    parts = non_empty[: max(1, int(max_head_lines))]
+    if len(non_empty) > len(parts):
+        tail = non_empty[-1]
+        if tail not in parts:
+            parts.extend(["...", tail])
+    return history_preview(" | ".join(parts), limit=limit)
 
 
 def save_cell_to_path(cell: Dict[str, Any], raw_path: str) -> Path:
@@ -2826,6 +2932,49 @@ def diff_cell_contents(
         lineterm="",
     )
     return "\n".join(diff)
+
+
+def print_cell_content(cell: Dict[str, Any]) -> None:
+    print(
+        f"{cell.get('id')} [{cell.get('language')}] "
+        f"rev={cell.get('revision')} turn={cell.get('turn')}"
+    )
+    print(str(cell.get("content") or ""))
+
+
+def resolve_run_request(
+    args: Sequence[str],
+    current_cell_id: Optional[str],
+    default_timeout_s: int = 30,
+) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    usage = "usage: /run [cell_id] [timeout_seconds]"
+    if len(args) == 0 or len(args) > 3:
+        return None, None, usage
+
+    target = str(current_cell_id or "").strip()
+    timeout_s = int(default_timeout_s)
+
+    if len(args) == 2:
+        token = str(args[1] or "").strip()
+        if token and target and re.fullmatch(r"\d+", token):
+            return target, max(1, int(token)), None
+        if token:
+            target = token
+    elif len(args) == 3:
+        target = str(args[1] or "").strip()
+        raw_timeout = str(args[2] or "").strip()
+        try:
+            timeout_s = max(1, int(raw_timeout))
+        except ValueError:
+            return None, None, usage
+
+    if target in {"current", ".", "last"}:
+        target = str(current_cell_id or "").strip()
+
+    if not target:
+        return None, None, "cells: no current cell (use /cells or /show <cell_id>)"
+
+    return target, timeout_s, None
 
 
 def execute_cell_locally(
@@ -2896,6 +3045,16 @@ def execute_cell_locally(
             "stdout": str(exc.stdout or ""),
             "stderr": str(exc.stderr or ""),
         }
+    except KeyboardInterrupt:
+        return {
+            "ok": False,
+            "backend": "local",
+            "command": runner_cmd,
+            "error": "execution cancelled by user",
+            "stdout": "",
+            "stderr": "",
+            "cancelled": True,
+        }
     except FileNotFoundError:
         return {
             "ok": False,
@@ -2963,6 +3122,8 @@ def start_pyreplab_session(
         return {"ok": False, "command": command, "error": f"runner not found: {pyreplab_cmd[0]}"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "command": command, "error": "pyreplab start timed out"}
+    except KeyboardInterrupt:
+        return {"ok": False, "command": command, "error": "pyreplab start cancelled by user", "cancelled": True}
     return {"ok": int(proc.returncode) == 0, "command": command, "exit_code": int(proc.returncode)}
 
 
@@ -2992,6 +3153,8 @@ def stop_pyreplab_session(
         return {"ok": False, "command": command, "error": f"runner not found: {pyreplab_cmd[0]}"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "command": command, "error": "pyreplab stop timed out"}
+    except KeyboardInterrupt:
+        return {"ok": False, "command": command, "error": "pyreplab stop cancelled by user", "cancelled": True}
     return {"ok": int(proc.returncode) == 0, "command": command, "exit_code": int(proc.returncode)}
 
 
@@ -3086,6 +3249,16 @@ def execute_pyreplab_code(
             "stdout": str(exc.stdout or ""),
             "stderr": str(exc.stderr or ""),
         }
+    except KeyboardInterrupt:
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "command": run_cmd,
+            "error": "execution cancelled by user",
+            "stdout": "",
+            "stderr": "",
+            "cancelled": True,
+        }
     except FileNotFoundError:
         return {
             "ok": False,
@@ -3125,6 +3298,16 @@ def execute_pyreplab_code(
                 "error": f"pyreplab wait timed out after {int(timeout_s)}s",
                 "stdout": stdout_text,
                 "stderr": stderr_text,
+            }
+        except KeyboardInterrupt:
+            return {
+                "ok": False,
+                "backend": "pyreplab",
+                "command": wait_cmd,
+                "error": "execution cancelled by user",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "cancelled": True,
             }
 
     error_message = ""
@@ -3812,12 +3995,13 @@ def run_repl(
     cell_store: Dict[str, Dict[str, Any]] = {}
     cell_order: List[str] = []
     cell_counters: Dict[str, int] = {}
+    current_cell_id: Optional[str] = None
     cell_workspace = Path.cwd() / ".sky_cells"
     readline_mod, readline_history_path = setup_repl_readline_history()
     current_layout_text = navigate_current_page(
         client, agent_id, current_url, navigate_tools, verbose=debug
     )
-    print("interactive mode: /help for commands, /exit to quit")
+    print("interactive mode: /help for commands, /exit to quit, Ctrl-C cancels /run")
 
     if not first_prompt:
         # Clear stale draft text from previous runs so the interactive prompt starts clean.
@@ -3866,11 +4050,16 @@ def run_repl(
             cell_counters=cell_counters,
         )
         if created_cells:
+            current_cell_id = str(created_cells[-1].get("id") or "") or current_cell_id
             summary = " ".join(
                 f"{cell['id']}[{cell.get('language')}]"
                 for cell in created_cells
             )
-            print(f"cells> +{summary}")
+            current_preview = summarize_cell_preview(str(created_cells[-1].get("content") or ""), limit=120)
+            if current_preview:
+                print(f"cells> +{summary} current={current_cell_id} :: {current_preview}")
+            else:
+                print(f"cells> +{summary} current={current_cell_id}")
         history.append(
             {
                 "prompt": first_prompt,
@@ -3886,6 +4075,10 @@ def run_repl(
             except EOFError:
                 print()
                 break
+            except KeyboardInterrupt:
+                print()
+                print("cancelled")
+                continue
             if not line:
                 continue
             add_repl_history_entry(readline_mod, line)
@@ -3897,7 +4090,7 @@ def run_repl(
                     "/url <url> | /submit on|off | /format markdown|plain|json | "
                     "/backend [local|pyreplab] | "
                     "/py <code> | /pyfile <path.py> | "
-                    "/history [n] | /last | /cells [n|all] | /show <cell> | /run <cell> [timeout] | "
+                    "/history [n] | /last | /cells [n|all] | /show [cell] | /run [cell] [timeout] | "
                     "/fork <src> [dst] | /edit <cell> | /save <cell> <path> | /diff <a> <b> | /ddm | /exit"
                 )
                 continue
@@ -4109,26 +4302,37 @@ def run_repl(
                 elif len(parts) > 2:
                     print("usage: /cells [n|all]")
                     continue
-                print_cell_catalog(cell_store, cell_order, limit=limit)
+                print_cell_catalog(
+                    cell_store,
+                    cell_order,
+                    limit=limit,
+                    current_cell_id=current_cell_id,
+                )
                 continue
-            if lower.startswith("/show "):
+            if lower == "/show" or lower.startswith("/show "):
                 args, parse_error = split_repl_command_args(line)
                 if parse_error:
                     print(f"command parse error: {parse_error}")
                     continue
                 assert args is not None
-                if len(args) != 2:
-                    print("usage: /show <cell_id>")
+                if len(args) == 1:
+                    target_cell_id = current_cell_id
+                elif len(args) == 2:
+                    target_cell_id = args[1]
+                else:
+                    print("usage: /show [cell_id]")
                     continue
-                cell = cell_store.get(args[1])
+                if not target_cell_id:
+                    print("cells: no current cell (use /cells or /show <cell_id>)")
+                    continue
+                if target_cell_id in {"current", ".", "last"}:
+                    target_cell_id = current_cell_id
+                cell = cell_store.get(target_cell_id)
                 if not isinstance(cell, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{target_cell_id}'")
                     continue
-                print(
-                    f"{cell.get('id')} [{cell.get('language')}] "
-                    f"rev={cell.get('revision')} turn={cell.get('turn')}"
-                )
-                print(str(cell.get("content") or ""))
+                current_cell_id = str(cell.get("id") or "") or current_cell_id
+                print_cell_content(cell)
                 continue
             if lower == "/run" or lower.startswith("/run "):
                 args, parse_error = split_repl_command_args(line)
@@ -4136,20 +4340,19 @@ def run_repl(
                     print(f"command parse error: {parse_error}")
                     continue
                 assert args is not None
-                if len(args) < 2 or len(args) > 3:
-                    print("usage: /run <cell_id> [timeout_seconds]")
+                target_cell_id, timeout_s, run_error = resolve_run_request(args, current_cell_id=current_cell_id)
+                if run_error:
+                    print(run_error)
                     continue
-                cell = cell_store.get(args[1])
+                assert timeout_s is not None
+                assert target_cell_id is not None
+                cell = cell_store.get(target_cell_id)
                 if not isinstance(cell, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{target_cell_id}'")
                     continue
-                timeout_s = 30
-                if len(args) == 3:
-                    try:
-                        timeout_s = max(1, int(args[2]))
-                    except ValueError:
-                        print("usage: /run <cell_id> [timeout_seconds]")
-                        continue
+                current_cell_id = str(cell.get("id") or "") or current_cell_id
+                print("source>")
+                print_cell_content(cell)
                 language = normalize_code_language(str(cell.get("language") or ""))
                 if run_backend_mode == "pyreplab" and language == "python":
                     result = execute_cell_with_pyreplab(
@@ -4209,6 +4412,7 @@ def run_repl(
                 forked["revision"] = 1
                 cell_store[new_id] = forked
                 cell_order.append(new_id)
+                current_cell_id = new_id
                 print(f"cells> forked {source.get('id')} -> {new_id}")
                 continue
             if lower.startswith("/save "):
@@ -4263,6 +4467,7 @@ def run_repl(
                 if not isinstance(cell, dict):
                     print(f"cells: unknown id '{args[1]}'")
                     continue
+                current_cell_id = str(cell.get("id") or "") or current_cell_id
                 ok, message = edit_cell_in_editor(cell, cell_workspace)
                 if ok:
                     print(f"cells> {message}")
@@ -4295,11 +4500,16 @@ def run_repl(
                 cell_counters=cell_counters,
             )
             if created_cells:
+                current_cell_id = str(created_cells[-1].get("id") or "") or current_cell_id
                 summary = " ".join(
                     f"{cell['id']}[{cell.get('language')}]"
                     for cell in created_cells
                 )
-                print(f"cells> +{summary}")
+                current_preview = summarize_cell_preview(str(created_cells[-1].get("content") or ""), limit=120)
+                if current_preview:
+                    print(f"cells> +{summary} current={current_cell_id} :: {current_preview}")
+                else:
+                    print(f"cells> +{summary} current={current_cell_id}")
             history.append(
                 {
                     "prompt": line,
