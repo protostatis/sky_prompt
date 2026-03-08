@@ -30,6 +30,7 @@ DEFAULT_WAIT_TIMEOUT = 180
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_RENDER_STABLE_POLLS = 3
 DEFAULT_RENDER_SETTLE_SECONDS = 1.2
+DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
@@ -745,6 +746,51 @@ def build_input_state_expression() -> str:
 """.strip()
 
 
+def build_send_button_state_expression() -> str:
+    return """
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isDisabled(el) {
+    if (!el) return true;
+    if ("disabled" in el && !!el.disabled) return true;
+    return String(el.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+  }
+
+  const send = Array.from(document.querySelectorAll("button,[role='button']")).find((node) => {
+    if (!visible(node)) return false;
+    const label = String(
+      node.getAttribute("aria-label") ||
+      node.innerText ||
+      node.getAttribute("title") ||
+      ""
+    ).toLowerCase();
+    return /(send prompt|send|submit)/.test(label);
+  });
+
+  if (!send) {
+    return JSON.stringify({ ok: false, visible: false });
+  }
+
+  const rect = send.getBoundingClientRect();
+  return JSON.stringify({
+    ok: true,
+    visible: true,
+    enabled: !isDisabled(send),
+    label: String(send.getAttribute("aria-label") || send.innerText || send.getAttribute("title") || ""),
+    x: Math.round(rect.left + rect.width / 2),
+    y: Math.round(rect.top + rect.height / 2)
+  });
+})()
+""".strip()
+
+
 def build_assistant_probe_expression() -> str:
     return """
 (() => {
@@ -1421,6 +1467,51 @@ def read_visible_input_text(
     if not isinstance(state, dict):
         return ""
     return str(state.get("text_after") or "")
+
+
+def read_visible_send_button_state(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> Dict[str, Any]:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_send_button_state_expression(),
+            label="send button probe",
+        )
+    except MCPError:
+        return {}
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return {}
+    return state
+
+
+def wait_for_visible_send_button_state(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+    timeout_s: float = DEFAULT_COMPOSER_SETTLE_SECONDS,
+    poll_interval_s: float = 0.1,
+) -> Dict[str, Any]:
+    deadline = time.time() + max(0.0, float(timeout_s))
+    last_state: Dict[str, Any] = {}
+    while True:
+        last_state = read_visible_send_button_state(
+            client=client,
+            agent_id=agent_id,
+            js_tools=js_tools,
+        )
+        if bool(last_state.get("visible")):
+            return last_state
+        if time.time() >= deadline:
+            return last_state
+        time.sleep(max(0.05, float(poll_interval_s)))
 
 
 def capture_final_assistant_text(
@@ -2959,6 +3050,69 @@ result = a + b
             self.assertNotIn("range.collapse(false)", expr)
             self.assertIn("fallbackSubmitButton", expr)
             self.assertIn("/(send prompt|send|submit)/", expr)
+
+        def test_send_button_state_expression_targets_send_button(self) -> None:
+            expr = build_send_button_state_expression()
+            self.assertIn('button,[role=\'button\']', expr)
+            self.assertIn('/(send prompt|send|submit)/', expr)
+            self.assertIn('enabled: !isDisabled(send)', expr)
+
+        def test_wait_for_visible_send_button_state_retries_until_visible(self) -> None:
+            with mock.patch(
+                __name__ + ".read_visible_send_button_state",
+                side_effect=[
+                    {"ok": False, "visible": False},
+                    {"ok": True, "visible": True, "enabled": True, "x": 10, "y": 20},
+                ],
+            ) as read_mock:
+                with mock.patch(__name__ + ".time.sleep") as sleep_mock:
+                    state = wait_for_visible_send_button_state(
+                        client=mock.Mock(),
+                        agent_id="agent-test",
+                        js_tools=["js_eval"],
+                        timeout_s=0.2,
+                        poll_interval_s=0.01,
+                    )
+            self.assertTrue(state.get("visible"))
+            self.assertEqual(read_mock.call_count, 2)
+            sleep_mock.assert_called_once()
+
+        def test_dispatch_prompt_prefers_native_submit_when_click_tools_exist(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            with mock.patch(__name__ + ".read_assistant_probe", return_value={}) as probe_mock:
+                with mock.patch(
+                    __name__ + ".cdp_fallback_submit",
+                    return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
+                ) as native_submit_mock:
+                    with mock.patch(__name__ + ".call_js_expression") as call_js_mock:
+                        with mock.patch(
+                            __name__ + ".wait_for_assistant_response",
+                            return_value=(None, True, False, True),
+                        ):
+                            with mock.patch(
+                                __name__ + ".capture_final_assistant_text",
+                                return_value=(None, None),
+                            ):
+                                with mock.patch(
+                                    __name__ + ".summarize_missing_assistant_response",
+                                    return_value="assistant> (timed out waiting after fallback submit)",
+                                ):
+                                    with mock.patch("builtins.print"):
+                                        dispatch_prompt(
+                                            client=client,
+                                            agent_id="agent-test",
+                                            prompt="hello",
+                                            js_tools=["js_eval"],
+                                            click_tools=["cdp_click"],
+                                            type_tools=["cdp_type"],
+                                            ddm_tools=["ddm"],
+                                            submit=True,
+                                            layout_text="",
+                                            wait_for_response=True,
+                                        )
+            native_submit_mock.assert_called_once()
+            call_js_mock.assert_not_called()
+            self.assertGreaterEqual(probe_mock.call_count, 2)
 
         def test_summarize_missing_assistant_response_prefers_empty_shell_messages(self) -> None:
             self.assertEqual(
@@ -4989,6 +5143,25 @@ def cdp_fallback_submit(
 
     submit_mode = "none"
     if submit:
+        send_button_state = wait_for_visible_send_button_state(
+            client=client,
+            agent_id=agent_id,
+            js_tools=js_tools,
+        )
+        dom_send_point: Optional[Tuple[int, int]] = None
+        try:
+            if bool(send_button_state.get("visible")):
+                dom_send_point = (
+                    int(send_button_state.get("x") or 0),
+                    int(send_button_state.get("y") or 0),
+                )
+                if dom_send_point[0] <= 0 or dom_send_point[1] <= 0:
+                    dom_send_point = None
+        except (TypeError, ValueError):
+            dom_send_point = None
+        if dom_send_point:
+            send_point = dom_send_point
+
         def submit_via_newline(newline_label: str) -> Tuple[str, str]:
             current_input_text = read_visible_input_text(
                 client=client,
@@ -5090,6 +5263,7 @@ def dispatch_prompt(
     timed_out = False
     baseline_probe = None
     fallback_used = False
+    native_submit_default = bool(submit and click_tools)
     foreground_mode = browser_foreground_mode() if submit else "off"
     submit_focus_mode = "hold" if (submit and foreground_mode in {"submit", "poll"}) else "off"
     poll_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
@@ -5103,40 +5277,58 @@ def dispatch_prompt(
                 label="assistant baseline probe",
             )
 
-        expression = build_prompt_expression(prompt, submit=submit)
-        tool, _, result_text, status = call_js_expression(
-            client=client,
-            js_tools=js_tools,
-            agent_id=agent_id,
-            expression=expression,
-            label="js prompt dispatch",
-        )
-        if status and status.get("ok") is False:
-            if type_tools:
-                fallback_status = cdp_fallback_submit(
-                    client=client,
-                    agent_id=agent_id,
-                    prompt=prompt,
-                    js_tools=js_tools,
-                    click_tools=click_tools,
-                    type_tools=type_tools,
-                    ddm_tools=ddm_tools,
-                    layout_text=layout_text,
-                    submit=submit,
-                    baseline_probe=baseline_probe,
-                )
-                if echo_result and show_dispatch_details:
-                    print(f"[{tool}] {result_text}")
-                    print(f"[fallback] {json.dumps(fallback_status)}")
-                status = fallback_status
-                fallback_used = True
-                turn_result["fallback_used"] = True
-            else:
-                raise MCPError(f"Prompt dispatch failed: {status}")
-        elif echo_result and show_dispatch_details:
-            print(f"[{tool}] {result_text}")
+        if native_submit_default:
+            status = cdp_fallback_submit(
+                client=client,
+                agent_id=agent_id,
+                prompt=prompt,
+                js_tools=js_tools,
+                click_tools=click_tools,
+                type_tools=type_tools,
+                ddm_tools=ddm_tools,
+                layout_text=layout_text,
+                submit=submit,
+                baseline_probe=baseline_probe,
+            )
+            fallback_used = True
+            turn_result["fallback_used"] = True
+            if echo_result and show_dispatch_details:
+                print(f"[native-submit] {json.dumps(status)}")
+        else:
+            expression = build_prompt_expression(prompt, submit=submit)
+            tool, _, result_text, status = call_js_expression(
+                client=client,
+                js_tools=js_tools,
+                agent_id=agent_id,
+                expression=expression,
+                label="js prompt dispatch",
+            )
+            if status and status.get("ok") is False:
+                if type_tools:
+                    fallback_status = cdp_fallback_submit(
+                        client=client,
+                        agent_id=agent_id,
+                        prompt=prompt,
+                        js_tools=js_tools,
+                        click_tools=click_tools,
+                        type_tools=type_tools,
+                        ddm_tools=ddm_tools,
+                        layout_text=layout_text,
+                        submit=submit,
+                        baseline_probe=baseline_probe,
+                    )
+                    if echo_result and show_dispatch_details:
+                        print(f"[{tool}] {result_text}")
+                        print(f"[fallback] {json.dumps(fallback_status)}")
+                    status = fallback_status
+                    fallback_used = True
+                    turn_result["fallback_used"] = True
+                else:
+                    raise MCPError(f"Prompt dispatch failed: {status}")
+            elif echo_result and show_dispatch_details:
+                print(f"[{tool}] {result_text}")
 
-        if submit and type_tools:
+        if submit and type_tools and (not native_submit_default):
             post_dispatch_probe = read_assistant_probe(
                 client=client,
                 agent_id=agent_id,
@@ -5181,7 +5373,7 @@ def dispatch_prompt(
                 poll_interval_s=poll_interval_s,
                 debug=show_dispatch_details,
             )
-        if (not user_submitted) and type_tools:
+        if (not user_submitted) and type_tools and (not native_submit_default):
             with foreground_browser_context(submit_focus_mode):
                 pre_retry_probe = read_assistant_probe(
                     client=client,
