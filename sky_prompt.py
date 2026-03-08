@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import difflib
+import errno
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,11 +27,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 DEFAULT_ENDPOINT = "https://api.unchainedsky.com/mcp"
 DEFAULT_URL = "https://chatgpt.com"
 DEFAULT_AGENT_ENV_PATH = Path.home() / "sky-agent" / ".env"
+LEGACY_INSTALL_ENV_PATH = Path.home() / "unchained-agent" / ".env"
 DEFAULT_REPL_HISTORY_PATH = Path.home() / ".sky_prompt_history"
 DEFAULT_REPL_HISTORY_LIMIT = 1000
 _FOREGROUND_BROWSER_CONTEXT_STACK: List[str] = []
 DEFAULT_WAIT_TIMEOUT = 180
 DEFAULT_POLL_INTERVAL = 1.0
+DEFAULT_INSTALL_TIMEOUT = 600
+DEFAULT_AGENT_DISCOVERY_GRACE_SECONDS = 20
+DEFAULT_AGENT_DISCOVERY_POLL_SECONDS = 2.0
 DEFAULT_RENDER_STABLE_POLLS = 3
 DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
@@ -43,6 +51,9 @@ ANSI_CYAN = "\033[36m"
 PRIMARY_API_KEY_ENV = "SKY_API_KEY"
 PRIMARY_AGENT_ID_ENV = "SKY_AGENT_ID"
 PRIMARY_TARGET_URL_ENV = "SKY_TARGET_URL"
+SETUP_ASSUME_YES_ENV = "SKY_SETUP_ASSUME_YES"
+LEGACY_INSTALL_API_KEY_ENV = "UNCHAINED_API_KEY"
+INSTALL_SCRIPT_URL = "https://api.unchainedsky.com/install.sh"
 LANGUAGE_ANSI_BY_LANGUAGE: Dict[str, str] = {
     "python": "\033[38;5;75m",
     "bash": "\033[38;5;78m",
@@ -3643,6 +3654,52 @@ result = a + b
             self.assertEqual(agent_id, "sky-agent")
             self.assertEqual(source, "flags/env")
 
+        def test_resolve_credentials_supports_legacy_install_api_key(self) -> None:
+            module_name = resolve_credentials.__module__
+            with mock.patch.dict(
+                os.environ,
+                {
+                    PRIMARY_API_KEY_ENV: "",
+                    PRIMARY_AGENT_ID_ENV: "",
+                },
+                clear=False,
+            ):
+                with mock.patch(f"{module_name}.parse_env_file", return_value={}):
+                    with mock.patch(
+                        f"{module_name}.load_legacy_install_values",
+                        return_value={LEGACY_INSTALL_API_KEY_ENV: "legacy-key"},
+                    ):
+                        with mock.patch(f"{module_name}.fetch_agent_id", return_value="agent-legacy"):
+                            api_key, agent_id, source = resolve_credentials(
+                                api_key_arg=None,
+                                agent_id_arg=None,
+                                endpoint="https://example.invalid/mcp",
+                                timeout=5,
+                            )
+            self.assertEqual(api_key, "legacy-key")
+            self.assertEqual(agent_id, "agent-legacy")
+            self.assertEqual(source, "legacy-install-env+auto-discovered-from-api")
+
+        def test_run_upstream_install_script_feeds_daemon_choice(self) -> None:
+            module_name = run_upstream_install_script.__module__
+            response_mock = mock.MagicMock()
+            response_mock.read.return_value = b"#!/usr/bin/env bash\necho install\n"
+            response_context = mock.MagicMock()
+            response_context.__enter__.return_value = response_mock
+            response_context.__exit__.return_value = False
+            with mock.patch("urllib.request.urlopen", return_value=response_context):
+                with mock.patch(
+                    f"{module_name}.run_command_with_tty_reply",
+                    return_value=(0, "Agent ID: agent-123\nAPI key: uc_live_demo\n"),
+                ) as run_mock:
+                    ok, detail, api_key, agent_id = run_upstream_install_script(timeout_s=30, daemon_choice="d")
+            self.assertTrue(ok)
+            self.assertEqual(detail, "installed")
+            self.assertEqual(api_key, "uc_live_demo")
+            self.assertEqual(agent_id, "agent-123")
+            self.assertEqual(run_mock.call_args.kwargs.get("reply"), "d\n")
+
+
         def test_extract_agent_choices_prefers_connected_agents(self) -> None:
             payload = {
                 "agents": [
@@ -3664,6 +3721,66 @@ result = a + b
             self.assertIn('SKY_API_KEY="old"', payload)
             self.assertIn('SKY_AGENT_ID="new-agent"', payload)
             self.assertNotIn('SKY_AGENT_ID="old-agent"', payload)
+
+        def test_maybe_migrate_primary_env_writes_missing_values(self) -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                env_path = Path(tmpdir) / ".env"
+                changed = maybe_migrate_primary_env(
+                    api_key="sky-key",
+                    agent_id="agent-123",
+                    env_path=env_path,
+                )
+                payload = env_path.read_text(encoding="utf-8")
+            self.assertTrue(changed)
+            self.assertIn('SKY_API_KEY="sky-key"', payload)
+            self.assertIn('SKY_AGENT_ID="agent-123"', payload)
+
+        def test_wait_for_agent_choices_retries_until_available(self) -> None:
+            module_name = wait_for_agent_choices.__module__
+            fetch_side_effect = [
+                [],
+                [
+                    {
+                        "agent_id": "agent-123",
+                        "label": "MacBook",
+                        "status": "connected",
+                        "connected": True,
+                    }
+                ],
+            ]
+            with mock.patch(f"{module_name}.fetch_agent_choices", side_effect=fetch_side_effect):
+                with mock.patch("time.sleep") as sleep_mock:
+                    choices, error = wait_for_agent_choices(
+                        api_key="sky-key",
+                        endpoint="https://example.invalid/mcp",
+                        timeout=5,
+                        wait_s=1,
+                        poll_s=0.1,
+                    )
+            self.assertIsNone(error)
+            self.assertEqual(str(choices[0].get("agent_id") or ""), "agent-123")
+            sleep_mock.assert_called_once()
+
+        def test_wait_for_agent_connection_retries_until_connected(self) -> None:
+            module_name = wait_for_agent_connection.__module__
+            fetch_side_effect = [
+                [{"agent_id": "agent-123", "connected": False}],
+                [{"agent_id": "agent-123", "connected": True}],
+            ]
+            with mock.patch(f"{module_name}.fetch_agent_choices", side_effect=fetch_side_effect):
+                with mock.patch("time.sleep") as sleep_mock:
+                    connected, saw_agent, error = wait_for_agent_connection(
+                        api_key="sky-key",
+                        agent_id="agent-123",
+                        endpoint="https://example.invalid/mcp",
+                        timeout=5,
+                        wait_s=1,
+                        poll_s=0.1,
+                    )
+            self.assertTrue(connected)
+            self.assertTrue(saw_agent)
+            self.assertIsNone(error)
+            sleep_mock.assert_called_once()
 
         def test_maybe_run_first_call_setup_writes_single_connected_agent(self) -> None:
             module_name = maybe_run_first_call_setup.__module__
@@ -3691,6 +3808,99 @@ result = a + b
             self.assertEqual(agent_id, "agent-123")
             self.assertEqual(source, "setup-wizard")
             write_mock.assert_called_once_with(env_path, PRIMARY_AGENT_ID_ENV, "agent-123")
+
+        def test_maybe_run_first_call_setup_runs_installer_when_api_key_missing(self) -> None:
+            module_name = maybe_run_first_call_setup.__module__
+            env_path = Path("/tmp/sky-setup-install.env")
+            with mock.patch.object(sys.stdin, "isatty", return_value=True):
+                with mock.patch.object(sys.stdout, "isatty", return_value=True):
+                    with mock.patch(f"{module_name}.prompt_for_confirmation", return_value=True):
+                        with mock.patch(
+                            f"{module_name}.run_upstream_install_script",
+                            return_value=(True, "installed", None, None),
+                        ):
+                            with mock.patch(
+                                f"{module_name}.resolve_credentials",
+                                return_value=("sky-key", "agent-456", "auto-discovered-from-api"),
+                            ):
+                                with mock.patch(f"{module_name}.maybe_migrate_primary_env", return_value=True) as migrate_mock:
+                                    with mock.patch("builtins.print"):
+                                        api_key, agent_id, source = maybe_run_first_call_setup(
+                                            api_key=None,
+                                            agent_id=None,
+                                            endpoint="https://example.invalid/mcp",
+                                            timeout=5,
+                                            env_path=env_path,
+                                        )
+            self.assertEqual(api_key, "sky-key")
+            self.assertEqual(agent_id, "agent-456")
+            self.assertEqual(source, "setup-wizard")
+            migrate_mock.assert_called_once_with(api_key="sky-key", agent_id="agent-456", env_path=env_path)
+
+        def test_maybe_run_first_call_setup_honors_assume_yes_env(self) -> None:
+            module_name = maybe_run_first_call_setup.__module__
+            env_path = Path("/tmp/sky-setup-auto-install.env")
+            with mock.patch.object(sys.stdin, "isatty", return_value=True):
+                with mock.patch.object(sys.stdout, "isatty", return_value=True):
+                    with mock.patch.dict(os.environ, {SETUP_ASSUME_YES_ENV: "1"}, clear=False):
+                        with mock.patch(f"{module_name}.prompt_for_confirmation") as prompt_mock:
+                            with mock.patch(
+                                f"{module_name}.run_upstream_install_script",
+                                return_value=(True, "installed", None, None),
+                            ):
+                                with mock.patch(
+                                    f"{module_name}.resolve_credentials",
+                                    return_value=("sky-key", "agent-456", "auto-discovered-from-api"),
+                                ):
+                                    with mock.patch(f"{module_name}.maybe_migrate_primary_env", return_value=True):
+                                        with mock.patch("builtins.print"):
+                                            api_key, agent_id, source = maybe_run_first_call_setup(
+                                                api_key=None,
+                                                agent_id=None,
+                                                endpoint="https://example.invalid/mcp",
+                                                timeout=5,
+                                                env_path=env_path,
+                                            )
+            self.assertEqual(api_key, "sky-key")
+            self.assertEqual(agent_id, "agent-456")
+            self.assertEqual(source, "setup-wizard")
+            prompt_mock.assert_not_called()
+
+        def test_maybe_run_first_call_setup_uses_installer_agent_id_when_available(self) -> None:
+            module_name = maybe_run_first_call_setup.__module__
+            env_path = Path("/tmp/sky-setup-install-wait.env")
+            with mock.patch.object(sys.stdin, "isatty", return_value=True):
+                with mock.patch.object(sys.stdout, "isatty", return_value=True):
+                    with mock.patch(f"{module_name}.prompt_for_confirmation", return_value=True):
+                        with mock.patch(
+                            f"{module_name}.run_upstream_install_script",
+                            return_value=(True, "installed", "sky-key", "agent-789"),
+                        ):
+                            with mock.patch(
+                                f"{module_name}.resolve_credentials",
+                                return_value=("sky-key", None, "legacy-install-env"),
+                            ):
+                                with mock.patch(f"{module_name}.fetch_agent_choices", return_value=[]):
+                                    with mock.patch(
+                                        f"{module_name}.wait_for_agent_choices",
+                                        return_value=([], None),
+                                    ) as wait_mock:
+                                        with mock.patch(f"{module_name}.upsert_env_file_value") as write_mock:
+                                            with mock.patch(f"{module_name}.maybe_migrate_primary_env", return_value=True) as migrate_mock:
+                                                with mock.patch("builtins.print"):
+                                                    api_key, agent_id, source = maybe_run_first_call_setup(
+                                                        api_key=None,
+                                                        agent_id=None,
+                                                        endpoint="https://example.invalid/mcp",
+                                                        timeout=5,
+                                                        env_path=env_path,
+                                                    )
+            self.assertEqual(api_key, "sky-key")
+            self.assertEqual(agent_id, "agent-789")
+            self.assertEqual(source, "setup-wizard")
+            wait_mock.assert_not_called()
+            write_mock.assert_not_called()
+            migrate_mock.assert_called_once_with(api_key="sky-key", agent_id="agent-789", env_path=env_path)
 
         def test_install_alias_launcher_sets_cli_name(self) -> None:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -6218,6 +6428,28 @@ def getenv_first(*names: str) -> Optional[str]:
     return None
 
 
+def load_legacy_install_values(path: Path = LEGACY_INSTALL_ENV_PATH) -> Dict[str, str]:
+    return parse_env_file(path)
+
+
+def maybe_migrate_primary_env(
+    api_key: Optional[str],
+    agent_id: Optional[str],
+    env_path: Path = DEFAULT_AGENT_ENV_PATH,
+) -> bool:
+    if not api_key and not agent_id:
+        return False
+    current_values = parse_env_file(env_path)
+    changed = False
+    if api_key and not current_values.get(PRIMARY_API_KEY_ENV):
+        upsert_env_file_value(env_path, PRIMARY_API_KEY_ENV, api_key)
+        changed = True
+    if agent_id and not current_values.get(PRIMARY_AGENT_ID_ENV):
+        upsert_env_file_value(env_path, PRIMARY_AGENT_ID_ENV, agent_id)
+        changed = True
+    return changed
+
+
 def infer_agents_endpoint(endpoint: str) -> str:
     clean = endpoint.rstrip("/")
     if clean.endswith("/mcp"):
@@ -6376,6 +6608,216 @@ def prompt_for_choice(prompt: str, count: int, default_index: int = 1) -> Option
         print(f"Enter a number between 1 and {count}, or q to cancel.")
 
 
+def prompt_for_confirmation(prompt: str, default: bool = True) -> Optional[bool]:
+    while True:
+        try:
+            raw = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        if raw in {"q", "quit", "exit"}:
+            return None
+        print("Enter y or n, or q to cancel.")
+
+
+def run_command_with_tty_reply(
+    argv: Sequence[str],
+    reply: str,
+    prompt_markers: Sequence[str],
+    timeout_s: int,
+) -> Tuple[int, str]:
+    if os.name != "posix":
+        completed = subprocess.run(
+            list(argv),
+            input=reply,
+            text=True,
+            timeout=max(30, int(timeout_s)),
+            check=False,
+        )
+        return int(completed.returncode), ""
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(str(argv[0]), list(argv))
+        except FileNotFoundError:
+            os._exit(127)
+        except Exception:
+            os._exit(1)
+
+    prompt_seen = ""
+    output_chunks: List[str] = []
+    reply_sent = False
+    deadline = time.monotonic() + max(30, int(timeout_s))
+    status: Optional[int] = None
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                raise subprocess.TimeoutExpired(list(argv), int(timeout_s))
+
+            timeout_window = min(0.2, max(0.0, deadline - now))
+            ready, _, _ = select.select([master_fd], [], [], timeout_window)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        chunk = b""
+                    else:
+                        raise
+                if chunk:
+                    text = chunk.decode("utf-8", "replace")
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    output_chunks.append(text)
+                    prompt_seen = (prompt_seen + text)[-1024:]
+                    if not reply_sent and any(marker in prompt_seen for marker in prompt_markers):
+                        os.write(master_fd, reply.encode("utf-8"))
+                        reply_sent = True
+                elif status is not None:
+                    break
+
+            if status is None:
+                done_pid, done_status = os.waitpid(pid, os.WNOHANG)
+                if done_pid == pid:
+                    status = done_status
+                    if not ready:
+                        break
+
+        if status is None:
+            _, status = os.waitpid(pid, 0)
+    except KeyboardInterrupt:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        raise
+    finally:
+        os.close(master_fd)
+
+    if os.WIFEXITED(status):
+        return int(os.WEXITSTATUS(status)), "".join(output_chunks)
+    if os.WIFSIGNALED(status):
+        return 128 + int(os.WTERMSIG(status)), "".join(output_chunks)
+    return 1, "".join(output_chunks)
+
+
+def extract_installer_output_values(output: str) -> Tuple[Optional[str], Optional[str]]:
+    agent_matches = re.findall(r"^\s*Agent ID:\s+(\S+)\s*$", output, flags=re.MULTILINE)
+    api_key_matches = re.findall(r"^\s*API key:\s+(\S+)\s*$", output, flags=re.MULTILINE)
+    agent_id = agent_matches[-1].strip() if agent_matches else None
+    api_key = api_key_matches[-1].strip() if api_key_matches else None
+    return api_key, agent_id
+
+
+def run_upstream_install_script(
+    install_url: str = INSTALL_SCRIPT_URL,
+    timeout_s: int = DEFAULT_INSTALL_TIMEOUT,
+    daemon_choice: str = "d",
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
+    try:
+        with urllib.request.urlopen(install_url, timeout=max(30, int(timeout_s))) as response:
+            script_body = response.read().decode("utf-8", "replace")
+    except Exception as exc:
+        return False, f"install download failed: {exc}", None, None
+
+    script_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh", encoding="utf-8") as handle:
+            handle.write(script_body)
+            script_path = Path(handle.name)
+        script_path.chmod(0o700)
+        returncode, output = run_command_with_tty_reply(
+            ["bash", str(script_path)],
+            reply=f"{daemon_choice}\n",
+            prompt_markers=("Start now? [d]aemon / [f]oreground / [N]o:",),
+            timeout_s=max(30, int(timeout_s)),
+        )
+    except FileNotFoundError:
+        return False, "bash not found", None, None
+    except subprocess.TimeoutExpired:
+        return False, f"install timed out after {int(timeout_s)}s", None, None
+    except KeyboardInterrupt:
+        return False, "install cancelled", None, None
+    finally:
+        if script_path is not None:
+            script_path.unlink(missing_ok=True)
+
+    api_key, agent_id = extract_installer_output_values(output)
+    if int(returncode) != 0:
+        return False, f"install exited with code {returncode}", api_key, agent_id
+    return True, "installed", api_key, agent_id
+
+
+def wait_for_agent_choices(
+    api_key: str,
+    endpoint: str,
+    timeout: int,
+    wait_s: float = DEFAULT_AGENT_DISCOVERY_GRACE_SECONDS,
+    poll_s: float = DEFAULT_AGENT_DISCOVERY_POLL_SECONDS,
+) -> Tuple[List[Dict[str, Any]], Optional[Exception]]:
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    last_error: Optional[Exception] = None
+    while True:
+        try:
+            choices = fetch_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            choices = []
+        else:
+            last_error = None
+            if choices:
+                return choices, None
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return [], last_error
+        time.sleep(min(max(0.1, float(poll_s)), remaining))
+
+
+def wait_for_agent_connection(
+    api_key: str,
+    agent_id: str,
+    endpoint: str,
+    timeout: int,
+    wait_s: float = DEFAULT_AGENT_DISCOVERY_GRACE_SECONDS,
+    poll_s: float = DEFAULT_AGENT_DISCOVERY_POLL_SECONDS,
+) -> Tuple[bool, bool, Optional[Exception]]:
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    last_error: Optional[Exception] = None
+    saw_agent = False
+    while True:
+        try:
+            choices = fetch_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            choices = []
+        else:
+            last_error = None
+            for item in choices:
+                if str(item.get("agent_id") or "").strip() != agent_id:
+                    continue
+                saw_agent = True
+                if bool(item.get("connected")):
+                    return True, True, None
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, saw_agent, last_error
+        time.sleep(min(max(0.1, float(poll_s)), remaining))
+
+
 def maybe_run_first_call_setup(
     api_key: Optional[str],
     agent_id: Optional[str],
@@ -6383,6 +6825,7 @@ def maybe_run_first_call_setup(
     timeout: int,
     env_path: Path = DEFAULT_AGENT_ENV_PATH,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    installed_now = False
     if api_key and agent_id:
         return api_key, agent_id, None
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -6393,9 +6836,43 @@ def maybe_run_first_call_setup(
     print(f"  Agent id: {'found' if agent_id else 'missing'}")
 
     if not api_key:
-        print(f"Run: curl -fsSL https://api.unchainedsky.com/install.sh | bash")
-        print(f"Then rerun sky. Expected config path: {env_path}")
-        return api_key, agent_id, "setup-instructions"
+        assume_yes_raw = os.getenv(SETUP_ASSUME_YES_ENV, "").strip().lower()
+        if assume_yes_raw in {"1", "true", "yes", "y", "on"}:
+            install_now = True
+            print(f"{SETUP_ASSUME_YES_ENV}=1 -> running installer")
+        else:
+            install_now = prompt_for_confirmation("Run Sky installer now? [Y/n]: ", default=True)
+        if install_now is None:
+            print("setup cancelled")
+            return api_key, agent_id, "setup-cancelled"
+        if not install_now:
+            print(f"Run: curl -fsSL https://api.unchainedsky.com/install.sh | bash")
+            print(f"Then rerun sky. Expected config path: {env_path}")
+            return api_key, agent_id, "setup-instructions"
+        ok, detail, installer_api_key, installer_agent_id = run_upstream_install_script(
+            timeout_s=max(DEFAULT_INSTALL_TIMEOUT, int(timeout))
+        )
+        if not ok:
+            print(f"Installer failed: {detail}")
+            return api_key, agent_id, "setup-instructions"
+        installed_now = True
+        resolved_api_key, resolved_agent_id, _ = resolve_credentials(
+            api_key_arg=None,
+            agent_id_arg=None,
+            endpoint=endpoint,
+            timeout=timeout,
+        )
+        api_key = resolved_api_key or installer_api_key
+        agent_id = resolved_agent_id or installer_agent_id
+        if api_key:
+            maybe_migrate_primary_env(api_key=api_key, agent_id=agent_id, env_path=env_path)
+        print(f"  API key: {'found' if api_key else 'missing'}")
+        print(f"  Agent id: {'found' if agent_id else 'missing'}")
+        if api_key and agent_id:
+            return api_key, agent_id, "setup-wizard"
+        if not api_key:
+            print("Installer completed but SKY_API_KEY is still missing.")
+            return api_key, agent_id, "setup-instructions"
 
     if agent_id:
         return api_key, agent_id, None
@@ -6404,9 +6881,26 @@ def maybe_run_first_call_setup(
     try:
         agent_choices = fetch_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
     except Exception as exc:
-        print(f"Agent discovery failed: {exc}")
-        print("Start the Sky agent and rerun sky.")
-        return api_key, agent_id, "setup-instructions"
+        if not installed_now:
+            print(f"Agent discovery failed: {exc}")
+            print("Start the Sky agent and rerun sky.")
+            return api_key, agent_id, "setup-instructions"
+        print("Waiting for the new agent to register...")
+        agent_choices, wait_error = wait_for_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
+        if not agent_choices:
+            print(f"Agent discovery failed: {wait_error or exc}")
+            print("Start the Sky agent and rerun sky.")
+            return api_key, agent_id, "setup-instructions"
+    else:
+        if installed_now and not agent_choices:
+            print("Waiting for the new agent to register...")
+            waited_choices, wait_error = wait_for_agent_choices(api_key=api_key, endpoint=endpoint, timeout=timeout)
+            if waited_choices:
+                agent_choices = waited_choices
+            elif wait_error is not None:
+                print(f"Agent discovery failed: {wait_error}")
+                print("Start the Sky agent and rerun sky.")
+                return api_key, agent_id, "setup-instructions"
 
     connected_choices = [item for item in agent_choices if bool(item.get("connected"))]
     active_choices = connected_choices or agent_choices
@@ -6519,19 +7013,28 @@ def resolve_credentials(
     timeout: int,
 ) -> Tuple[Optional[str], Optional[str], str]:
     env_file_values = parse_env_file(DEFAULT_AGENT_ENV_PATH)
+    legacy_install_values = load_legacy_install_values()
     env_file_agent_id = env_file_values.get(PRIMARY_AGENT_ID_ENV)
 
-    api_key = api_key_arg or getenv_first(PRIMARY_API_KEY_ENV) or env_file_values.get(PRIMARY_API_KEY_ENV)
+    api_key = (
+        api_key_arg
+        or getenv_first(PRIMARY_API_KEY_ENV)
+        or env_file_values.get(PRIMARY_API_KEY_ENV)
+        or legacy_install_values.get(LEGACY_INSTALL_API_KEY_ENV)
+    )
     agent_id = agent_id_arg or getenv_first(PRIMARY_AGENT_ID_ENV) or env_file_agent_id
 
     source = "flags/env"
     if not api_key:
         return None, None, source
 
+    if not env_file_values.get(PRIMARY_API_KEY_ENV) and legacy_install_values.get(LEGACY_INSTALL_API_KEY_ENV):
+        source = "legacy-install-env"
+
     if not agent_id:
         agent_id = fetch_agent_id(api_key=api_key, endpoint=endpoint, timeout=timeout)
         if agent_id:
-            source = "auto-discovered-from-api"
+            source = "auto-discovered-from-api" if source == "flags/env" else f"{source}+auto-discovered-from-api"
         elif env_file_agent_id:
             source = "local-env-file"
     elif agent_id == env_file_agent_id:
@@ -7903,6 +8406,27 @@ def main() -> int:
             "in ~/.sky-agent/.env, or ensure "
             "https://api.unchainedsky.com/api/agents returns a connected agent."
         )
+    maybe_migrate_primary_env(
+        api_key=resolved_api_key,
+        agent_id=resolved_agent_id,
+    )
+    if setup_source == "setup-wizard":
+        print(f"Waiting for agent {resolved_agent_id} to connect...")
+        connected, saw_agent, connect_error = wait_for_agent_connection(
+            api_key=resolved_api_key,
+            agent_id=resolved_agent_id,
+            endpoint=args.endpoint,
+            timeout=args.timeout,
+        )
+        if not connected:
+            if connect_error is not None:
+                print(f"Agent connection check failed: {connect_error}")
+            elif saw_agent:
+                print(f"Agent {resolved_agent_id} is not connected yet.")
+            else:
+                print(f"Agent {resolved_agent_id} has not appeared yet.")
+            print("Rerun sky in a few seconds if the agent just started.")
+            return 2
 
     cli_prompt = " ".join(args.prompt_args).strip()
     explicit_prompt = (args.prompt or "").strip()

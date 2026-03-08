@@ -39,11 +39,11 @@ sk --help
 
 ```bash
 curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/sky-agent
+cd ~/unchained-agent
 ./start.sh --daemon
 ```
 
-2. Run `sky` and follow the first-run setup if prompted. `install.sh` should already place the API key in `~/.sky-agent/.env`.
+2. Run `sky` and follow the first-run setup if prompted. If no API key is present, `sky` can launch the upstream installer for you and auto-select daemon start. The current upstream installer still creates `~/unchained-agent/.env`; `sky` imports that into `~/sky-agent/.env` automatically on first run.
 
 3. Run one-shot prompt:
 
@@ -82,7 +82,7 @@ now summarize in 3 bullets
 
 ```bash
 curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/sky-agent
+cd ~/unchained-agent
 ./start.sh --daemon
 ```
 
@@ -93,7 +93,7 @@ export SKY_API_KEY="uc_live_..."
 export SKY_AGENT_ID="claude-xxxxxxxx"
 ```
 
-On first run, if `SKY_AGENT_ID` is missing but the API key is present, `sky` will guide you through selecting a connected agent and write it back to `~/.sky-agent/.env`.
+On first run, if the upstream installer only created `~/unchained-agent/.env`, `sky` will import the API key into `~/sky-agent/.env`. If `SKY_AGENT_ID` is still missing but the API key is present, `sky` will guide you through selecting a connected agent and write it back to `~/sky-agent/.env`.
 
 To find your agent id:
 
