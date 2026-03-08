@@ -36,6 +36,28 @@ DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
 SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
+REPL_COMMAND_SPECS: Tuple[Dict[str, Any], ...] = (
+    {"name": "/url", "usage": "/url <url>", "summary": "navigate the connected browser target"},
+    {"name": "/submit", "usage": "/submit on|off", "summary": "toggle prompt submission after fill"},
+    {"name": "/format", "usage": "/format markdown|plain|json", "summary": "set assistant output format"},
+    {"name": "/backend", "usage": "/backend [local|pyreplab]", "summary": "show or switch the /run backend"},
+    {"name": "/py", "usage": "/py <code>", "summary": "run Python directly in the pyreplab session"},
+    {"name": "/pyfile", "usage": "/pyfile <path.py>", "summary": "run a Python file in the pyreplab session"},
+    {"name": "/history", "usage": "/history [n]", "summary": "show recent interactive turns"},
+    {"name": "/last", "usage": "/last", "summary": "reprint the last turn with active refs"},
+    {"name": "/cells", "usage": "/cells [n|all]", "summary": "list stored runnable cells"},
+    {"name": "/show", "usage": "/show [cell|@ref]", "summary": "print a cell or response ref"},
+    {"name": "/run", "usage": "/run [cell|@ref] [timeout]", "summary": "execute a cell or response ref"},
+    {"name": "/focus", "usage": "/focus <cell|@ref>", "summary": "set the current focused cell/ref"},
+    {"name": "/fork", "usage": "/fork <src|@ref> [dst]", "summary": "clone a cell for mutation"},
+    {"name": "/edit", "usage": "/edit <cell|@ref>", "summary": "open a cell in $EDITOR"},
+    {"name": "/save", "usage": "/save <cell|@ref> <path>", "summary": "write a cell to disk"},
+    {"name": "/diff", "usage": "/diff <a|@ref> <b|@ref>", "summary": "show a unified diff between two cells"},
+    {"name": "/ddm", "usage": "/ddm", "summary": "inspect the current page with ddm"},
+    {"name": "/help", "usage": "/help", "summary": "show interactive commands"},
+    {"name": "/exit", "usage": "/exit", "summary": "leave interactive mode"},
+)
+REPL_REF_COMMANDS: Tuple[str, ...] = ("/run", "/show", "/edit", "/fork", "/save", "/diff", "/focus")
 LANGUAGE_ALIASES: Dict[str, str] = {
     "py": "python",
     "python3": "python",
@@ -2309,6 +2331,272 @@ def extract_labeled_code_and_output_blocks_from_text(
     return code_blocks, output_blocks
 
 
+def extract_response_items_from_text(
+    text: str,
+    start_text_index: int,
+    start_labeled_code_index: int,
+    start_output_index: int,
+    start_command_index: int,
+    start_inferred_index: int,
+    segment_id: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int, int, int, int, int]:
+    lines = str(text or "").splitlines()
+    items: List[Dict[str, Any]] = []
+    i = 0
+    text_index = start_text_index
+    labeled_code_index = start_labeled_code_index
+    output_index = start_output_index
+    command_index = start_command_index
+    inferred_index = start_inferred_index
+    text_buffer: List[str] = []
+
+    def flush_text_buffer() -> None:
+        nonlocal text_index
+        if not text_buffer:
+            return
+        while text_buffer and not text_buffer[0].strip():
+            text_buffer.pop(0)
+        while text_buffer and not text_buffer[-1].strip():
+            text_buffer.pop()
+        if not text_buffer:
+            return
+        chunk = "\n".join(text_buffer).strip("\n")
+        text_buffer.clear()
+        if not chunk.strip():
+            return
+        item: Dict[str, Any] = {
+            "id": f"text_item_{text_index}",
+            "type": "text",
+            "source": "text",
+            "text": chunk,
+        }
+        if segment_id:
+            item["segment_id"] = segment_id
+        items.append(item)
+        text_index += 1
+
+    while i < len(lines):
+        declared_language = parse_language_label_line(lines[i])
+        if declared_language and declared_language != "text":
+            language = normalize_code_language(declared_language)
+            j = i + 1
+            while j < len(lines) and lines[j].strip().lower() in UI_NOISE_LINES:
+                j += 1
+
+            collected: List[str] = []
+            strong_markers = 0
+            while j < len(lines):
+                current = lines[j]
+                stripped = current.strip()
+                if not stripped:
+                    if collected:
+                        collected.append("")
+                    j += 1
+                    continue
+                if is_output_label_line(stripped):
+                    break
+
+                render_line = current.rstrip()
+                matched = False
+                if language == "python":
+                    matched = looks_like_python_code_line(current) or (
+                        collected and looks_like_python_continuation_line(current)
+                    )
+                elif language == "bash":
+                    matched = looks_like_shell_command_line(current)
+                    if matched:
+                        render_line = normalize_shell_candidate_line(current)
+                else:
+                    matched = looks_like_generic_code_line(current)
+                if not matched:
+                    break
+
+                collected.append(render_line)
+                if (
+                    re.match(r"^(from|import|def|class)\b", stripped)
+                    or "=" in stripped
+                    or "print" in stripped
+                    or (language == "bash" and looks_like_shell_command_line(stripped))
+                ):
+                    strong_markers += 1
+                j += 1
+
+            while collected and not collected[0].strip():
+                collected.pop(0)
+            while collected and not collected[-1].strip():
+                collected.pop()
+            if language == "python":
+                trim_trailing_heading_comment_lines(collected)
+
+            non_empty = [line for line in collected if line.strip()]
+            content = "\n".join(collected)
+            syntax_valid = True
+            has_valid_code = len(non_empty) >= 1 and (strong_markers >= 1 or language in {"bash", "python"})
+            if language == "python":
+                syntax_valid = python_snippet_is_valid(content)
+                has_valid_code = has_valid_code and syntax_valid
+            if has_valid_code:
+                flush_text_buffer()
+                runner = language_runner(language)
+                code_item: Dict[str, Any] = {
+                    "id": f"code_labeled_{labeled_code_index}",
+                    "type": "code_block",
+                    "source": "labeled_text",
+                    "language": language,
+                    "declared_language": language,
+                    "inferred_language": language,
+                    "runner": runner,
+                    "syntax_valid": syntax_valid,
+                    "executable": bool(runner) and syntax_valid,
+                    "content": content,
+                }
+                if segment_id:
+                    code_item["segment_id"] = segment_id
+                items.append(code_item)
+                labeled_code_index += 1
+
+                i = j
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+
+                if i < len(lines) and is_output_label_line(lines[i]):
+                    label_raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", lines[i].strip().lower())
+                    label_raw = re.sub(r"^\s*[-*]\s*", "", label_raw)
+                    label_raw = re.sub(r"^\s*\d+\.\s*", "", label_raw)
+                    label = re.sub(r"[\s:.\-]+$", "", label_raw)
+                    i += 1
+                    output_lines: List[str] = []
+                    consecutive_blanks = 0
+                    while i < len(lines):
+                        current = lines[i]
+                        stripped = current.strip()
+                        if not stripped:
+                            if output_lines:
+                                consecutive_blanks += 1
+                                if consecutive_blanks >= 2:
+                                    break
+                                output_lines.append("")
+                            i += 1
+                            continue
+
+                        consecutive_blanks = 0
+                        if output_lines and parse_language_label_line(stripped):
+                            break
+                        if output_lines and re.match(r"^\s{0,3}#{1,6}\s+", current):
+                            break
+                        if output_lines and not looks_like_runtime_output_line(current):
+                            break
+                        output_lines.append(current.rstrip())
+                        i += 1
+
+                    while output_lines and not output_lines[0].strip():
+                        output_lines.pop(0)
+                    while output_lines and not output_lines[-1].strip():
+                        output_lines.pop()
+                    if output_lines:
+                        output_item: Dict[str, Any] = {
+                            "id": f"output_{output_index}",
+                            "type": "output_block",
+                            "source": "labeled_text",
+                            "label": label or "result",
+                            "language": "text",
+                            "content": "\n".join(output_lines),
+                        }
+                        if segment_id:
+                            output_item["segment_id"] = segment_id
+                        items.append(output_item)
+                        output_index += 1
+                continue
+
+        if looks_like_shell_command_line(lines[i]):
+            commands: List[str] = []
+            j = i
+            while j < len(lines) and looks_like_shell_command_line(lines[j]):
+                candidate = normalize_shell_candidate_line(lines[j])
+                if candidate:
+                    commands.append(candidate)
+                j += 1
+            if commands:
+                flush_text_buffer()
+                command_item: Dict[str, Any] = {
+                    "id": f"command_{command_index}",
+                    "type": "command_block",
+                    "source": "command_text",
+                    "language": "bash",
+                    "runner": "bash",
+                    "executable": True,
+                    "commands": commands,
+                    "content": "\n".join(commands),
+                }
+                if segment_id:
+                    command_item["segment_id"] = segment_id
+                items.append(command_item)
+                command_index += 1
+                i = j
+                continue
+
+        if looks_like_python_code_line(lines[i]):
+            start = i
+            collected = []
+            strong_markers = 0
+            while i < len(lines):
+                current = lines[i]
+                if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
+                    collected.append(current.rstrip())
+                    trimmed = current.strip()
+                    if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed or "print" in trimmed:
+                        strong_markers += 1
+                    i += 1
+                    continue
+                if current.strip() == "" and collected:
+                    collected.append("")
+                    i += 1
+                    continue
+                break
+
+            while collected and not collected[0].strip():
+                collected.pop(0)
+            while collected and not collected[-1].strip():
+                collected.pop()
+            trim_trailing_heading_comment_lines(collected)
+            non_empty = [line for line in collected if line.strip()]
+            content = "\n".join(collected)
+            if len(non_empty) >= 1 and strong_markers >= 1 and python_snippet_is_valid(content):
+                flush_text_buffer()
+                inferred_item: Dict[str, Any] = {
+                    "id": f"code_inferred_{inferred_index}",
+                    "type": "code_block",
+                    "source": "inferred_text",
+                    "language": "python",
+                    "declared_language": None,
+                    "inferred_language": "python",
+                    "runner": "python",
+                    "syntax_valid": True,
+                    "executable": True,
+                    "content": content,
+                }
+                if segment_id:
+                    inferred_item["segment_id"] = segment_id
+                items.append(inferred_item)
+                inferred_index += 1
+                continue
+
+            i = start
+
+        text_buffer.append(lines[i].rstrip())
+        i += 1
+
+    flush_text_buffer()
+    return (
+        items,
+        text_index,
+        labeled_code_index,
+        output_index,
+        command_index,
+        inferred_index,
+    )
+
+
 def dedupe_code_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen: set = set()
@@ -2527,40 +2815,48 @@ def prettify_markdown_response(markdown_text: str) -> str:
 def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
     text = str(markdown_text or "").strip()
     segments, fenced_code_blocks = split_markdown_with_fenced_blocks(text)
-    command_blocks: List[Dict[str, Any]] = []
-    labeled_code_blocks: List[Dict[str, Any]] = []
-    inferred_code_blocks: List[Dict[str, Any]] = []
-    output_blocks: List[Dict[str, Any]] = []
-    command_index = 1
+    response_items: List[Dict[str, Any]] = []
+    text_item_index = 1
     labeled_code_index = 1
-    inferred_index = 1
     output_index = 1
+    command_index = 1
+    inferred_index = 1
+    fenced_code_by_id = {
+        str(block.get("id") or ""): block
+        for block in fenced_code_blocks
+        if str(block.get("id") or "")
+    }
 
     for segment in segments:
-        if segment.get("type") != "text":
+        segment_type = str(segment.get("type") or "")
+        segment_id = str(segment.get("id") or "")
+        if segment_type == "code":
+            block = fenced_code_by_id.get(segment_id)
+            if isinstance(block, dict):
+                response_items.append(dict(block))
             continue
-        segment_text = str(segment.get("text") or "")
-
-        extracted_labeled_code, extracted_outputs = extract_labeled_code_and_output_blocks_from_text(
-            segment_text,
-            labeled_code_index,
-            output_index,
+        if segment_type != "text":
+            continue
+        extracted_items, text_item_index, labeled_code_index, output_index, command_index, inferred_index = (
+            extract_response_items_from_text(
+                str(segment.get("text") or ""),
+                start_text_index=text_item_index,
+                start_labeled_code_index=labeled_code_index,
+                start_output_index=output_index,
+                start_command_index=command_index,
+                start_inferred_index=inferred_index,
+                segment_id=segment_id or None,
+            )
         )
-        labeled_code_blocks.extend(extracted_labeled_code)
-        output_blocks.extend(extracted_outputs)
-        labeled_code_index += len(extracted_labeled_code)
-        output_index += len(extracted_outputs)
+        response_items.extend(extracted_items)
 
-        extracted_commands = extract_command_blocks_from_text(segment_text, command_index)
-        command_blocks.extend(extracted_commands)
-        command_index += len(extracted_commands)
-
-        extracted_python = extract_python_blocks_from_text(segment_text, inferred_index)
-        inferred_code_blocks.extend(extracted_python)
-        inferred_index += len(extracted_python)
-
-    code_blocks = dedupe_code_blocks(fenced_code_blocks + labeled_code_blocks + inferred_code_blocks)
-    command_blocks = dedupe_command_blocks(command_blocks)
+    code_blocks = dedupe_code_blocks(
+        [dict(item) for item in response_items if str(item.get("type") or "") == "code_block"]
+    )
+    command_blocks = dedupe_command_blocks(
+        [dict(item) for item in response_items if str(item.get("type") or "") == "command_block"]
+    )
+    output_blocks = [dict(item) for item in response_items if str(item.get("type") or "") == "output_block"]
     bash_code_contents = {
         str(block.get("content") or "").strip()
         for block in code_blocks
@@ -2633,6 +2929,7 @@ def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
 
     return {
         "segments": segments,
+        "response_items": response_items,
         "code_blocks": code_blocks,
         "command_blocks": command_blocks,
         "output_blocks": output_blocks,
@@ -2675,6 +2972,164 @@ def format_assistant_output(
         return json.dumps(payload, indent=2)
 
     return prettify_markdown_response(normalized_text)
+
+
+def format_cell_action_footer(action_ref: Dict[str, Any]) -> str:
+    handle = str(action_ref.get("handle") or "").strip()
+    cell_id = str(action_ref.get("cell_id") or "").strip()
+    language = normalize_code_language(str(action_ref.get("language") or "")) or "text"
+    return (
+        f"[{handle} {cell_id} {language}] "
+        f"/run {handle} /show {handle} /edit {handle} /fork {handle}"
+    ).strip()
+
+
+def render_response_items_with_action_refs(
+    response_items: Sequence[Dict[str, Any]],
+    action_ref_by_source_id: Dict[str, Dict[str, Any]],
+) -> str:
+    lines, _ = build_response_render_lines(response_items, action_ref_by_source_id)
+    rendered = "\n".join(lines)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered.strip()
+
+
+def build_response_render_lines(
+    response_items: Sequence[Dict[str, Any]],
+    action_ref_by_source_id: Dict[str, Dict[str, Any]],
+) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    lines: List[str] = []
+    ref_spans: Dict[str, Dict[str, Any]] = {}
+
+    def append_blank_line() -> None:
+        if lines and lines[-1] != "":
+            lines.append("")
+
+    def append_text_block(block_text: str) -> None:
+        text = str(block_text or "").strip()
+        if not text:
+            return
+        append_blank_line()
+        lines.extend(text.splitlines())
+
+    def register_ref_span(action_ref: Dict[str, Any], start_line: int, end_line: int) -> None:
+        handle = str(action_ref.get("handle") or "").strip()
+        cell_id = str(action_ref.get("cell_id") or "").strip()
+        payload = {
+            "handle": handle,
+            "cell_id": cell_id,
+            "language": normalize_code_language(str(action_ref.get("language") or "")) or "text",
+            "start_line": int(start_line),
+            "end_line": int(end_line),
+        }
+        if handle:
+            ref_spans[handle] = dict(payload)
+        if cell_id:
+            ref_spans[cell_id] = dict(payload)
+
+    for item in response_items:
+        item_type = str(item.get("type") or "")
+        if item_type == "text":
+            append_text_block(str(item.get("text") or ""))
+            continue
+
+        if item_type in {"code_block", "command_block"}:
+            language = normalize_code_language(str(item.get("language") or "")) or "text"
+            body = str(item.get("content") or "").strip("\n")
+            block_start = len(lines)
+            block_end = len(lines)
+            if body:
+                append_blank_line()
+                block_start = len(lines)
+                lines.append(f"```{language}")
+                lines.extend(body.splitlines())
+                lines.append("```")
+                block_end = len(lines) - 1
+            action_ref = action_ref_by_source_id.get(str(item.get("id") or ""))
+            if action_ref:
+                footer = format_cell_action_footer(action_ref)
+                append_blank_line()
+                lines.append(footer)
+                if body:
+                    register_ref_span(action_ref, block_start, block_end)
+            continue
+
+        if item_type == "output_block":
+            label = str(item.get("label") or "output").strip() or "output"
+            body = str(item.get("content") or "").strip("\n")
+            if body:
+                append_blank_line()
+                lines.append(f"{label.capitalize()}:")
+                lines.append("```text")
+                lines.extend(body.splitlines())
+                lines.append("```")
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines, ref_spans
+
+
+def build_interactive_turn_view(
+    assistant_text: Optional[str],
+    output_format: str,
+    artifacts: Optional[Dict[str, Any]] = None,
+    action_refs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    normalized_text = str(assistant_text or "").strip()
+    mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
+    artifact_payload = artifacts if isinstance(artifacts, dict) else build_response_artifacts(normalized_text)
+    refs = list(action_refs or [])
+    action_ref_by_source_id = {
+        str(ref.get("source_id") or ""): ref
+        for ref in refs
+        if str(ref.get("source_id") or "")
+    }
+    response_items = list(artifact_payload.get("response_items") or [])
+    preview_lines: List[str] = []
+    ref_spans: Dict[str, Dict[str, Any]] = {}
+    if response_items:
+        preview_lines, ref_spans = build_response_render_lines(response_items, action_ref_by_source_id)
+    preview_text = "\n".join(preview_lines).strip()
+
+    if mode == "json":
+        payload: Dict[str, Any] = {
+            "ok": bool(normalized_text),
+            "format": "json",
+            "text": normalized_text,
+            "artifacts": artifact_payload,
+        }
+        if refs:
+            payload["action_refs"] = refs
+        rendered = json.dumps(payload, indent=2)
+    elif preview_text:
+        rendered = preview_text
+    else:
+        rendered = format_assistant_output(normalized_text, output_format=mode, snapshot=None)
+    if mode == "plain":
+        rendered = markdown_to_plain_text(rendered)
+    return {
+        "artifacts": artifact_payload,
+        "action_refs": refs,
+        "output_format": mode,
+        "rendered_output": rendered,
+        "preview_lines": preview_lines,
+        "ref_spans": ref_spans,
+    }
+
+
+def render_interactive_turn_output(
+    assistant_text: Optional[str],
+    output_format: str,
+    artifacts: Optional[Dict[str, Any]] = None,
+    action_refs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> str:
+    turn_view = build_interactive_turn_view(
+        assistant_text=assistant_text,
+        output_format=output_format,
+        artifacts=artifacts,
+        action_refs=action_refs,
+    )
+    return str(turn_view.get("rendered_output") or "")
 
 
 def run_self_tests() -> int:
@@ -2870,6 +3325,33 @@ X_train, X_test, y_train, y_test = train_test_split(
             self.assertIn("])", content)
             self.assertIn("y = np.array([0, 0, 0, 1, 1, 1])", content)
 
+        def test_response_items_preserve_text_code_output_and_command_order(self) -> None:
+            sample = """Intro
+
+Python
+x = 1
+print(x)
+
+Output:
+1
+
+pip install numpy
+python app.py
+
+Done
+"""
+            artifacts = build_response_artifacts(sample)
+            items = list(artifacts.get("response_items") or [])
+            self.assertEqual(
+                [str(item.get("type") or "") for item in items],
+                ["text", "code_block", "output_block", "command_block", "text"],
+            )
+            self.assertEqual(str(items[0].get("text") or ""), "Intro")
+            self.assertIn("print(x)", str(items[1].get("content") or ""))
+            self.assertEqual(str(items[2].get("label") or ""), "output")
+            self.assertIn("python app.py", str(items[3].get("content") or ""))
+            self.assertEqual(str(items[4].get("text") or ""), "Done")
+
         def test_invalid_math_equation_not_executable_python_cell(self) -> None:
             sample = "y = 2x + 1"
             artifacts = build_response_artifacts(sample)
@@ -2902,6 +3384,119 @@ result = a + b
             self.assertEqual(len(new_cells), 1)
             self.assertEqual(new_cells[0].get("id"), "py1")
             self.assertIn("print(x)", str(new_cells[0].get("content") or ""))
+
+        def test_build_turn_action_refs_uses_response_item_order(self) -> None:
+            turn_result: Dict[str, Any] = {
+                "assistant_text": "Python\nx = 1\nprint(x)\n\npip install numpy\npython app.py\n",
+                "artifacts": build_response_artifacts(
+                    "Python\nx = 1\nprint(x)\n\npip install numpy\npython app.py\n"
+                ),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            refs = build_turn_action_refs(turn_result, new_cells)
+            self.assertEqual([str(ref.get("handle") or "") for ref in refs], ["@1", "@2"])
+            self.assertEqual([str(ref.get("cell_id") or "") for ref in refs], ["py1", "sh1"])
+
+        def test_render_interactive_turn_output_inlines_action_refs(self) -> None:
+            assistant_text = "Python\nx = 1\nprint(x)\n"
+            turn_result: Dict[str, Any] = {
+                "assistant_text": assistant_text,
+                "artifacts": build_response_artifacts(assistant_text),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            refs = build_turn_action_refs(turn_result, new_cells)
+            rendered = render_interactive_turn_output(
+                assistant_text=assistant_text,
+                output_format="markdown",
+                artifacts=turn_result.get("artifacts"),
+                action_refs=refs,
+            )
+            self.assertIn("```python", rendered)
+            self.assertIn("[@1 py1 python] /run @1 /show @1 /edit @1 /fork @1", rendered)
+
+        def test_build_interactive_turn_view_tracks_ref_line_spans(self) -> None:
+            assistant_text = "Python\nx = 1\nprint(x)\n\nBash\necho hi\n"
+            turn_result: Dict[str, Any] = {
+                "assistant_text": assistant_text,
+                "artifacts": build_response_artifacts(assistant_text),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            refs = build_turn_action_refs(turn_result, new_cells)
+            turn_view = build_interactive_turn_view(
+                assistant_text=assistant_text,
+                output_format="markdown",
+                artifacts=turn_result.get("artifacts"),
+                action_refs=refs,
+            )
+            ref_spans = dict(turn_view.get("ref_spans") or {})
+            self.assertIn("@1", ref_spans)
+            self.assertIn("py1", ref_spans)
+            self.assertGreaterEqual(int(ref_spans["@1"].get("end_line") or 0), int(ref_spans["@1"].get("start_line") or 0))
+
+        def test_build_live_repl_panel_lines_shows_ref_preview_for_run(self) -> None:
+            assistant_text = "Python\nx = 1\nprint(x)\n\nDone\n"
+            turn_result: Dict[str, Any] = {
+                "assistant_text": assistant_text,
+                "artifacts": build_response_artifacts(assistant_text),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            refs = build_turn_action_refs(turn_result, new_cells)
+            turn_view = build_interactive_turn_view(
+                assistant_text=assistant_text,
+                output_format="markdown",
+                artifacts=turn_result.get("artifacts"),
+                action_refs=refs,
+            )
+            panel = build_live_repl_panel_lines(
+                "/run @1",
+                current_cell_id="py1",
+                action_refs=refs,
+                action_ref_index=build_action_ref_index(refs),
+                turn_view=turn_view,
+            )
+            self.assertTrue(panel)
+            self.assertIn("preview>", panel[0])
+            self.assertIn("print(x)", "\n".join(panel))
+
+        def test_build_live_repl_panel_lines_shows_help_list_for_slash(self) -> None:
+            panel = build_live_repl_panel_lines(
+                "/r",
+                current_cell_id=None,
+                action_refs=[],
+                action_ref_index={},
+                turn_view=None,
+            )
+            self.assertTrue(panel)
+            self.assertIn("help>", panel[0])
+            self.assertTrue(any("/run" in line for line in panel[1:]))
+
+        def test_repl_completion_candidates_offer_ref_handles_for_run(self) -> None:
+            refs = [
+                {"handle": "@1", "cell_id": "py1", "language": "python"},
+                {"handle": "@2", "cell_id": "sh1", "language": "bash"},
+            ]
+            context = repl_completion_candidates(
+                "/run @",
+                len("/run @"),
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertIsNotNone(context)
+            suggestions = list((context or {}).get("suggestions") or [])
+            self.assertIn("@1", suggestions)
+            self.assertIn("@2", suggestions)
 
         def test_execute_cell_locally_python(self) -> None:
             cell = {
@@ -3084,6 +3679,21 @@ result = a + b
             self.assertEqual(cell_id, "py2")
             self.assertEqual(timeout_s, 45)
             self.assertIsNone(error)
+
+        def test_resolve_run_request_accepts_response_ref(self) -> None:
+            cell_id, timeout_s, error = resolve_run_request(
+                ["/run", "@1"],
+                current_cell_id="py2",
+                action_ref_index={"@1": "py7"},
+            )
+            self.assertEqual(cell_id, "py7")
+            self.assertEqual(timeout_s, 30)
+            self.assertIsNone(error)
+
+        def test_format_repl_help_lines_includes_focus_command(self) -> None:
+            lines = format_repl_help_lines("/foc")
+            self.assertTrue(lines)
+            self.assertTrue(any("/focus <cell|@ref>" in line for line in lines))
 
         def test_resolve_run_request_rejects_missing_current_cell(self) -> None:
             cell_id, timeout_s, error = resolve_run_request(["/run"], current_cell_id=None)
@@ -3497,6 +4107,75 @@ def register_turn_cells(
     return new_cells
 
 
+def build_turn_action_refs(
+    turn_result: Dict[str, Any],
+    created_cells: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    artifacts = turn_result.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = build_response_artifacts(str(turn_result.get("assistant_text") or ""))
+        turn_result["artifacts"] = artifacts
+
+    source_to_cell: Dict[str, Dict[str, Any]] = {}
+    for cell in created_cells:
+        source_id = str(cell.get("source_id") or "").strip()
+        if source_id and source_id not in source_to_cell:
+            source_to_cell[source_id] = cell
+
+    refs: List[Dict[str, Any]] = []
+    next_index = 1
+    for item in list(artifacts.get("response_items") or []):
+        if str(item.get("type") or "") not in {"code_block", "command_block"}:
+            continue
+        if not bool(item.get("executable")):
+            continue
+        source_id = str(item.get("id") or "").strip()
+        cell = source_to_cell.get(source_id)
+        if not isinstance(cell, dict):
+            continue
+        refs.append(
+            {
+                "handle": f"@{next_index}",
+                "cell_id": str(cell.get("id") or ""),
+                "source_id": source_id,
+                "language": normalize_code_language(str(item.get("language") or "")) or "text",
+                "kind": str(item.get("type") or ""),
+            }
+        )
+        next_index += 1
+    turn_result["action_refs"] = refs
+    return refs
+
+
+def build_action_ref_index(action_refs: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    index: Dict[str, str] = {}
+    for ref in action_refs:
+        handle = str(ref.get("handle") or "").strip()
+        cell_id = str(ref.get("cell_id") or "").strip()
+        if handle and cell_id:
+            index[handle] = cell_id
+    return index
+
+
+def resolve_cell_reference(
+    raw_target: Optional[str],
+    current_cell_id: Optional[str],
+    action_ref_index: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    target = str(raw_target or "").strip()
+    if not target or target in {"current", ".", "last"}:
+        resolved = str(current_cell_id or "").strip()
+        if not resolved:
+            return None, "cells: no current cell (use /cells or /show <cell_id>)"
+        return resolved, None
+    if target.startswith("@"):
+        resolved = str((action_ref_index or {}).get(target) or "").strip()
+        if resolved:
+            return resolved, None
+        return None, f"cells: unknown response ref '{target}'"
+    return target, None
+
+
 def print_cell_catalog(
     cell_store: Dict[str, Dict[str, Any]],
     cell_order: Sequence[str],
@@ -3585,13 +4264,20 @@ def print_cell_content(cell: Dict[str, Any]) -> None:
 def resolve_run_request(
     args: Sequence[str],
     current_cell_id: Optional[str],
+    action_ref_index: Optional[Dict[str, str]] = None,
     default_timeout_s: int = 30,
 ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    usage = "usage: /run [cell_id] [timeout_seconds]"
+    usage = "usage: /run [cell_id|@ref] [timeout_seconds]"
     if len(args) == 0 or len(args) > 3:
         return None, None, usage
 
-    target = str(current_cell_id or "").strip()
+    target, target_error = resolve_cell_reference(
+        None,
+        current_cell_id=current_cell_id,
+        action_ref_index=action_ref_index,
+    )
+    if target_error:
+        target = ""
     timeout_s = int(default_timeout_s)
 
     if len(args) == 2:
@@ -3599,19 +4285,30 @@ def resolve_run_request(
         if token and target and re.fullmatch(r"\d+", token):
             return target, max(1, int(token)), None
         if token:
-            target = token
+            target, target_error = resolve_cell_reference(
+                token,
+                current_cell_id=current_cell_id,
+                action_ref_index=action_ref_index,
+            )
+            if target_error:
+                return None, None, target_error
     elif len(args) == 3:
-        target = str(args[1] or "").strip()
+        target, target_error = resolve_cell_reference(
+            str(args[1] or "").strip(),
+            current_cell_id=current_cell_id,
+            action_ref_index=action_ref_index,
+        )
+        if target_error:
+            return None, None, target_error
         raw_timeout = str(args[2] or "").strip()
         try:
             timeout_s = max(1, int(raw_timeout))
         except ValueError:
             return None, None, usage
 
-    if target in {"current", ".", "last"}:
-        target = str(current_cell_id or "").strip()
-
     if not target:
+        if target_error:
+            return None, None, target_error
         return None, None, "cells: no current cell (use /cells or /show <cell_id>)"
 
     return target, timeout_s, None
@@ -4030,6 +4727,35 @@ def split_repl_command_args(raw_line: str) -> Tuple[Optional[List[str]], Optiona
         return None, str(exc)
 
 
+def find_repl_command_spec(name: str) -> Optional[Dict[str, Any]]:
+    target = str(name or "").strip().lower()
+    if not target:
+        return None
+    for spec in REPL_COMMAND_SPECS:
+        if str(spec.get("name") or "").lower() == target:
+            return dict(spec)
+    return None
+
+
+def format_repl_help_lines(filter_text: str = "", limit: Optional[int] = None) -> List[str]:
+    query = str(filter_text or "").strip().lower()
+    lines: List[str] = []
+    for spec in REPL_COMMAND_SPECS:
+        name = str(spec.get("name") or "")
+        usage = str(spec.get("usage") or name)
+        summary = str(spec.get("summary") or "")
+        if query and not (name.lower().startswith(query) or usage.lower().startswith(query)):
+            continue
+        lines.append(f"{usage} :: {summary}".rstrip())
+    if isinstance(limit, int) and limit > 0:
+        return lines[:limit]
+    return lines
+
+
+def live_buffer_tokens(buffer: str) -> List[str]:
+    return [token for token in re.findall(r"\S+", str(buffer or "")) if token]
+
+
 def setup_repl_readline_history(
     history_path: Path = DEFAULT_REPL_HISTORY_PATH,
 ) -> Tuple[Optional[Any], Optional[Path]]:
@@ -4090,6 +4816,520 @@ def flush_repl_history(
         readline_mod.write_history_file(str(history_path))
     except Exception:
         return
+
+
+def load_repl_history_entries(
+    history_path: Path = DEFAULT_REPL_HISTORY_PATH,
+    limit: int = DEFAULT_REPL_HISTORY_LIMIT,
+) -> List[str]:
+    if not history_path.is_file():
+        return []
+    try:
+        lines = [line.rstrip("\n") for line in history_path.read_text(encoding="utf-8").splitlines()]
+    except OSError:
+        return []
+    entries = [line for line in lines if line.strip()]
+    if limit > 0:
+        return entries[-limit:]
+    return entries
+
+
+def add_repl_history_entry_to_list(entries: List[str], line: str) -> None:
+    entry = str(line or "").strip()
+    if not entry:
+        return
+    if entries and entries[-1].strip() == entry:
+        return
+    entries.append(entry)
+
+
+def flush_repl_history_entries(
+    entries: Sequence[str],
+    history_path: Path = DEFAULT_REPL_HISTORY_PATH,
+    limit: int = DEFAULT_REPL_HISTORY_LIMIT,
+) -> None:
+    trimmed = [str(entry or "").rstrip("\n") for entry in entries if str(entry or "").strip()]
+    if limit > 0:
+        trimmed = trimmed[-limit:]
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = "\n".join(trimmed)
+        if payload:
+            payload += "\n"
+        history_path.write_text(payload, encoding="utf-8")
+    except OSError:
+        return
+
+
+def repl_ref_completion_items(action_refs: Sequence[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    seen: set = set()
+    for ref in action_refs:
+        handle = str(ref.get("handle") or "").strip()
+        cell_id = str(ref.get("cell_id") or "").strip()
+        language = normalize_code_language(str(ref.get("language") or "")) or "text"
+        preview = f"{cell_id} {language}".strip()
+        if handle and handle not in seen:
+            items.append((handle, preview))
+            seen.add(handle)
+        if cell_id and cell_id not in seen:
+            items.append((cell_id, preview))
+            seen.add(cell_id)
+    return items
+
+
+def format_repl_ref_suggestion_lines(
+    action_refs: Sequence[Dict[str, Any]],
+    current_cell_id: Optional[str] = None,
+    limit: int = 8,
+) -> List[str]:
+    lines: List[str] = []
+    for ref in list(action_refs)[: max(1, int(limit))]:
+        handle = str(ref.get("handle") or "").strip()
+        cell_id = str(ref.get("cell_id") or "").strip()
+        language = normalize_code_language(str(ref.get("language") or "")) or "text"
+        marker = "*" if current_cell_id and cell_id == current_cell_id else " "
+        lines.append(f"{marker} {handle} -> {cell_id} [{language}]")
+    return lines
+
+
+def build_live_ref_preview_lines(
+    raw_target: str,
+    current_cell_id: Optional[str],
+    action_ref_index: Mapping[str, str],
+    turn_view: Optional[Dict[str, Any]],
+    *,
+    context_lines: int = 20,
+) -> List[str]:
+    if not isinstance(turn_view, dict):
+        return []
+    resolved_target, target_error = resolve_cell_reference(
+        raw_target,
+        current_cell_id=current_cell_id,
+        action_ref_index=dict(action_ref_index),
+    )
+    if target_error:
+        return [f"preview> {target_error}"]
+    ref_spans = turn_view.get("ref_spans")
+    preview_lines = list(turn_view.get("preview_lines") or [])
+    if not isinstance(ref_spans, dict) or not preview_lines:
+        return []
+    span = ref_spans.get(str(raw_target or "").strip()) or ref_spans.get(str(resolved_target or "").strip())
+    if not isinstance(span, dict):
+        return [f"preview> no rendered preview for {raw_target}"]
+    start_line = max(0, int(span.get("start_line") or 0))
+    end_line = max(start_line, int(span.get("end_line") or start_line))
+    preview_end = min(len(preview_lines), max(end_line + 1, start_line + max(4, int(context_lines))))
+    header = (
+        f"preview> {span.get('handle') or raw_target} "
+        f"{span.get('cell_id') or resolved_target} "
+        f"[{span.get('language') or 'text'}]"
+    )
+    body = preview_lines[start_line:preview_end]
+    if preview_end < len(preview_lines):
+        body = list(body) + ["..."]
+    return [header] + body
+
+
+def build_live_repl_panel_lines(
+    buffer: str,
+    *,
+    current_cell_id: Optional[str],
+    action_refs: Sequence[Dict[str, Any]],
+    action_ref_index: Mapping[str, str],
+    turn_view: Optional[Dict[str, Any]],
+) -> List[str]:
+    raw = str(buffer or "")
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    tokens = live_buffer_tokens(raw)
+    if not tokens:
+        return []
+    first = str(tokens[0] or "").lower()
+    if not first.startswith("/"):
+        return []
+
+    if first in {"/help", "/h"}:
+        query = str(tokens[1] or "") if len(tokens) > 1 else ""
+        help_lines = format_repl_help_lines(query, limit=12)
+        return ["help> commands"] + (help_lines or ["help> no matching commands"])
+
+    if len(tokens) == 1 and not raw.endswith(" "):
+        help_lines = format_repl_help_lines(first, limit=12)
+        if help_lines:
+            return ["help> commands"] + help_lines
+
+    if first in REPL_REF_COMMANDS:
+        if first == "/diff":
+            if len(tokens) >= 2:
+                preview = build_live_ref_preview_lines(
+                    tokens[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=action_ref_index,
+                    turn_view=turn_view,
+                )
+                if len(tokens) >= 3:
+                    second_preview = build_live_ref_preview_lines(
+                        tokens[2],
+                        current_cell_id=current_cell_id,
+                        action_ref_index=action_ref_index,
+                        turn_view=turn_view,
+                    )
+                    return preview + [""] + second_preview if second_preview else preview
+                if preview:
+                    return preview
+            return ["refs> available refs"] + format_repl_ref_suggestion_lines(action_refs, current_cell_id=current_cell_id)
+
+        raw_target = ""
+        if len(tokens) >= 2:
+            raw_target = str(tokens[1] or "")
+        elif raw.endswith(" "):
+            raw_target = ""
+        if raw_target:
+            preview = build_live_ref_preview_lines(
+                raw_target,
+                current_cell_id=current_cell_id,
+                action_ref_index=action_ref_index,
+                turn_view=turn_view,
+            )
+            if preview:
+                return preview
+        return ["refs> available refs"] + format_repl_ref_suggestion_lines(action_refs, current_cell_id=current_cell_id)
+
+    help_lines = format_repl_help_lines(first, limit=10)
+    if help_lines:
+        return ["help> commands"] + help_lines
+    return []
+
+
+def repl_completion_candidates(
+    buffer: str,
+    cursor: int,
+    *,
+    current_cell_id: Optional[str],
+    action_refs: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if cursor != len(buffer):
+        return None
+    raw = str(buffer or "")
+    if not raw.startswith("/"):
+        return None
+    tokens = live_buffer_tokens(raw)
+    trailing_space = raw.endswith(" ")
+    if not tokens:
+        suggestions = [str(spec.get("name") or "") for spec in REPL_COMMAND_SPECS]
+        return {"start": 0, "end": 0, "suggestions": suggestions, "append_space": True}
+
+    first = str(tokens[0] or "")
+    if len(tokens) == 1 and not trailing_space:
+        suggestions = [
+            str(spec.get("name") or "")
+            for spec in REPL_COMMAND_SPECS
+            if str(spec.get("name") or "").startswith(first)
+        ]
+        return {"start": 0, "end": cursor, "suggestions": suggestions, "append_space": True}
+
+    first_lower = first.lower()
+    ref_items = repl_ref_completion_items(action_refs)
+    ref_suggestions = [value for value, _ in ref_items]
+    if current_cell_id and current_cell_id not in ref_suggestions:
+        ref_suggestions.append(current_cell_id)
+
+    if first_lower in {"/run", "/show", "/edit", "/focus"}:
+        prefix = ""
+        start = cursor
+        end = cursor
+        if len(tokens) >= 2 and not trailing_space:
+            prefix = str(tokens[1] or "")
+            start = raw.rfind(prefix)
+            end = cursor
+        suggestions = [value for value in ref_suggestions if value.startswith(prefix)]
+        return {"start": start, "end": end, "suggestions": suggestions, "append_space": True}
+
+    if first_lower in {"/fork", "/save"}:
+        if trailing_space and len(tokens) >= 2:
+            return None
+        prefix = ""
+        start = cursor
+        end = cursor
+        if len(tokens) >= 2 and not trailing_space:
+            prefix = str(tokens[1] or "")
+            start = raw.rfind(prefix)
+            end = cursor
+        suggestions = [value for value in ref_suggestions if value.startswith(prefix)]
+        return {"start": start, "end": end, "suggestions": suggestions, "append_space": True}
+
+    if first_lower == "/diff":
+        if len(tokens) >= 3 and trailing_space:
+            return None
+        if len(tokens) >= 3:
+            prefix = str(tokens[2] or "")
+        elif len(tokens) >= 2 and trailing_space:
+            prefix = ""
+        elif len(tokens) >= 2:
+            prefix = str(tokens[1] or "")
+        else:
+            prefix = ""
+        start = cursor - len(prefix)
+        end = cursor
+        suggestions = [value for value in ref_suggestions if value.startswith(prefix)]
+        return {"start": start, "end": end, "suggestions": suggestions, "append_space": True}
+
+    return None
+
+
+def format_repl_input_line(prompt: str, buffer: str, cursor: int, width: int) -> Tuple[str, int]:
+    prompt_text = str(prompt or "")
+    content = str(buffer or "")
+    available = max(8, int(width) - len(prompt_text))
+    if len(content) <= available:
+        return prompt_text + content, len(prompt_text) + min(len(content), max(0, cursor))
+
+    safe_cursor = max(0, min(len(content), int(cursor)))
+    window_start = min(max(0, safe_cursor - available + 1), max(0, len(content) - available))
+    window_end = min(len(content), window_start + available)
+    prefix = "..." if window_start > 0 else ""
+    suffix = "..." if window_end < len(content) else ""
+    visible = content[window_start:window_end]
+    if prefix:
+        visible = prefix + visible[3:]
+    if suffix and len(visible) >= 3:
+        visible = visible[:-3] + suffix
+    cursor_col = len(prompt_text) + max(0, safe_cursor - window_start)
+    cursor_col = min(len(prompt_text) + len(visible), cursor_col)
+    return prompt_text + visible, cursor_col
+
+
+def truncate_repl_panel_line(text: str, width: int) -> str:
+    raw = str(text or "")
+    if width <= 0 or len(raw) <= width:
+        return raw
+    if width <= 3:
+        return raw[:width]
+    return raw[: width - 3] + "..."
+
+
+def read_escape_sequence(fd: int) -> str:
+    chunks = ["\x1b"]
+    try:
+        import select
+    except Exception:
+        return "\x1b"
+    for _ in range(4):
+        ready, _, _ = select.select([fd], [], [], 0.01)
+        if not ready:
+            break
+        piece = os.read(fd, 1)
+        if not piece:
+            break
+        chunks.append(piece.decode("utf-8", "ignore"))
+        if chunks[-1].isalpha() or chunks[-1] == "~":
+            break
+    return "".join(chunks)
+
+
+def read_live_repl_input(
+    prompt: str,
+    *,
+    history_entries: List[str],
+    panel_builder: Optional[Any] = None,
+    current_cell_id: Optional[str] = None,
+    action_refs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> str:
+    if not sys.stdin.isatty() or not sys.stdout.isatty() or os.name == "nt":
+        return input(prompt).strip()
+
+    try:
+        import termios
+        import tty
+    except Exception:
+        return input(prompt).strip()
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    buffer = ""
+    cursor = 0
+    history_index = len(history_entries)
+    history_draft = ""
+    last_block_lines = 1
+    last_panel_hidden = False
+    completion_state: Optional[Dict[str, Any]] = None
+
+    def reset_completion_state() -> None:
+        nonlocal completion_state
+        completion_state = None
+
+    def move_to_input_origin() -> None:
+        if last_block_lines > 1:
+            sys.stdout.write(f"\x1b[{last_block_lines - 1}A")
+        sys.stdout.write("\r")
+
+    def render(panel_hidden: bool = False) -> None:
+        nonlocal last_block_lines
+        nonlocal last_panel_hidden
+        width = shutil.get_terminal_size((100, 24)).columns
+        input_line, cursor_col = format_repl_input_line(prompt, buffer, cursor, width)
+        panel_lines: List[str] = []
+        if not panel_hidden and callable(panel_builder):
+            try:
+                raw_panel_lines = list(panel_builder(buffer, cursor) or [])
+            except Exception:
+                raw_panel_lines = []
+            panel_lines = [truncate_repl_panel_line(line, width) for line in raw_panel_lines[:24]]
+        move_to_input_origin()
+        sys.stdout.write("\x1b[J")
+        sys.stdout.write(input_line)
+        for line in panel_lines:
+            sys.stdout.write("\n" + line)
+        if panel_lines:
+            sys.stdout.write(f"\x1b[{len(panel_lines)}A")
+        sys.stdout.write("\r")
+        if cursor_col > 0:
+            sys.stdout.write(f"\x1b[{cursor_col}C")
+        sys.stdout.flush()
+        last_block_lines = 1 + len(panel_lines)
+        last_panel_hidden = panel_hidden
+
+    def finalize_line() -> None:
+        move_to_input_origin()
+        sys.stdout.write("\x1b[J")
+        sys.stdout.write(f"{prompt}{buffer}\n")
+        sys.stdout.flush()
+
+    def apply_completion() -> None:
+        nonlocal buffer
+        nonlocal cursor
+        nonlocal completion_state
+        context = repl_completion_candidates(
+            buffer,
+            cursor,
+            current_cell_id=current_cell_id,
+            action_refs=list(action_refs or []),
+        )
+        if not context or not list(context.get("suggestions") or []):
+            return
+        suggestions = list(context.get("suggestions") or [])
+        start = int(context.get("start") or 0)
+        end = int(context.get("end") or cursor)
+        base_key = (buffer, cursor, start, end, tuple(suggestions))
+        if completion_state and completion_state.get("key") == base_key:
+            index = (int(completion_state.get("index") or 0) + 1) % len(suggestions)
+        else:
+            index = 0
+        suggestion = suggestions[index]
+        buffer = buffer[:start] + suggestion + buffer[end:]
+        if bool(context.get("append_space")) and not buffer.endswith(" "):
+            buffer += " "
+        cursor = len(buffer)
+        completion_state = {"key": base_key, "index": index}
+
+    try:
+        tty.setraw(fd)
+        render(panel_hidden=False)
+        while True:
+            raw = os.read(fd, 1)
+            if not raw:
+                raise EOFError
+            ch = raw.decode("utf-8", "ignore")
+            if ch in {"\r", "\n"}:
+                finalize_line()
+                return buffer.strip()
+            if ch == "\x03":
+                move_to_input_origin()
+                sys.stdout.write("\x1b[J\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            if ch == "\x04":
+                if not buffer:
+                    move_to_input_origin()
+                    sys.stdout.write("\x1b[J\n")
+                    sys.stdout.flush()
+                    raise EOFError
+                if cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1 :]
+                    reset_completion_state()
+                    render(panel_hidden=False)
+                continue
+            if ch == "\t":
+                apply_completion()
+                render(panel_hidden=False)
+                continue
+            if ch in {"\x7f", "\x08"}:
+                if cursor > 0:
+                    buffer = buffer[: cursor - 1] + buffer[cursor:]
+                    cursor -= 1
+                    reset_completion_state()
+                render(panel_hidden=False)
+                continue
+            if ch == "\x01":
+                cursor = 0
+                render(panel_hidden=False)
+                continue
+            if ch == "\x05":
+                cursor = len(buffer)
+                render(panel_hidden=False)
+                continue
+            if ch == "\x1b":
+                sequence = read_escape_sequence(fd)
+                if sequence == "\x1b":
+                    reset_completion_state()
+                    render(panel_hidden=True)
+                    continue
+                if sequence in {"\x1b[A", "\x1bOA"}:
+                    if history_entries:
+                        if history_index == len(history_entries):
+                            history_draft = buffer
+                        history_index = max(0, history_index - 1)
+                        buffer = history_entries[history_index]
+                        cursor = len(buffer)
+                        reset_completion_state()
+                    render(panel_hidden=False)
+                    continue
+                if sequence in {"\x1b[B", "\x1bOB"}:
+                    if history_entries:
+                        if history_index < len(history_entries) - 1:
+                            history_index += 1
+                            buffer = history_entries[history_index]
+                        else:
+                            history_index = len(history_entries)
+                            buffer = history_draft
+                        cursor = len(buffer)
+                        reset_completion_state()
+                    render(panel_hidden=False)
+                    continue
+                if sequence in {"\x1b[C", "\x1bOC"}:
+                    cursor = min(len(buffer), cursor + 1)
+                    render(panel_hidden=False)
+                    continue
+                if sequence in {"\x1b[D", "\x1bOD"}:
+                    cursor = max(0, cursor - 1)
+                    render(panel_hidden=False)
+                    continue
+                if sequence in {"\x1b[H", "\x1bOH"}:
+                    cursor = 0
+                    render(panel_hidden=False)
+                    continue
+                if sequence in {"\x1b[F", "\x1bOF"}:
+                    cursor = len(buffer)
+                    render(panel_hidden=False)
+                    continue
+                if sequence == "\x1b[3~":
+                    if cursor < len(buffer):
+                        buffer = buffer[:cursor] + buffer[cursor + 1 :]
+                        reset_completion_state()
+                    render(panel_hidden=False)
+                    continue
+                render(panel_hidden=last_panel_hidden)
+                continue
+            if ch and ch >= " ":
+                buffer = buffer[:cursor] + ch + buffer[cursor:]
+                cursor += len(ch)
+                history_index = len(history_entries)
+                reset_completion_state()
+                render(panel_hidden=False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
 def browser_foreground_mode(env: Optional[Mapping[str, str]] = None) -> str:
@@ -4861,17 +6101,94 @@ def run_repl(
         else:
             print("backend: pyreplab ready")
     history: List[Dict[str, Any]] = []
+    history_entries = load_repl_history_entries()
     turn_index = 0
     cell_store: Dict[str, Dict[str, Any]] = {}
     cell_order: List[str] = []
     cell_counters: Dict[str, int] = {}
     current_cell_id: Optional[str] = None
     cell_workspace = Path.cwd() / ".sky_cells"
-    readline_mod, readline_history_path = setup_repl_readline_history()
     current_layout_text = navigate_current_page(
         client, agent_id, current_url, navigate_tools, verbose=debug
     )
     print("interactive mode: /help for commands, /exit to quit, Ctrl-C cancels /run")
+    active_action_refs: List[Dict[str, Any]] = []
+    active_action_ref_index: Dict[str, str] = {}
+    active_turn_view: Optional[Dict[str, Any]] = None
+
+    def record_interactive_turn(turn_result: Dict[str, Any], prompt_text: str) -> None:
+        nonlocal turn_index
+        nonlocal current_cell_id
+        nonlocal active_action_refs
+        nonlocal active_action_ref_index
+        nonlocal active_turn_view
+
+        turn_index += 1
+        created_cells = register_turn_cells(
+            turn_result=turn_result,
+            turn_index=turn_index,
+            cell_store=cell_store,
+            cell_order=cell_order,
+            cell_counters=cell_counters,
+        )
+        action_refs = build_turn_action_refs(turn_result, created_cells)
+        active_action_refs = list(action_refs)
+        active_action_ref_index = build_action_ref_index(active_action_refs)
+        if active_action_refs:
+            current_cell_id = str(active_action_refs[-1].get("cell_id") or "") or current_cell_id
+        elif created_cells:
+            current_cell_id = str(created_cells[-1].get("id") or "") or current_cell_id
+
+        assistant_text = str(turn_result.get("assistant_text") or "").strip()
+        if assistant_text:
+            active_turn_view = build_interactive_turn_view(
+                assistant_text=assistant_text,
+                output_format=output_mode,
+                artifacts=turn_result.get("artifacts"),
+                action_refs=active_action_refs,
+            )
+            rendered_output = str(active_turn_view.get("rendered_output") or "")
+            if output_mode == "json":
+                print(rendered_output)
+            else:
+                print("assistant>")
+                print(rendered_output)
+            turn_result["rendered_output"] = rendered_output
+        else:
+            active_turn_view = None
+
+        history.append(
+            {
+                "prompt": prompt_text,
+                "assistant_text": assistant_text,
+                "cell_ids": list(turn_result.get("cell_ids") or []),
+                "action_refs": list(active_action_refs),
+                "artifacts": turn_result.get("artifacts"),
+            }
+        )
+
+    def rebuild_active_turn_view_from_entry(entry: Dict[str, Any]) -> None:
+        nonlocal active_turn_view
+        assistant_text = str(entry.get("assistant_text") or "").strip()
+        if not assistant_text:
+            active_turn_view = None
+            return
+        active_turn_view = build_interactive_turn_view(
+            assistant_text=assistant_text,
+            output_format=output_mode,
+            artifacts=entry.get("artifacts"),
+            action_refs=list(entry.get("action_refs") or []),
+        )
+
+    def live_panel_builder(buffer: str, cursor: int) -> List[str]:
+        del cursor
+        return build_live_repl_panel_lines(
+            buffer,
+            current_cell_id=current_cell_id,
+            action_refs=active_action_refs,
+            action_ref_index=active_action_ref_index,
+            turn_view=active_turn_view,
+        )
 
     if not first_prompt:
         # Clear stale draft text from previous runs so the interactive prompt starts clean.
@@ -4905,43 +6222,24 @@ def run_repl(
             submit=submit_enabled,
             output_format=output_mode,
             layout_text=current_layout_text,
-            echo_result=True,
+            echo_result=False,
             wait_for_response=submit_enabled,
             wait_timeout_s=wait_timeout_s,
             poll_interval_s=poll_interval_s,
             show_dispatch_details=debug,
         )
-        turn_index += 1
-        created_cells = register_turn_cells(
-            turn_result=initial_result,
-            turn_index=turn_index,
-            cell_store=cell_store,
-            cell_order=cell_order,
-            cell_counters=cell_counters,
-        )
-        if created_cells:
-            current_cell_id = str(created_cells[-1].get("id") or "") or current_cell_id
-            summary = " ".join(
-                f"{cell['id']}[{cell.get('language')}]"
-                for cell in created_cells
-            )
-            current_preview = summarize_cell_preview(str(created_cells[-1].get("content") or ""), limit=120)
-            if current_preview:
-                print(f"cells> +{summary} current={current_cell_id} :: {current_preview}")
-            else:
-                print(f"cells> +{summary} current={current_cell_id}")
-        history.append(
-            {
-                "prompt": first_prompt,
-                "assistant_text": str(initial_result.get("assistant_text") or ""),
-                "cell_ids": list(initial_result.get("cell_ids") or []),
-            }
-        )
+        record_interactive_turn(initial_result, first_prompt)
 
     try:
         while True:
             try:
-                line = input("> ").strip()
+                line = read_live_repl_input(
+                    "> ",
+                    history_entries=history_entries,
+                    panel_builder=live_panel_builder,
+                    current_cell_id=current_cell_id,
+                    action_refs=active_action_refs,
+                ).strip()
             except EOFError:
                 print()
                 break
@@ -4951,18 +6249,12 @@ def run_repl(
                 continue
             if not line:
                 continue
-            add_repl_history_entry(readline_mod, line)
+            add_repl_history_entry_to_list(history_entries, line)
             lower = line.lower()
             if lower in {"quit", "exit", ":q", "/exit", "/quit"}:
                 break
             if lower in {"/help", "/h"}:
-                print(
-                    "/url <url> | /submit on|off | /format markdown|plain|json | "
-                    "/backend [local|pyreplab] | "
-                    "/py <code> | /pyfile <path.py> | "
-                    "/history [n] | /last | /cells [n|all] | /show [cell] | /run [cell] [timeout] | "
-                    "/fork <src> [dst] | /edit <cell> | /save <cell> <path> | /diff <a> <b> | /ddm | /exit"
-                )
+                print("\n".join(format_repl_help_lines()))
                 continue
             if lower.startswith("/url "):
                 next_url = line[5:].strip()
@@ -5099,6 +6391,8 @@ def run_repl(
                 if mode in SUPPORTED_OUTPUT_FORMATS:
                     output_mode = mode
                     print(f"format: {output_mode}")
+                    if history:
+                        rebuild_active_turn_view_from_entry(history[-1])
                 else:
                     print("usage: /format markdown|plain|json")
                 continue
@@ -5111,22 +6405,22 @@ def run_repl(
                 print(str(entry.get("prompt") or ""))
                 assistant_text = str(entry.get("assistant_text") or "").strip()
                 if not assistant_text:
+                    active_action_refs = []
+                    active_action_ref_index = {}
+                    active_turn_view = None
                     print("assistant> (no response captured)")
                     continue
-                rendered = format_assistant_output(
-                    text=assistant_text,
-                    output_format=output_mode,
-                    snapshot=None,
-                )
+                active_action_refs = list(entry.get("action_refs") or [])
+                active_action_ref_index = build_action_ref_index(active_action_refs)
+                if active_action_refs:
+                    current_cell_id = str(active_action_refs[-1].get("cell_id") or "") or current_cell_id
+                rebuild_active_turn_view_from_entry(entry)
+                rendered = str((active_turn_view or {}).get("rendered_output") or "")
                 if output_mode == "json":
                     print(rendered)
                 else:
                     print("assistant>")
                     print(rendered)
-                cell_ids = list(entry.get("cell_ids") or [])
-                if cell_ids:
-                    print("cells>")
-                    print(" ".join(cell_ids))
                 continue
             if lower == "/history" or lower.startswith("/history "):
                 parts = line.split()
@@ -5152,6 +6446,16 @@ def run_repl(
                         assistant_preview = "(no response captured)"
                     print(f"[{idx}] user: {user_preview}")
                     print(f"    assistant: {assistant_preview}")
+                    action_refs = list(entry.get("action_refs") or [])
+                    if action_refs:
+                        ref_preview = " ".join(
+                            f"{ref.get('handle')}->{ref.get('cell_id')}"
+                            for ref in action_refs
+                            if str(ref.get("handle") or "").strip() and str(ref.get("cell_id") or "").strip()
+                        )
+                        if ref_preview:
+                            print(f"    refs: {ref_preview}")
+                            continue
                     cell_ids = list(entry.get("cell_ids") or [])
                     if cell_ids:
                         print(f"    cells: {' '.join(cell_ids)}")
@@ -5186,17 +6490,26 @@ def run_repl(
                     continue
                 assert args is not None
                 if len(args) == 1:
-                    target_cell_id = current_cell_id
+                    target_cell_id, target_error = resolve_cell_reference(
+                        None,
+                        current_cell_id=current_cell_id,
+                        action_ref_index=active_action_ref_index,
+                    )
                 elif len(args) == 2:
-                    target_cell_id = args[1]
+                    target_cell_id, target_error = resolve_cell_reference(
+                        args[1],
+                        current_cell_id=current_cell_id,
+                        action_ref_index=active_action_ref_index,
+                    )
                 else:
-                    print("usage: /show [cell_id]")
+                    print("usage: /show [cell_id|@ref]")
+                    continue
+                if target_error:
+                    print(target_error)
                     continue
                 if not target_cell_id:
                     print("cells: no current cell (use /cells or /show <cell_id>)")
                     continue
-                if target_cell_id in {"current", ".", "last"}:
-                    target_cell_id = current_cell_id
                 cell = cell_store.get(target_cell_id)
                 if not isinstance(cell, dict):
                     print(f"cells: unknown id '{target_cell_id}'")
@@ -5210,7 +6523,11 @@ def run_repl(
                     print(f"command parse error: {parse_error}")
                     continue
                 assert args is not None
-                target_cell_id, timeout_s, run_error = resolve_run_request(args, current_cell_id=current_cell_id)
+                target_cell_id, timeout_s, run_error = resolve_run_request(
+                    args,
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
                 if run_error:
                     print(run_error)
                     continue
@@ -5259,6 +6576,31 @@ def run_repl(
                 print("stderr>")
                 print(stderr_text if stderr_text else "(empty)")
                 continue
+            if lower == "/focus" or lower.startswith("/focus "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 2:
+                    print("usage: /focus <cell_id|@ref>")
+                    continue
+                target_cell_id, target_error = resolve_cell_reference(
+                    args[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if target_error:
+                    print(target_error)
+                    continue
+                assert target_cell_id is not None
+                cell = cell_store.get(target_cell_id)
+                if not isinstance(cell, dict):
+                    print(f"cells: unknown id '{target_cell_id}'")
+                    continue
+                current_cell_id = str(cell.get("id") or "") or current_cell_id
+                print(f"focus: {current_cell_id}")
+                continue
             if lower.startswith("/fork "):
                 args, parse_error = split_repl_command_args(line)
                 if parse_error:
@@ -5266,11 +6608,19 @@ def run_repl(
                     continue
                 assert args is not None
                 if len(args) not in {2, 3}:
-                    print("usage: /fork <source_cell_id> [new_cell_id]")
+                    print("usage: /fork <source_cell_id|@ref> [new_cell_id]")
                     continue
-                source = cell_store.get(args[1])
+                source_id, source_error = resolve_cell_reference(
+                    args[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if source_error:
+                    print(source_error)
+                    continue
+                source = cell_store.get(source_id)
                 if not isinstance(source, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{source_id}'")
                     continue
                 new_id = args[2] if len(args) == 3 else next_cell_id(cell_counters, str(source.get("language") or ""))
                 if new_id in cell_store:
@@ -5292,14 +6642,22 @@ def run_repl(
                     continue
                 assert args is not None
                 if len(args) != 3:
-                    print("usage: /save <cell_id> <path>")
+                    print("usage: /save <cell_id|@ref> <path>")
                     continue
-                cell = cell_store.get(args[1])
+                target_cell_id, target_error = resolve_cell_reference(
+                    args[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if target_error:
+                    print(target_error)
+                    continue
+                cell = cell_store.get(target_cell_id)
                 if not isinstance(cell, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{target_cell_id}'")
                     continue
                 target = save_cell_to_path(cell, args[2])
-                print(f"saved {args[1]} -> {target}")
+                print(f"saved {target_cell_id} -> {target}")
                 continue
             if lower.startswith("/diff "):
                 args, parse_error = split_repl_command_args(line)
@@ -5308,15 +6666,31 @@ def run_repl(
                     continue
                 assert args is not None
                 if len(args) != 3:
-                    print("usage: /diff <cell_a> <cell_b>")
+                    print("usage: /diff <cell_a|@ref> <cell_b|@ref>")
                     continue
-                left = cell_store.get(args[1])
-                right = cell_store.get(args[2])
+                left_id, left_error = resolve_cell_reference(
+                    args[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if left_error:
+                    print(left_error)
+                    continue
+                right_id, right_error = resolve_cell_reference(
+                    args[2],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if right_error:
+                    print(right_error)
+                    continue
+                left = cell_store.get(left_id)
+                right = cell_store.get(right_id)
                 if not isinstance(left, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{left_id}'")
                     continue
                 if not isinstance(right, dict):
-                    print(f"cells: unknown id '{args[2]}'")
+                    print(f"cells: unknown id '{right_id}'")
                     continue
                 diff_text = diff_cell_contents(left, right)
                 if diff_text:
@@ -5331,11 +6705,19 @@ def run_repl(
                     continue
                 assert args is not None
                 if len(args) != 2:
-                    print("usage: /edit <cell_id>")
+                    print("usage: /edit <cell_id|@ref>")
                     continue
-                cell = cell_store.get(args[1])
+                target_cell_id, target_error = resolve_cell_reference(
+                    args[1],
+                    current_cell_id=current_cell_id,
+                    action_ref_index=active_action_ref_index,
+                )
+                if target_error:
+                    print(target_error)
+                    continue
+                cell = cell_store.get(target_cell_id)
                 if not isinstance(cell, dict):
-                    print(f"cells: unknown id '{args[1]}'")
+                    print(f"cells: unknown id '{target_cell_id}'")
                     continue
                 current_cell_id = str(cell.get("id") or "") or current_cell_id
                 ok, message = edit_cell_in_editor(cell, cell_workspace)
@@ -5355,38 +6737,13 @@ def run_repl(
                 submit=submit_enabled,
                 output_format=output_mode,
                 layout_text=current_layout_text,
-                echo_result=True,
+                echo_result=False,
                 wait_for_response=submit_enabled,
                 wait_timeout_s=wait_timeout_s,
                 poll_interval_s=poll_interval_s,
                 show_dispatch_details=debug,
             )
-            turn_index += 1
-            created_cells = register_turn_cells(
-                turn_result=result,
-                turn_index=turn_index,
-                cell_store=cell_store,
-                cell_order=cell_order,
-                cell_counters=cell_counters,
-            )
-            if created_cells:
-                current_cell_id = str(created_cells[-1].get("id") or "") or current_cell_id
-                summary = " ".join(
-                    f"{cell['id']}[{cell.get('language')}]"
-                    for cell in created_cells
-                )
-                current_preview = summarize_cell_preview(str(created_cells[-1].get("content") or ""), limit=120)
-                if current_preview:
-                    print(f"cells> +{summary} current={current_cell_id} :: {current_preview}")
-                else:
-                    print(f"cells> +{summary} current={current_cell_id}")
-            history.append(
-                {
-                    "prompt": line,
-                    "assistant_text": str(result.get("assistant_text") or ""),
-                    "cell_ids": list(result.get("cell_ids") or []),
-                }
-            )
+            record_interactive_turn(result, line)
     finally:
         if resolved_pyreplab_cmd and pyreplab_session_dir:
             stop_pyreplab_session(
@@ -5395,7 +6752,7 @@ def run_repl(
                 session_dir=pyreplab_session_dir,
                 timeout_s=6,
             )
-        flush_repl_history(readline_mod, readline_history_path)
+        flush_repl_history_entries(history_entries)
 
 
 def cdp_fallback_submit(
@@ -5647,7 +7004,7 @@ def dispatch_prompt(
             )
             fallback_used = True
             turn_result["fallback_used"] = True
-            if echo_result and show_dispatch_details:
+            if show_dispatch_details:
                 print(f"[native-submit] {json.dumps(status)}")
         else:
             expression = build_prompt_expression(prompt, submit=submit)
@@ -5672,7 +7029,7 @@ def dispatch_prompt(
                         submit=submit,
                         baseline_probe=baseline_probe,
                     )
-                    if echo_result and show_dispatch_details:
+                    if show_dispatch_details:
                         print(f"[{tool}] {result_text}")
                         print(f"[fallback] {json.dumps(fallback_status)}")
                     status = fallback_status
@@ -5680,7 +7037,7 @@ def dispatch_prompt(
                     turn_result["fallback_used"] = True
                 else:
                     raise MCPError(f"Prompt dispatch failed: {status}")
-            elif echo_result and show_dispatch_details:
+            elif show_dispatch_details:
                 print(f"[{tool}] {result_text}")
 
         if submit and type_tools and (not native_submit_default):
@@ -5705,7 +7062,7 @@ def dispatch_prompt(
                 )
                 fallback_used = True
                 turn_result["fallback_used"] = True
-                if echo_result and show_dispatch_details:
+                if show_dispatch_details:
                     print(f"[retry-fallback] {json.dumps(retry_status)}")
 
     if wait_for_response and submit:
@@ -5760,7 +7117,7 @@ def dispatch_prompt(
                     )
                     fallback_used = True
                     turn_result["fallback_used"] = True
-                    if echo_result and show_dispatch_details:
+                    if show_dispatch_details:
                         print(f"[final-retry] {json.dumps(retry_status)}")
 
                 retry_baseline = read_assistant_probe(
