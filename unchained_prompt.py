@@ -36,6 +36,28 @@ DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
 SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+LANGUAGE_ANSI_BY_LANGUAGE: Dict[str, str] = {
+    "python": "\033[38;5;75m",
+    "bash": "\033[38;5;78m",
+    "sql": "\033[38;5;214m",
+    "postgresql": "\033[38;5;214m",
+    "mysql": "\033[38;5;214m",
+    "sqlite": "\033[38;5;214m",
+    "javascript": "\033[38;5;220m",
+    "js": "\033[38;5;220m",
+    "typescript": "\033[38;5;117m",
+    "ts": "\033[38;5;117m",
+    "json": "\033[38;5;141m",
+    "yaml": "\033[38;5;109m",
+    "yml": "\033[38;5;109m",
+    "html": "\033[38;5;208m",
+    "css": "\033[38;5;177m",
+    "text": "\033[38;5;244m",
+}
 REPL_COMMAND_SPECS: Tuple[Dict[str, Any], ...] = (
     {"name": "/url", "usage": "/url <url>", "summary": "navigate the connected browser target"},
     {"name": "/submit", "usage": "/submit on|off", "summary": "toggle prompt submission after fill"},
@@ -3202,6 +3224,24 @@ Output:
             self.assertIn("```text", rendered)
             self.assertNotIn("\n4\n", rendered)
 
+        def test_colorize_markdown_text_for_terminal_styles_code_blocks(self) -> None:
+            rendered = colorize_markdown_text_for_terminal(
+                "```python\nprint('x')\n```\n\n```bash\necho hi\n```",
+                enable_color=True,
+            )
+            self.assertIn(ANSI_RESET, rendered)
+            self.assertIn(LANGUAGE_ANSI_BY_LANGUAGE["python"], rendered)
+            self.assertIn(LANGUAGE_ANSI_BY_LANGUAGE["bash"], rendered)
+
+        def test_colorize_command_help_lines_for_terminal_styles_usage(self) -> None:
+            lines = colorize_command_help_lines_for_terminal(
+                ["/run [cell|@ref] [timeout] :: execute a cell or response ref"],
+                enable_color=True,
+            )
+            self.assertEqual(len(lines), 1)
+            self.assertIn(ANSI_CYAN, lines[0])
+            self.assertIn(ANSI_DIM, lines[0])
+
         def test_output_heading_label_parsed(self) -> None:
             sample = """Python
 import numpy as np
@@ -4279,11 +4319,7 @@ def diff_cell_contents(
 
 
 def print_cell_content(cell: Dict[str, Any]) -> None:
-    print(
-        f"{cell.get('id')} [{cell.get('language')}] "
-        f"rev={cell.get('revision')} turn={cell.get('turn')}"
-    )
-    print(str(cell.get("content") or ""))
+    print(colorize_cell_text_for_terminal(cell))
 
 
 def resolve_run_request(
@@ -4779,6 +4815,149 @@ def format_repl_help_lines(filter_text: str = "", limit: Optional[int] = None) -
 
 def live_buffer_tokens(buffer: str) -> List[str]:
     return [token for token in re.findall(r"\S+", str(buffer or "")) if token]
+
+
+def terminal_colors_enabled(
+    stream: Optional[Any] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> bool:
+    values = env or os.environ
+    if str(values.get("NO_COLOR") or "").strip():
+        return False
+    if str(values.get("CLICOLOR_FORCE") or "").strip() not in {"", "0"}:
+        return True
+    if os.name == "nt":
+        return False
+    target = stream if stream is not None else sys.stdout
+    try:
+        if not bool(target.isatty()):
+            return False
+    except Exception:
+        return False
+    term = str(values.get("TERM") or "").strip().lower()
+    if term in {"", "dumb"}:
+        return False
+    return True
+
+
+def language_ansi_color(language: str) -> str:
+    normalized = normalize_code_language(language)
+    if normalized in LANGUAGE_ANSI_BY_LANGUAGE:
+        return LANGUAGE_ANSI_BY_LANGUAGE[normalized]
+    return LANGUAGE_ANSI_BY_LANGUAGE.get("text", "")
+
+
+def ansi_wrap(text: str, *styles: str, enabled: bool = True) -> str:
+    payload = str(text or "")
+    if not enabled:
+        return payload
+    codes = "".join(style for style in styles if style)
+    if not codes:
+        return payload
+    return f"{codes}{payload}{ANSI_RESET}"
+
+
+def line_fence_language(line: str) -> Optional[str]:
+    match = re.fullmatch(r"```([A-Za-z0-9_.+-]*)\s*", str(line or "").strip())
+    if not match:
+        return None
+    return normalize_code_language(str(match.group(1) or "").strip()) or "text"
+
+
+def line_footer_language(line: str) -> Optional[str]:
+    match = re.search(r"\[[^\]]+\s+([A-Za-z0-9_.+-]+)\]\s*(?:/run|/show|/edit|/fork)", str(line or ""))
+    if not match:
+        return None
+    return normalize_code_language(str(match.group(1) or "").strip()) or "text"
+
+
+def colorize_markdown_lines_for_terminal(
+    lines: Sequence[str],
+    *,
+    enable_color: Optional[bool] = None,
+) -> List[str]:
+    colored: List[str] = []
+    active_language = ""
+    in_code_block = False
+    use_color = terminal_colors_enabled() if enable_color is None else bool(enable_color)
+    for raw_line in lines:
+        line = str(raw_line or "")
+        fence_language = line_fence_language(line)
+        if fence_language is not None:
+            color = language_ansi_color(active_language if in_code_block else fence_language)
+            colored.append(ansi_wrap(line, ANSI_BOLD, color, enabled=use_color))
+            if in_code_block:
+                in_code_block = False
+                active_language = ""
+            else:
+                in_code_block = True
+                active_language = fence_language
+            continue
+
+        if in_code_block:
+            color = language_ansi_color(active_language)
+            colored.append(ansi_wrap(line, color, enabled=use_color))
+            continue
+
+        footer_language = line_footer_language(line)
+        if footer_language:
+            color = language_ansi_color(footer_language)
+            colored.append(ansi_wrap(line, ANSI_DIM, color, enabled=use_color))
+            continue
+
+        colored.append(line)
+    return colored
+
+
+def colorize_markdown_text_for_terminal(
+    text: str,
+    *,
+    enable_color: Optional[bool] = None,
+) -> str:
+    lines = str(text or "").splitlines()
+    return "\n".join(colorize_markdown_lines_for_terminal(lines, enable_color=enable_color))
+
+
+def colorize_command_help_lines_for_terminal(
+    lines: Sequence[str],
+    *,
+    enable_color: Optional[bool] = None,
+) -> List[str]:
+    use_color = terminal_colors_enabled() if enable_color is None else bool(enable_color)
+    colored: List[str] = []
+    for raw_line in lines:
+        line = str(raw_line or "")
+        if " :: " not in line:
+            colored.append(line)
+            continue
+        usage, summary = line.split(" :: ", 1)
+        colored.append(
+            ansi_wrap(usage, ANSI_CYAN, ANSI_BOLD, enabled=use_color)
+            + " :: "
+            + ansi_wrap(summary, ANSI_DIM, enabled=use_color)
+        )
+    return colored
+
+
+def colorize_cell_text_for_terminal(
+    cell: Dict[str, Any],
+    *,
+    enable_color: Optional[bool] = None,
+) -> str:
+    language = normalize_code_language(str(cell.get("language") or "")) or "text"
+    use_color = terminal_colors_enabled() if enable_color is None else bool(enable_color)
+    header = (
+        f"{cell.get('id')} [{cell.get('language')}] "
+        f"rev={cell.get('revision')} turn={cell.get('turn')}"
+    )
+    styled_header = ansi_wrap(header, ANSI_BOLD, language_ansi_color(language), enabled=use_color)
+    content_lines = str(cell.get("content") or "").splitlines()
+    styled_content = "\n".join(
+        ansi_wrap(line, language_ansi_color(language), enabled=use_color) for line in content_lines
+    )
+    if styled_content:
+        return styled_header + "\n" + styled_content
+    return styled_header
 
 
 def setup_repl_readline_history(
@@ -5277,6 +5456,10 @@ def read_live_repl_input(
             except Exception:
                 raw_panel_lines = []
             panel_lines = [truncate_repl_panel_line(line, width) for line in raw_panel_lines[:24]]
+            if raw_panel_lines and str(raw_panel_lines[0] or "").startswith("help>"):
+                panel_lines = colorize_command_help_lines_for_terminal(panel_lines)
+            else:
+                panel_lines = colorize_markdown_lines_for_terminal(panel_lines)
         move_to_input_origin()
         sys.stdout.write("\x1b[J")
         sys.stdout.write(input_line)
@@ -6237,7 +6420,7 @@ def run_repl(
                 print(rendered_output)
             else:
                 print("assistant>")
-                print(rendered_output)
+                print(colorize_markdown_text_for_terminal(rendered_output))
             turn_result["rendered_output"] = rendered_output
         else:
             active_turn_view = None
@@ -6339,7 +6522,7 @@ def run_repl(
             if lower in {"quit", "exit", ":q", "/exit", "/quit"}:
                 break
             if lower in {"/help", "/h"}:
-                print("\n".join(format_repl_help_lines()))
+                print("\n".join(colorize_command_help_lines_for_terminal(format_repl_help_lines())))
                 continue
             if lower.startswith("/url "):
                 next_url = line[5:].strip()
@@ -6505,7 +6688,7 @@ def run_repl(
                     print(rendered)
                 else:
                     print("assistant>")
-                    print(rendered)
+                    print(colorize_markdown_text_for_terminal(rendered))
                 continue
             if lower == "/history" or lower.startswith("/history "):
                 parts = line.split()
@@ -7258,7 +7441,7 @@ def dispatch_prompt(
             print(rendered_output)
         else:
             print("assistant>")
-            print(rendered_output)
+            print(colorize_markdown_text_for_terminal(rendered_output))
         turn_result["rendered_output"] = rendered_output
     elif wait_for_response and submit:
         if show_dispatch_details:
