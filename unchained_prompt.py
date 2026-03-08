@@ -3498,6 +3498,31 @@ result = a + b
             self.assertIn("@1", suggestions)
             self.assertIn("@2", suggestions)
 
+        def test_apply_repl_completion_state_cycles_run_ref_slot(self) -> None:
+            refs = [
+                {"handle": "@1", "cell_id": "py1", "language": "python"},
+                {"handle": "@2", "cell_id": "py2", "language": "python"},
+            ]
+            buffer = "/run @"
+            cursor = len(buffer)
+            state = None
+            buffer, cursor, state = apply_repl_completion_state(
+                buffer,
+                cursor,
+                state,
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertEqual(buffer, "/run @1 ")
+            buffer, cursor, state = apply_repl_completion_state(
+                buffer,
+                cursor,
+                state,
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertEqual(buffer, "/run @2 ")
+
         def test_execute_cell_locally_python(self) -> None:
             cell = {
                 "id": "py1",
@@ -5003,6 +5028,27 @@ def build_live_repl_panel_lines(
     return []
 
 
+def ref_completion_suggestions(
+    ref_suggestions: Sequence[str],
+    token: str,
+    *,
+    include_exact_cycle: bool = False,
+) -> List[str]:
+    candidate = str(token or "").strip()
+    values = [str(value or "").strip() for value in ref_suggestions if str(value or "").strip()]
+    if not candidate:
+        return values
+    if candidate.startswith("@"):
+        scoped = [value for value in values if value.startswith("@")]
+    else:
+        scoped = [value for value in values if not value.startswith("@")]
+    if not scoped:
+        scoped = values
+    if include_exact_cycle and candidate in scoped:
+        return scoped
+    return [value for value in scoped if value.startswith(candidate)]
+
+
 def repl_completion_candidates(
     buffer: str,
     cursor: int,
@@ -5037,15 +5083,29 @@ def repl_completion_candidates(
         ref_suggestions.append(current_cell_id)
 
     if first_lower in {"/run", "/show", "/edit", "/focus"}:
+        if len(tokens) > 2:
+            return None
         prefix = ""
         start = cursor
         end = cursor
-        if len(tokens) >= 2 and not trailing_space:
+        if len(tokens) >= 2:
             prefix = str(tokens[1] or "")
             start = raw.rfind(prefix)
-            end = cursor
-        suggestions = [value for value in ref_suggestions if value.startswith(prefix)]
-        return {"start": start, "end": end, "suggestions": suggestions, "append_space": True}
+            end = start + len(prefix) if trailing_space else cursor
+            suggestions = ref_completion_suggestions(
+                ref_suggestions,
+                prefix,
+                include_exact_cycle=bool(trailing_space or prefix in ref_suggestions),
+            )
+        else:
+            suggestions = list(ref_suggestions)
+        return {
+            "start": start,
+            "end": end,
+            "suggestions": suggestions,
+            "append_space": True,
+            "cycle_key": (first_lower, "ref-slot", tuple(suggestions)),
+        }
 
     if first_lower in {"/fork", "/save"}:
         if trailing_space and len(tokens) >= 2:
@@ -5077,6 +5137,46 @@ def repl_completion_candidates(
         return {"start": start, "end": end, "suggestions": suggestions, "append_space": True}
 
     return None
+
+
+def apply_repl_completion_state(
+    buffer: str,
+    cursor: int,
+    completion_state: Optional[Dict[str, Any]],
+    *,
+    current_cell_id: Optional[str],
+    action_refs: Sequence[Dict[str, Any]],
+) -> Tuple[str, int, Optional[Dict[str, Any]]]:
+    context = repl_completion_candidates(
+        buffer,
+        cursor,
+        current_cell_id=current_cell_id,
+        action_refs=action_refs,
+    )
+    if not context or not list(context.get("suggestions") or []):
+        return buffer, cursor, completion_state
+
+    suggestions = list(context.get("suggestions") or [])
+    start = int(context.get("start") or 0)
+    end = int(context.get("end") or cursor)
+    cycle_key = context.get("cycle_key")
+    if cycle_key is not None:
+        base_key = cycle_key
+    else:
+        base_key = (buffer, cursor, start, end, tuple(suggestions))
+
+    if completion_state and completion_state.get("key") == base_key:
+        index = (int(completion_state.get("index") or 0) + 1) % len(suggestions)
+    else:
+        index = 0
+
+    suggestion = suggestions[index]
+    next_buffer = buffer[:start] + suggestion + buffer[end:]
+    if bool(context.get("append_space")) and not next_buffer.endswith(" "):
+        next_buffer += " "
+    next_cursor = len(next_buffer)
+    next_state = {"key": base_key, "index": index}
+    return next_buffer, next_cursor, next_state
 
 
 def format_repl_input_line(prompt: str, buffer: str, cursor: int, width: int) -> Tuple[str, int]:
@@ -5181,7 +5281,7 @@ def read_live_repl_input(
         sys.stdout.write("\x1b[J")
         sys.stdout.write(input_line)
         for line in panel_lines:
-            sys.stdout.write("\n" + line)
+            sys.stdout.write("\r\n" + line)
         if panel_lines:
             sys.stdout.write(f"\x1b[{len(panel_lines)}A")
         sys.stdout.write("\r")
@@ -5194,35 +5294,20 @@ def read_live_repl_input(
     def finalize_line() -> None:
         move_to_input_origin()
         sys.stdout.write("\x1b[J")
-        sys.stdout.write(f"{prompt}{buffer}\n")
+        sys.stdout.write(f"{prompt}{buffer}\r\n")
         sys.stdout.flush()
 
     def apply_completion() -> None:
         nonlocal buffer
         nonlocal cursor
         nonlocal completion_state
-        context = repl_completion_candidates(
+        buffer, cursor, completion_state = apply_repl_completion_state(
             buffer,
             cursor,
+            completion_state,
             current_cell_id=current_cell_id,
             action_refs=list(action_refs or []),
         )
-        if not context or not list(context.get("suggestions") or []):
-            return
-        suggestions = list(context.get("suggestions") or [])
-        start = int(context.get("start") or 0)
-        end = int(context.get("end") or cursor)
-        base_key = (buffer, cursor, start, end, tuple(suggestions))
-        if completion_state and completion_state.get("key") == base_key:
-            index = (int(completion_state.get("index") or 0) + 1) % len(suggestions)
-        else:
-            index = 0
-        suggestion = suggestions[index]
-        buffer = buffer[:start] + suggestion + buffer[end:]
-        if bool(context.get("append_space")) and not buffer.endswith(" "):
-            buffer += " "
-        cursor = len(buffer)
-        completion_state = {"key": base_key, "index": index}
 
     try:
         tty.setraw(fd)
@@ -5237,13 +5322,13 @@ def read_live_repl_input(
                 return buffer.strip()
             if ch == "\x03":
                 move_to_input_origin()
-                sys.stdout.write("\x1b[J\n")
+                sys.stdout.write("\x1b[J\r\n")
                 sys.stdout.flush()
                 raise KeyboardInterrupt
             if ch == "\x04":
                 if not buffer:
                     move_to_input_origin()
-                    sys.stdout.write("\x1b[J\n")
+                    sys.stdout.write("\x1b[J\r\n")
                     sys.stdout.flush()
                     raise EOFError
                 if cursor < len(buffer):
