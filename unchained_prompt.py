@@ -192,11 +192,17 @@ class MCPClient:
         self.timeout = timeout
         self.debug = debug
         self.session_id: Optional[str] = None
+        self._rpc_seq = 0
+
+    def _next_rpc_id(self, prefix: str) -> str:
+        self._rpc_seq += 1
+        safe_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(prefix or "rpc"))
+        return f"{safe_prefix}-{int(time.time() * 1000)}-{self._rpc_seq}"
 
     def initialize(self) -> None:
         payload = {
             "jsonrpc": "2.0",
-            "id": "init-1",
+            "id": self._next_rpc_id("init"),
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-03-26",
@@ -223,7 +229,12 @@ class MCPClient:
         self._rpc_request(notification, include_session=True, allow_empty=True)
 
     def list_tools(self) -> List[str]:
-        payload = {"jsonrpc": "2.0", "id": "tools-list-1", "method": "tools/list", "params": {}}
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_rpc_id("tools-list"),
+            "method": "tools/list",
+            "params": {},
+        }
         try:
             response = self._rpc_request(payload, include_session=True, allow_empty=False)
         except MCPError:
@@ -248,7 +259,7 @@ class MCPClient:
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         payload = {
             "jsonrpc": "2.0",
-            "id": f"tool-call-{name}",
+            "id": self._next_rpc_id(f"tool-call-{name}"),
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
         }
@@ -2502,6 +2513,38 @@ result = a + b
             self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
             self.assertIn("PLAYGROUND_OK", str(result.get("stdout") or ""))
 
+        def test_execute_cell_locally_python_failure_sets_ok_false(self) -> None:
+            cell = {
+                "id": "py2",
+                "language": "python",
+                "content": "raise RuntimeError('PLAYGROUND_FAIL')",
+            }
+            result = execute_cell_locally(cell, timeout_s=10)
+            self.assertFalse(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertNotEqual(int(result.get("exit_code", 0)), 0, msg=json.dumps(result))
+            self.assertIn("PLAYGROUND_FAIL", str(result.get("error") or ""))
+            self.assertIn("PLAYGROUND_FAIL", str(result.get("stderr") or ""))
+
+        def test_execute_cell_locally_python_can_import_workspace_module(self) -> None:
+            module_path = Path.cwd() / "_sky_prompt_local_import_probe.py"
+            module_path.write_text("VALUE = 7\n", encoding="utf-8")
+            try:
+                cell = {
+                    "id": "py3",
+                    "language": "python",
+                    "content": (
+                        "import _sky_prompt_local_import_probe\n"
+                        "print(_sky_prompt_local_import_probe.VALUE)"
+                    ),
+                }
+                result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=10)
+            finally:
+                module_path.unlink(missing_ok=True)
+
+            self.assertTrue(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
+            self.assertIn("7", str(result.get("stdout") or ""))
+
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
             self.assertEqual(resolved, ["pyreplab", "--workdir", "/tmp/demo"])
@@ -2588,6 +2631,31 @@ result = a + b
         def test_extract_cell_preview_line_uses_last_non_empty_line(self) -> None:
             content = "import numpy as np\nx = np.array([1,2,3])\n\nprint(x)\n"
             self.assertEqual(extract_cell_preview_line(content), "print(x)")
+
+        def test_mcp_client_next_rpc_id_is_unique(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            ids = {client._next_rpc_id("tool-call-js_eval") for _ in range(8)}
+            self.assertEqual(len(ids), 8)
+
+        def test_mcp_client_call_tool_uses_unique_ids(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            client.session_id = "sid-test"
+            seen_ids: List[str] = []
+
+            def fake_rpc(payload: Dict[str, Any], include_session: bool, allow_empty: bool) -> Dict[str, Any]:
+                seen_ids.append(str(payload.get("id") or ""))
+                self.assertTrue(include_session)
+                self.assertFalse(allow_empty)
+                return {"result": {"content": []}}
+
+            with mock.patch.object(client, "_rpc_request", side_effect=fake_rpc):
+                client.call_tool("js_eval", {"expression": "1+1"})
+                client.call_tool("js_eval", {"expression": "2+2"})
+
+            self.assertEqual(len(seen_ids), 2)
+            self.assertNotEqual(seen_ids[0], seen_ids[1])
+            self.assertTrue(seen_ids[0].startswith("tool-call-js_eval-"))
+            self.assertTrue(seen_ids[1].startswith("tool-call-js_eval-"))
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ResponseFormattingSelfTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -2762,53 +2830,62 @@ def diff_cell_contents(
 
 def execute_cell_locally(
     cell: Dict[str, Any],
+    workdir: Optional[Path] = None,
     timeout_s: int = 30,
 ) -> Dict[str, Any]:
     language = normalize_code_language(str(cell.get("language") or ""))
     content = str(cell.get("content") or "")
     if not content.strip():
         return {"ok": False, "backend": "local", "error": "empty cell content"}
+    workdir_path = Path(workdir or Path.cwd())
+    script_path: Optional[Path] = None
+    input_text: Optional[str] = None
 
-    suffix = language_to_cell_extension(language)
-    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as handle:
-        handle.write(content)
-        script_path = Path(handle.name)
-
-    runner_cmd: List[str]
     if language == "python":
-        runner_cmd = ["python3", str(script_path)]
-    elif language == "bash":
-        runner_cmd = ["bash", str(script_path)]
-    elif language in {"javascript", "js"}:
-        runner_cmd = ["node", str(script_path)]
-    elif language in {"typescript", "ts"}:
-        runner_cmd = ["ts-node", str(script_path)]
-    elif language == "ruby":
-        runner_cmd = ["ruby", str(script_path)]
-    elif language == "perl":
-        runner_cmd = ["perl", str(script_path)]
+        runner_cmd = ["python3", "-"]
+        input_text = content
+    elif language in {"bash", "javascript", "js", "typescript", "ts", "ruby", "perl"}:
+        suffix = language_to_cell_extension(language)
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as handle:
+            handle.write(content)
+            script_path = Path(handle.name)
+        if language == "bash":
+            runner_cmd = ["bash", str(script_path)]
+        elif language in {"javascript", "js"}:
+            runner_cmd = ["node", str(script_path)]
+        elif language in {"typescript", "ts"}:
+            runner_cmd = ["ts-node", str(script_path)]
+        elif language == "ruby":
+            runner_cmd = ["ruby", str(script_path)]
+        else:
+            runner_cmd = ["perl", str(script_path)]
     else:
-        try:
-            script_path.unlink(missing_ok=True)
-        except Exception:
-            pass
         return {"ok": False, "backend": "local", "error": f"unsupported language for local run: {language}"}
 
     try:
         completed = subprocess.run(
             runner_cmd,
+            input=input_text,
             capture_output=True,
             text=True,
             timeout=max(1, int(timeout_s)),
+            cwd=str(workdir_path),
             check=False,
         )
+        exit_code = int(completed.returncode)
+        stderr_text = str(completed.stderr or "")
+        stdout_text = str(completed.stdout or "")
+        error_message = ""
+        if exit_code != 0:
+            error_message = stderr_text.strip() or stdout_text.strip() or f"command failed with exit code {exit_code}"
         return {
-            "ok": True,
+            "ok": exit_code == 0,
             "backend": "local",
             "command": runner_cmd,
-            "exit_code": int(completed.returncode),
-            "stdout": str(completed.stdout or ""),
-            "stderr": str(completed.stderr or ""),
+            "exit_code": exit_code,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "error": error_message,
         }
     except subprocess.TimeoutExpired as exc:
         return {
@@ -2827,10 +2904,11 @@ def execute_cell_locally(
             "error": f"runner not found: {runner_cmd[0]}",
         }
     finally:
-        try:
-            script_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if script_path is not None:
+            try:
+                script_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def resolve_pyreplab_command(explicit_command: Optional[str] = None) -> Optional[List[str]]:
@@ -4052,7 +4130,7 @@ def run_repl(
                 )
                 print(str(cell.get("content") or ""))
                 continue
-            if lower.startswith("/run "):
+            if lower == "/run" or lower.startswith("/run "):
                 args, parse_error = split_repl_command_args(line)
                 if parse_error:
                     print(f"command parse error: {parse_error}")
@@ -4083,9 +4161,9 @@ def run_repl(
                     )
                 elif run_backend_mode == "pyreplab" and language != "python":
                     print(f"backend: pyreplab supports python only; using local for {language or 'unknown'}")
-                    result = execute_cell_locally(cell, timeout_s=timeout_s)
+                    result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=timeout_s)
                 else:
-                    result = execute_cell_locally(cell, timeout_s=timeout_s)
+                    result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=timeout_s)
                 if not result.get("ok"):
                     print(f"run error: {result.get('error')}")
                     stderr_text = str(result.get("stderr") or "").strip()

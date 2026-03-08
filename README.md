@@ -174,6 +174,13 @@ Run built-in closed-loop self-tests:
 ./unchained --self-test
 ```
 
+Developer test loop (recommended while iterating):
+
+```bash
+./scripts/test_loop.sh
+./scripts/test_loop.sh --watch
+```
+
 ## Custom Alias Setup
 
 Install any command name you want (for example `sky`):
