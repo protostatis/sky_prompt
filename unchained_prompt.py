@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +30,8 @@ DEFAULT_RENDER_STABLE_POLLS = 3
 DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
+DEFAULT_RUN_BACKEND = "pyreplab"
+SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
 LANGUAGE_ALIASES: Dict[str, str] = {
     "py": "python",
@@ -43,6 +50,26 @@ RUNNER_BY_LANGUAGE: Dict[str, str] = {
     "ts": "ts-node",
     "ruby": "ruby",
     "perl": "perl",
+}
+CELL_PREFIX_BY_LANGUAGE: Dict[str, str] = {
+    "python": "py",
+    "bash": "sh",
+    "javascript": "js",
+    "js": "js",
+    "typescript": "ts",
+    "ts": "ts",
+    "ruby": "rb",
+    "perl": "pl",
+}
+CELL_EXTENSION_BY_LANGUAGE: Dict[str, str] = {
+    "python": ".py",
+    "bash": ".sh",
+    "javascript": ".js",
+    "js": ".js",
+    "typescript": ".ts",
+    "ts": ".ts",
+    "ruby": ".rb",
+    "perl": ".pl",
 }
 SHELL_PREFIXES: Tuple[str, ...] = (
     "pip ",
@@ -118,6 +145,34 @@ SHELL_BINARIES: set = {
     "make",
     "cargo",
     "go",
+}
+LANGUAGE_LABEL_LINE_MAP: Dict[str, str] = {
+    "python": "python",
+    "python3": "python",
+    "py": "python",
+    "bash": "bash",
+    "shell": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "javascript": "javascript",
+    "js": "javascript",
+    "typescript": "typescript",
+    "ts": "typescript",
+    "json": "json",
+    "csv": "csv",
+    "sql": "sql",
+    "plain text": "text",
+}
+UI_NOISE_LINES: set = {
+    "run",
+    "copy",
+    "copy code",
+}
+OUTPUT_SECTION_LABELS: set = {
+    "result",
+    "output",
+    "stdout",
+    "response",
 }
 PREFERRED_NAVIGATE_TOOLS = ("cdp_navigate", "navigate")
 PREFERRED_JS_TOOLS = ("js_eval", "execute_js")
@@ -1300,6 +1355,31 @@ def normalize_code_language(language: str) -> str:
     return LANGUAGE_ALIASES.get(raw, raw)
 
 
+def parse_language_label_line(raw_line: str) -> str:
+    line = str(raw_line or "").strip().lower()
+    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+    line = re.sub(r"^\s*[-*]\s*", "", line)
+    line = re.sub(r"^\s*\d+\.\s*", "", line)
+    if not line:
+        return ""
+    compact = re.sub(r"[\s:.\-]+$", "", line)
+    compact = re.sub(r"\s+code$", "", compact)
+    if compact in LANGUAGE_LABEL_LINE_MAP:
+        return normalize_code_language(LANGUAGE_LABEL_LINE_MAP[compact])
+    return ""
+
+
+def is_output_label_line(raw_line: str) -> bool:
+    line = str(raw_line or "").strip().lower()
+    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+    line = re.sub(r"^\s*[-*]\s*", "", line)
+    line = re.sub(r"^\s*\d+\.\s*", "", line)
+    if not line:
+        return False
+    normalized = re.sub(r"[\s:.\-]+$", "", line)
+    return normalized in OUTPUT_SECTION_LABELS
+
+
 def infer_language_from_code(content: str) -> str:
     stripped = str(content or "").strip()
     if not stripped:
@@ -1328,9 +1408,113 @@ def infer_language_from_code(content: str) -> str:
     return ""
 
 
+def python_snippet_is_valid(content: str) -> bool:
+    snippet = str(content or "").strip()
+    if not snippet:
+        return False
+    try:
+        compile(snippet, "<inferred-python>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def trim_trailing_heading_comment_lines(lines: List[str]) -> None:
+    while lines:
+        stripped = str(lines[-1] or "").strip()
+        if not stripped:
+            lines.pop()
+            continue
+        if re.match(r"^#\s+[A-Za-z].*", stripped):
+            lines.pop()
+            continue
+        break
+
+
 def language_runner(language: str) -> Optional[str]:
     normalized = normalize_code_language(language)
     return RUNNER_BY_LANGUAGE.get(normalized)
+
+
+def looks_like_indented_code_tail_line(language: str, line: str) -> bool:
+    candidate = str(line or "").strip()
+    if not candidate:
+        return False
+    normalized = normalize_code_language(language)
+    if normalized == "python":
+        return looks_like_python_code_line(candidate) or looks_like_python_continuation_line(candidate)
+    if normalized == "bash":
+        return looks_like_shell_command_line(candidate)
+    return looks_like_generic_code_line(candidate)
+
+
+def consume_fenced_indented_tail(
+    markdown_text: str,
+    start_offset: int,
+    language: str,
+    seeded: bool = False,
+) -> Tuple[str, int]:
+    tail = markdown_text[start_offset:]
+    if not tail:
+        return "", 0
+
+    lines = tail.splitlines(keepends=True)
+    consumed = 0
+    collected: List[str] = []
+    saw_code = bool(seeded)
+
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        stripped = line.strip()
+        if not stripped:
+            if not saw_code and not collected:
+                consumed += len(raw)
+                continue
+            collected.append("")
+            consumed += len(raw)
+            continue
+
+        if stripped.startswith("```"):
+            break
+        if parse_language_label_line(stripped):
+            break
+        if is_output_label_line(stripped):
+            break
+
+        match = re.match(r"^(?: {4}|\t)(.+)$", line)
+        if match:
+            code_line = match.group(1).rstrip()
+            code_line_for_check = code_line
+            line_to_store = line.rstrip()
+        else:
+            code_line = line.rstrip()
+            code_line_for_check = code_line
+            line_to_store = code_line
+
+        if not looks_like_indented_code_tail_line(language, code_line_for_check):
+            break
+        if normalize_code_language(language) == "bash":
+            line_to_store = normalize_shell_candidate_line(code_line)
+            if not line_to_store:
+                break
+            collected.append(line_to_store)
+        else:
+            # Preserve leading indentation so loop/function bodies remain runnable.
+            collected.append(line_to_store)
+        consumed += len(raw)
+        saw_code = True
+
+    if not saw_code:
+        return "", 0
+
+    while collected and not collected[0].strip():
+        collected.pop(0)
+    while collected and not collected[-1].strip():
+        collected.pop()
+    trim_trailing_heading_comment_lines(collected)
+    if not collected:
+        return "", 0
+    return "\n".join(collected), consumed
 
 
 def split_markdown_with_fenced_blocks(markdown_text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1351,6 +1535,17 @@ def split_markdown_with_fenced_blocks(markdown_text: str) -> Tuple[List[Dict[str
         content = str(match.group(2) or "").strip("\n")
         inferred = infer_language_from_code(content)
         language = declared or inferred or "text"
+        tail_content, tail_consumed = consume_fenced_indented_tail(
+            markdown_text,
+            match.end(),
+            language,
+            seeded=bool(content.strip()),
+        )
+        if tail_content:
+            content = (content.rstrip() + "\n" + tail_content).strip("\n")
+        syntax_valid = True
+        if language == "python":
+            syntax_valid = python_snippet_is_valid(content)
         runner = language_runner(language)
         block = {
             "id": f"code_{code_id}",
@@ -1360,7 +1555,8 @@ def split_markdown_with_fenced_blocks(markdown_text: str) -> Tuple[List[Dict[str
             "declared_language": declared or None,
             "inferred_language": inferred or None,
             "runner": runner,
-            "executable": bool(runner),
+            "syntax_valid": syntax_valid,
+            "executable": bool(runner) and syntax_valid,
             "content": content,
         }
         code_blocks.append(block)
@@ -1373,7 +1569,7 @@ def split_markdown_with_fenced_blocks(markdown_text: str) -> Tuple[List[Dict[str
             }
         )
         code_id += 1
-        last_end = match.end()
+        last_end = match.end() + tail_consumed
 
     suffix = markdown_text[last_end:]
     if suffix.strip():
@@ -1394,21 +1590,33 @@ def normalize_shell_candidate_line(raw_line: str) -> str:
 
 
 def looks_like_shell_command_line(raw_line: str) -> bool:
-    line = normalize_shell_candidate_line(raw_line)
+    raw = str(raw_line or "")
+    line = normalize_shell_candidate_line(raw)
     if not line:
         return False
     if line.startswith("#"):
         return False
     lower = line.lower()
+
+    parts = line.split()
+    if not parts:
+        return False
+    first = parts[0].lower()
+    has_prompt_prefix = raw.lstrip().startswith("$ ")
+    if not has_prompt_prefix and line.endswith(":") and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.+-]*:\s*", line):
+        # Treat heading-like labels (e.g., "Python loop:") as prose, not shell commands.
+        return False
+    # Avoid classifying standalone language labels like "Python" as shell commands.
+    if len(parts) == 1 and not has_prompt_prefix and parse_language_label_line(first):
+        return False
     if any(lower.startswith(prefix) for prefix in SHELL_PREFIXES):
         return True
 
-    first = line.split()[0].lower()
     if first in SHELL_BINARIES:
         return True
     if first.startswith("./") or "/" in first:
         return True
-    if re.fullmatch(r"[A-Za-z0-9_.-]+", first) and len(line.split()) > 1 and first in SHELL_BINARIES:
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", first) and len(parts) > 1 and first in SHELL_BINARIES:
         return True
     return False
 
@@ -1449,15 +1657,64 @@ def looks_like_python_code_line(raw_line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
+    if re.match(r"^#{2,6}\s+\S", stripped):
+        return False
     if stripped.startswith("#"):
         return True
     if re.match(r"^(from|import|def|class|for|while|if|elif|else|try|except|with|return|yield|assert)\b", stripped):
         return True
-    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped):
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+\s*=", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*(?:[\+\-\*/%@]?=)", stripped):
+        return True
+    if re.match(r"^print\s*\(", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*\s*\(", stripped) and stripped.endswith(")"):
         return True
     if re.search(r"\b(np|pd|plt)\.[A-Za-z_]", stripped):
         return True
     if stripped.endswith(":") and re.match(r"^(for|while|if|elif|else|def|class|try|except|with)\b", stripped):
+        return True
+    return False
+
+
+def looks_like_python_continuation_line(raw_line: str) -> bool:
+    stripped = str(raw_line or "").strip()
+    if not stripped:
+        return False
+    if re.match(r"^[\])}]$", stripped):
+        return True
+    if stripped.startswith(("[", "]", "(", ")", "{", "}")) and "," in stripped:
+        return True
+    if stripped.endswith(("]", ")", "}", ",")) and "," in stripped:
+        return True
+    if stripped in {"pass", "break", "continue"}:
+        return True
+    return False
+
+
+def looks_like_generic_code_line(raw_line: str) -> bool:
+    stripped = str(raw_line or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    if re.search(r"[{}()[\];=]", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*\s+\S+", stripped):
+        return True
+    return False
+
+
+def looks_like_runtime_output_line(raw_line: str) -> bool:
+    stripped = str(raw_line or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("Traceback", "Error", "Exception")):
+        return True
+    if re.match(r"^[\[\]()<>{}\-+*/|_\\0-9.,\s]+$", stripped):
+        return True
+    if re.match(r"^[A-Za-z0-9 _.-]+:\s*[-+0-9.\[\]()<>{},\s]+$", stripped):
         return True
     return False
 
@@ -1477,10 +1734,10 @@ def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[st
         strong_markers = 0
         while i < len(lines):
             current = lines[i]
-            if looks_like_python_code_line(current):
+            if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
                 collected.append(current.rstrip())
                 trimmed = current.strip()
-                if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed:
+                if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed or "print" in trimmed:
                     strong_markers += 1
                 i += 1
                 continue
@@ -1494,9 +1751,10 @@ def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[st
             collected.pop(0)
         while collected and not collected[-1].strip():
             collected.pop()
+        trim_trailing_heading_comment_lines(collected)
         non_empty = [line for line in collected if line.strip()]
-        if len(non_empty) >= 3 and strong_markers >= 1:
-            content = "\n".join(collected)
+        content = "\n".join(collected)
+        if len(non_empty) >= 1 and strong_markers >= 1 and python_snippet_is_valid(content):
             blocks.append(
                 {
                     "id": f"code_inferred_{index}",
@@ -1506,6 +1764,7 @@ def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[st
                     "declared_language": None,
                     "inferred_language": "python",
                     "runner": "python",
+                    "syntax_valid": True,
                     "executable": True,
                     "content": content,
                 }
@@ -1517,18 +1776,400 @@ def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[st
     return blocks
 
 
+def extract_labeled_code_and_output_blocks_from_text(
+    text: str,
+    start_code_index: int,
+    start_output_index: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    lines = str(text or "").splitlines()
+    code_blocks: List[Dict[str, Any]] = []
+    output_blocks: List[Dict[str, Any]] = []
+    i = 0
+    code_index = start_code_index
+    output_index = start_output_index
+
+    while i < len(lines):
+        declared_language = parse_language_label_line(lines[i])
+        if not declared_language or declared_language == "text":
+            i += 1
+            continue
+
+        language = normalize_code_language(declared_language)
+        j = i + 1
+        while j < len(lines) and lines[j].strip().lower() in UI_NOISE_LINES:
+            j += 1
+
+        collected: List[str] = []
+        strong_markers = 0
+        while j < len(lines):
+            current = lines[j]
+            stripped = current.strip()
+            if not stripped:
+                if collected:
+                    collected.append("")
+                j += 1
+                continue
+            if is_output_label_line(stripped):
+                break
+
+            match_language = False
+            if language == "python":
+                if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
+                    match_language = True
+            elif language == "bash":
+                if looks_like_shell_command_line(current):
+                    current = normalize_shell_candidate_line(current)
+                    match_language = True
+            else:
+                if looks_like_generic_code_line(current):
+                    match_language = True
+
+            if not match_language:
+                break
+
+            collected.append(current.rstrip())
+            if (
+                re.match(r"^(from|import|def|class)\b", stripped)
+                or "=" in stripped
+                or "print" in stripped
+                or (language == "bash" and looks_like_shell_command_line(stripped))
+            ):
+                strong_markers += 1
+            j += 1
+
+        while collected and not collected[0].strip():
+            collected.pop(0)
+        while collected and not collected[-1].strip():
+            collected.pop()
+        if language == "python":
+            trim_trailing_heading_comment_lines(collected)
+
+        non_empty = [line for line in collected if line.strip()]
+        min_lines = 1
+        has_valid_code = len(non_empty) >= min_lines and (strong_markers >= 1 or language in {"bash", "python"})
+        content = "\n".join(collected)
+        syntax_valid = True
+        if language == "python":
+            syntax_valid = python_snippet_is_valid(content)
+            has_valid_code = has_valid_code and syntax_valid
+        if not has_valid_code:
+            i += 1
+            continue
+
+        runner = language_runner(language)
+        code_blocks.append(
+            {
+                "id": f"code_labeled_{code_index}",
+                "type": "code_block",
+                "source": "labeled_text",
+                "language": language,
+                "declared_language": language,
+                "inferred_language": language,
+                "runner": runner,
+                "syntax_valid": syntax_valid,
+                "executable": bool(runner) and syntax_valid,
+                "content": content,
+            }
+        )
+        code_index += 1
+
+        i = j
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+
+        if i < len(lines) and is_output_label_line(lines[i]):
+            label_raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", lines[i].strip().lower())
+            label_raw = re.sub(r"^\s*[-*]\s*", "", label_raw)
+            label_raw = re.sub(r"^\s*\d+\.\s*", "", label_raw)
+            label = re.sub(r"[\s:.\-]+$", "", label_raw)
+            i += 1
+            output_lines: List[str] = []
+            consecutive_blanks = 0
+            while i < len(lines):
+                current = lines[i]
+                stripped = current.strip()
+                if not stripped:
+                    if output_lines:
+                        consecutive_blanks += 1
+                        if consecutive_blanks >= 2:
+                            break
+                        output_lines.append("")
+                    i += 1
+                    continue
+
+                consecutive_blanks = 0
+                if output_lines and parse_language_label_line(stripped):
+                    break
+                if output_lines and re.match(r"^\s{0,3}#{1,6}\s+", current):
+                    break
+                if output_lines and not looks_like_runtime_output_line(current):
+                    break
+                output_lines.append(current.rstrip())
+                i += 1
+
+            while output_lines and not output_lines[0].strip():
+                output_lines.pop(0)
+            while output_lines and not output_lines[-1].strip():
+                output_lines.pop()
+            if output_lines:
+                output_blocks.append(
+                    {
+                        "id": f"output_{output_index}",
+                        "type": "output_block",
+                        "source": "labeled_text",
+                        "label": label or "result",
+                        "language": "text",
+                        "content": "\n".join(output_lines),
+                    }
+                )
+                output_index += 1
+        continue
+
+    return code_blocks, output_blocks
+
+
+def dedupe_code_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set = set()
+    for block in blocks:
+        language = normalize_code_language(str(block.get("language") or ""))
+        content = str(block.get("content") or "").strip()
+        if not content:
+            continue
+        key = (language, content)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(block)
+    return deduped
+
+
+def dedupe_command_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set = set()
+    for block in blocks:
+        content = str(block.get("content") or "").strip()
+        if not content:
+            continue
+        if content in seen:
+            continue
+        seen.add(content)
+        deduped.append(block)
+    return deduped
+
+
+def clean_section_label(raw_line: str) -> str:
+    line = str(raw_line or "").strip().lower()
+    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+    line = re.sub(r"^\s*[-*]\s*", "", line)
+    line = re.sub(r"^\s*\d+\.\s*", "", line)
+    return re.sub(r"[\s:.\-]+$", "", line)
+
+
+def is_probable_noise_digit_line(lines: Sequence[str], index: int) -> bool:
+    if index < 0 or index >= len(lines):
+        return False
+    current = str(lines[index] or "").strip()
+    if not re.fullmatch(r"\d", current):
+        return False
+
+    prev_non_empty = ""
+    for j in range(index - 1, -1, -1):
+        candidate = str(lines[j] or "").strip()
+        if candidate:
+            prev_non_empty = candidate
+            break
+    next_non_empty = ""
+    for j in range(index + 1, len(lines)):
+        candidate = str(lines[j] or "").strip()
+        if candidate:
+            next_non_empty = candidate
+            break
+    if not prev_non_empty or not next_non_empty:
+        return False
+    if re.match(r"^\s{0,3}#{1,6}\s+\S", prev_non_empty):
+        if re.match(r"^\d+[\).]?\s*", next_non_empty):
+            return False
+        if next_non_empty.startswith(("-", "*")):
+            return False
+        return True
+    return False
+
+
+def rewrite_labeled_sections_as_fenced_markdown(text: str) -> str:
+    lines = str(text or "").splitlines()
+    if not lines:
+        return ""
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        if is_probable_noise_digit_line(lines, i):
+            i += 1
+            continue
+
+        language = parse_language_label_line(lines[i])
+        if language and language != "text":
+            j = i + 1
+            while j < len(lines) and lines[j].strip().lower() in UI_NOISE_LINES:
+                j += 1
+
+            collected: List[str] = []
+            strong_markers = 0
+            while j < len(lines):
+                current = lines[j]
+                stripped = current.strip()
+                if not stripped:
+                    if collected:
+                        collected.append("")
+                    j += 1
+                    continue
+                if is_output_label_line(stripped):
+                    break
+
+                matched = False
+                render_line = current.rstrip()
+                if language == "python":
+                    matched = looks_like_python_code_line(current) or (
+                        collected and looks_like_python_continuation_line(current)
+                    )
+                elif language == "bash":
+                    matched = looks_like_shell_command_line(current)
+                    if matched:
+                        render_line = normalize_shell_candidate_line(current)
+                else:
+                    matched = looks_like_generic_code_line(current)
+
+                if not matched:
+                    break
+
+                collected.append(render_line)
+                if (
+                    re.match(r"^(from|import|def|class)\b", stripped)
+                    or "=" in stripped
+                    or "print" in stripped
+                    or (language == "bash" and looks_like_shell_command_line(stripped))
+                ):
+                    strong_markers += 1
+                j += 1
+
+            while collected and not collected[0].strip():
+                collected.pop(0)
+            while collected and not collected[-1].strip():
+                collected.pop()
+            if language == "python":
+                trim_trailing_heading_comment_lines(collected)
+
+            non_empty = [line for line in collected if line.strip()]
+            min_lines = 1
+            has_valid_code = len(non_empty) >= min_lines and (strong_markers >= 1 or language in {"bash", "python"})
+            if has_valid_code and language == "python":
+                has_valid_code = python_snippet_is_valid("\n".join(collected))
+            if has_valid_code:
+                out.append(f"```{language}")
+                out.extend(collected)
+                out.append("```")
+
+                i = j
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+
+                if i < len(lines) and is_output_label_line(lines[i]):
+                    label = clean_section_label(lines[i]) or "output"
+                    i += 1
+                    output_lines: List[str] = []
+                    consecutive_blanks = 0
+                    while i < len(lines):
+                        current = lines[i]
+                        stripped = current.strip()
+                        if not stripped:
+                            if output_lines:
+                                consecutive_blanks += 1
+                                if consecutive_blanks >= 2:
+                                    break
+                                output_lines.append("")
+                            i += 1
+                            continue
+
+                        consecutive_blanks = 0
+                        if output_lines and parse_language_label_line(stripped):
+                            break
+                        if output_lines and re.match(r"^\s{0,3}#{1,6}\s+", current):
+                            break
+                        if output_lines and not looks_like_runtime_output_line(current):
+                            break
+                        output_lines.append(current.rstrip())
+                        i += 1
+
+                    while output_lines and not output_lines[0].strip():
+                        output_lines.pop(0)
+                    while output_lines and not output_lines[-1].strip():
+                        output_lines.pop()
+                    if output_lines:
+                        out.append(f"{label.capitalize()}:")
+                        out.append("```text")
+                        out.extend(output_lines)
+                        out.append("```")
+                continue
+
+        out.append(lines[i].rstrip())
+        i += 1
+
+    rendered = "\n".join(out)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered.strip()
+
+
+def prettify_markdown_response(markdown_text: str) -> str:
+    text = str(markdown_text or "").strip()
+    if not text:
+        return ""
+    segments, _ = split_markdown_with_fenced_blocks(text)
+    rendered_segments: List[str] = []
+    for segment in segments:
+        segment_type = str(segment.get("type") or "")
+        if segment_type == "code":
+            language = normalize_code_language(str(segment.get("language") or "")) or "text"
+            body = str(segment.get("text") or "").strip("\n")
+            rendered_segments.append(f"```{language}\n{body}\n```".rstrip())
+            continue
+        if segment_type == "text":
+            rewritten = rewrite_labeled_sections_as_fenced_markdown(str(segment.get("text") or ""))
+            if rewritten:
+                rendered_segments.append(rewritten)
+
+    joined = "\n\n".join(part for part in rendered_segments if part.strip())
+    joined = re.sub(r"\n{3,}", "\n\n", joined)
+    return joined.strip()
+
+
 def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
     text = str(markdown_text or "").strip()
     segments, fenced_code_blocks = split_markdown_with_fenced_blocks(text)
     command_blocks: List[Dict[str, Any]] = []
+    labeled_code_blocks: List[Dict[str, Any]] = []
     inferred_code_blocks: List[Dict[str, Any]] = []
+    output_blocks: List[Dict[str, Any]] = []
     command_index = 1
+    labeled_code_index = 1
     inferred_index = 1
+    output_index = 1
 
     for segment in segments:
         if segment.get("type") != "text":
             continue
         segment_text = str(segment.get("text") or "")
+
+        extracted_labeled_code, extracted_outputs = extract_labeled_code_and_output_blocks_from_text(
+            segment_text,
+            labeled_code_index,
+            output_index,
+        )
+        labeled_code_blocks.extend(extracted_labeled_code)
+        output_blocks.extend(extracted_outputs)
+        labeled_code_index += len(extracted_labeled_code)
+        output_index += len(extracted_outputs)
+
         extracted_commands = extract_command_blocks_from_text(segment_text, command_index)
         command_blocks.extend(extracted_commands)
         command_index += len(extracted_commands)
@@ -1537,7 +2178,15 @@ def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
         inferred_code_blocks.extend(extracted_python)
         inferred_index += len(extracted_python)
 
-    code_blocks = fenced_code_blocks + inferred_code_blocks
+    code_blocks = dedupe_code_blocks(fenced_code_blocks + labeled_code_blocks + inferred_code_blocks)
+    command_blocks = dedupe_command_blocks(command_blocks)
+    bash_code_contents = {
+        str(block.get("content") or "").strip()
+        for block in code_blocks
+        if normalize_code_language(str(block.get("language") or "")) == "bash"
+    }
+    command_blocks = [block for block in command_blocks if str(block.get("content") or "").strip() not in bash_code_contents]
+
     copy_items: List[Dict[str, Any]] = []
     for block in code_blocks:
         copy_items.append(
@@ -1556,6 +2205,16 @@ def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
                 "language": "bash",
                 "content": block.get("content", ""),
                 "commands": block.get("commands", []),
+            }
+        )
+    for block in output_blocks:
+        copy_items.append(
+            {
+                "id": block["id"],
+                "kind": "output_block",
+                "language": "text",
+                "label": block.get("label"),
+                "content": block.get("content", ""),
             }
         )
 
@@ -1595,6 +2254,7 @@ def build_response_artifacts(markdown_text: str) -> Dict[str, Any]:
         "segments": segments,
         "code_blocks": code_blocks,
         "command_blocks": command_blocks,
+        "output_blocks": output_blocks,
         "copy_items": copy_items,
         "tool_hints": tool_hints[:64],
     }
@@ -1633,7 +2293,305 @@ def format_assistant_output(
                     payload[key] = snapshot.get(key)
         return json.dumps(payload, indent=2)
 
-    return normalized_text
+    return prettify_markdown_response(normalized_text)
+
+
+def run_self_tests() -> int:
+    import unittest
+    from unittest import mock
+
+    class ResponseFormattingSelfTests(unittest.TestCase):
+        def test_labeled_python_result_to_json_artifacts(self) -> None:
+            sample = """Python
+a = np.array ([[1,2,3],
+              [4,5,6]])
+
+b = np.array ([10,20,30])
+
+print (a + b)
+
+Result:
+
+[[11 22 33]
+ [14 25 36]]
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            self.assertEqual(len(artifacts.get("command_blocks", [])), 0)
+            self.assertEqual(len(artifacts.get("output_blocks", [])), 1)
+            code_block = artifacts["code_blocks"][0]
+            self.assertEqual(code_block.get("language"), "python")
+            self.assertIn("print (a + b)", code_block.get("content", ""))
+            output_block = artifacts["output_blocks"][0]
+            self.assertEqual(output_block.get("label"), "result")
+            self.assertIn("[11 22 33]", output_block.get("content", ""))
+
+        def test_plain_commands_stay_command_blocks(self) -> None:
+            sample = """pip install numpy
+python ascii_normal.py
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 0)
+            self.assertEqual(len(artifacts.get("command_blocks", [])), 1)
+            self.assertEqual(len(artifacts.get("output_blocks", [])), 0)
+
+        def test_labeled_bash_becomes_code_block(self) -> None:
+            sample = """Bash
+pip install numpy
+python ascii_normal.py
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            self.assertEqual(len(artifacts.get("command_blocks", [])), 0)
+            block = artifacts["code_blocks"][0]
+            self.assertEqual(block.get("language"), "bash")
+            self.assertIn("pip install numpy", block.get("content", ""))
+
+        def test_markdown_prettify_wraps_labeled_python_and_output(self) -> None:
+            sample = """## What Makes NumPy Special?
+4
+Example:
+
+Python
+a = np.array ([1,2,3])
+b = 10
+print (a + b)
+
+Output:
+
+[11 12 13]
+"""
+            rendered = format_assistant_output(sample, "markdown")
+            self.assertIn("```python", rendered)
+            self.assertIn("```text", rendered)
+            self.assertNotIn("\n4\n", rendered)
+
+        def test_output_heading_label_parsed(self) -> None:
+            sample = """Python
+import numpy as np
+print(np.arange(3))
+
+### Output
+
+[0 1 2]
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("output_blocks", [])), 1)
+            self.assertEqual(artifacts["output_blocks"][0].get("label"), "output")
+
+        def test_json_mode_contains_output_blocks(self) -> None:
+            sample = """Python
+import numpy as np
+print(np.array([1,2,3]))
+
+Result:
+
+[1 2 3]
+"""
+            raw_json = format_assistant_output(sample, "json")
+            payload = json.loads(raw_json)
+            self.assertEqual(payload.get("format"), "json")
+            artifacts = payload.get("artifacts", {})
+            self.assertEqual(len(artifacts.get("output_blocks", [])), 1)
+
+        def test_single_line_labeled_python_is_captured(self) -> None:
+            sample = """Python
+result = a + b
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            block = artifacts["code_blocks"][0]
+            self.assertEqual(block.get("language"), "python")
+            self.assertIn("result = a + b", block.get("content", ""))
+
+        def test_fenced_python_merges_indented_tail(self) -> None:
+            sample = """```python
+result = []
+for i in range (len (a)):
+```
+    result.append (a[i] + b[i])
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            block = artifacts["code_blocks"][0]
+            content = block.get("content", "")
+            self.assertIn("for i in range (len (a)):", content)
+            self.assertIn("result.append (a[i] + b[i])", content)
+            self.assertIn("\n    result.append (a[i] + b[i])", content)
+
+        def test_fenced_python_merges_unindented_tail(self) -> None:
+            sample = """```python
+import numpy as np
+```
+# Example data
+x = np.array([1, 2, 3])
+print(x)
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            block = artifacts["code_blocks"][0]
+            content = block.get("content", "")
+            self.assertIn("import numpy as np", content)
+            self.assertIn("x = np.array([1, 2, 3])", content)
+            self.assertIn("print(x)", content)
+
+        def test_fenced_python_tail_trims_markdown_heading_comment(self) -> None:
+            sample = """```python
+theta = [1, 2]
+```
+b, w = theta
+print(b, w)
+
+# Why NumPy Is Good For This
+NumPy makes math easy.
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            content = artifacts["code_blocks"][0].get("content", "")
+            self.assertIn("b, w = theta", content)
+            self.assertIn("print(b, w)", content)
+            self.assertNotIn("# Why NumPy Is Good For This", content)
+
+        def test_tuple_assignment_is_detected_as_python(self) -> None:
+            sample = "a, b = theta\nprint(a)"
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            self.assertIn("a, b = theta", artifacts["code_blocks"][0].get("content", ""))
+
+        def test_invalid_math_equation_not_executable_python_cell(self) -> None:
+            sample = "y = 2x + 1"
+            artifacts = build_response_artifacts(sample)
+            cells = collect_executable_cells_from_artifacts(
+                artifacts=artifacts,
+                turn_index=1,
+                cell_counters={},
+            )
+            self.assertEqual(len(cells), 0)
+
+        def test_heading_like_python_loop_label_is_not_command(self) -> None:
+            sample = """Example comparison:
+Python loop:
+
+Python
+result = a + b
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("command_blocks", [])), 0)
+
+        def test_register_turn_cells_creates_runnable_python_cell(self) -> None:
+            turn_result: Dict[str, Any] = {
+                "assistant_text": "Python\nx = 1\nprint(x)\n",
+                "artifacts": build_response_artifacts("Python\nx = 1\nprint(x)\n"),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            self.assertEqual(len(new_cells), 1)
+            self.assertEqual(new_cells[0].get("id"), "py1")
+            self.assertIn("print(x)", str(new_cells[0].get("content") or ""))
+
+        def test_execute_cell_locally_python(self) -> None:
+            cell = {
+                "id": "py1",
+                "language": "python",
+                "content": "print('PLAYGROUND_OK')",
+            }
+            result = execute_cell_locally(cell, timeout_s=10)
+            self.assertTrue(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
+            self.assertIn("PLAYGROUND_OK", str(result.get("stdout") or ""))
+
+        def test_resolve_pyreplab_command_explicit(self) -> None:
+            resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
+            self.assertEqual(resolved, ["pyreplab", "--workdir", "/tmp/demo"])
+
+        def test_start_pyreplab_session_empty_command(self) -> None:
+            result = start_pyreplab_session([], Path.cwd(), timeout_s=1)
+            self.assertFalse(bool(result.get("ok")))
+            self.assertIn("empty", str(result.get("error") or ""))
+
+        def test_stop_pyreplab_session_empty_command(self) -> None:
+            result = stop_pyreplab_session([], Path.cwd(), timeout_s=1)
+            self.assertFalse(bool(result.get("ok")))
+            self.assertIn("empty", str(result.get("error") or ""))
+
+        def test_allocate_pyreplab_session_dir_has_prefix(self) -> None:
+            session_dir = allocate_pyreplab_session_dir(Path.cwd())
+            self.assertIn("sky_prompt_", session_dir)
+
+        def test_start_pyreplab_session_accepts_session_dir(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0)
+                result = start_pyreplab_session(
+                    ["pyreplab"],
+                    Path.cwd(),
+                    session_dir="/tmp/pyreplab/fixed_session",
+                    timeout_s=1,
+                )
+            self.assertTrue(bool(result.get("ok")))
+            kwargs = run_mock.call_args.kwargs
+            env = kwargs.get("env") or {}
+            self.assertEqual(env.get("PYREPLAB_DIR"), "/tmp/pyreplab/fixed_session")
+
+        def test_resolve_pyreplab_session_dir_empty_command(self) -> None:
+            self.assertIsNone(resolve_pyreplab_session_dir([], Path.cwd(), timeout_s=1))
+
+        def test_execute_pyreplab_code_empty_code(self) -> None:
+            result = execute_pyreplab_code("", ["pyreplab"], Path.cwd(), timeout_s=1)
+            self.assertFalse(bool(result.get("ok")))
+            self.assertIn("empty code", str(result.get("error") or ""))
+
+        def test_execute_pyreplab_code_uses_explicit_session_dir(self) -> None:
+            with mock.patch(__name__ + ".resolve_pyreplab_session_dir") as resolve_mock:
+                with mock.patch(__name__ + ".start_pyreplab_session") as start_mock:
+                    with mock.patch("subprocess.run") as run_mock:
+                        resolve_mock.return_value = "/tmp/pyreplab/derived"
+                        start_mock.return_value = {"ok": True, "command": ["pyreplab", "start"], "exit_code": 0}
+                        run_mock.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                        result = execute_pyreplab_code(
+                            "print('ok')",
+                            ["pyreplab"],
+                            Path.cwd(),
+                            session_dir="/tmp/pyreplab/fixed",
+                            timeout_s=2,
+                        )
+            self.assertTrue(bool(result.get("ok")))
+            resolve_mock.assert_not_called()
+            start_kwargs = start_mock.call_args.kwargs
+            self.assertEqual(start_kwargs.get("session_dir"), "/tmp/pyreplab/fixed")
+            run_env = run_mock.call_args.kwargs.get("env") or {}
+            self.assertEqual(run_env.get("PYREPLAB_DIR"), "/tmp/pyreplab/fixed")
+
+        def test_execute_cell_with_pyreplab_requires_python(self) -> None:
+            cell = {"id": "sh1", "language": "bash", "content": "echo hi"}
+            result = execute_cell_with_pyreplab(
+                cell=cell,
+                pyreplab_cmd=["pyreplab"],
+                workdir=Path.cwd(),
+                timeout_s=5,
+            )
+            self.assertFalse(bool(result.get("ok")))
+            self.assertIn("only supports python", str(result.get("error") or ""))
+
+        def test_execute_cell_with_pyreplab_requires_command(self) -> None:
+            cell = {"id": "py1", "language": "python", "content": "print('hi')"}
+            result = execute_cell_with_pyreplab(
+                cell=cell,
+                pyreplab_cmd=[],
+                workdir=Path.cwd(),
+                timeout_s=5,
+            )
+            self.assertFalse(bool(result.get("ok")))
+            self.assertIn("not configured", str(result.get("error") or ""))
+
+        def test_extract_cell_preview_line_uses_last_non_empty_line(self) -> None:
+            content = "import numpy as np\nx = np.array([1,2,3])\n\nprint(x)\n"
+            self.assertEqual(extract_cell_preview_line(content), "print(x)")
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ResponseFormattingSelfTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
 
 
 def history_preview(text: str, limit: int = 96) -> str:
@@ -1641,6 +2599,534 @@ def history_preview(text: str, limit: int = 96) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: max(8, limit - 1)] + "…"
+
+
+def language_to_cell_prefix(language: str) -> str:
+    normalized = normalize_code_language(language)
+    return CELL_PREFIX_BY_LANGUAGE.get(normalized, "code")
+
+
+def language_to_cell_extension(language: str) -> str:
+    normalized = normalize_code_language(language)
+    return CELL_EXTENSION_BY_LANGUAGE.get(normalized, ".txt")
+
+
+def next_cell_id(cell_counters: Dict[str, int], language: str) -> str:
+    prefix = language_to_cell_prefix(language)
+    next_index = int(cell_counters.get(prefix, 0)) + 1
+    cell_counters[prefix] = next_index
+    return f"{prefix}{next_index}"
+
+
+def collect_executable_cells_from_artifacts(
+    artifacts: Dict[str, Any],
+    turn_index: int,
+    cell_counters: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    cells: List[Dict[str, Any]] = []
+
+    for block in list(artifacts.get("code_blocks", []) or []):
+        content = str(block.get("content") or "").strip("\n")
+        if not content:
+            continue
+        runner = str(block.get("runner") or "").strip()
+        language = normalize_code_language(str(block.get("language") or ""))
+        executable = bool(block.get("executable")) and bool(runner)
+        if not executable:
+            continue
+        cell_id = next_cell_id(cell_counters, language)
+        cells.append(
+            {
+                "id": cell_id,
+                "kind": "code_block",
+                "source_id": str(block.get("id") or ""),
+                "language": language,
+                "runner": runner,
+                "content": content,
+                "turn": int(turn_index),
+                "revision": 1,
+                "parent_id": None,
+            }
+        )
+
+    for block in list(artifacts.get("command_blocks", []) or []):
+        content = str(block.get("content") or "").strip("\n")
+        if not content:
+            continue
+        cell_id = next_cell_id(cell_counters, "bash")
+        cells.append(
+            {
+                "id": cell_id,
+                "kind": "command_block",
+                "source_id": str(block.get("id") or ""),
+                "language": "bash",
+                "runner": "bash",
+                "content": content,
+                "turn": int(turn_index),
+                "revision": 1,
+                "parent_id": None,
+            }
+        )
+
+    return cells
+
+
+def register_turn_cells(
+    turn_result: Dict[str, Any],
+    turn_index: int,
+    cell_store: Dict[str, Dict[str, Any]],
+    cell_order: List[str],
+    cell_counters: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    assistant_text = str(turn_result.get("assistant_text") or "").strip()
+    if not assistant_text:
+        turn_result["cell_ids"] = []
+        return []
+
+    artifacts = turn_result.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = build_response_artifacts(assistant_text)
+        turn_result["artifacts"] = artifacts
+
+    new_cells = collect_executable_cells_from_artifacts(
+        artifacts=artifacts,
+        turn_index=turn_index,
+        cell_counters=cell_counters,
+    )
+    for cell in new_cells:
+        cell_store[cell["id"]] = cell
+        cell_order.append(cell["id"])
+    turn_result["cell_ids"] = [str(cell.get("id") or "") for cell in new_cells]
+    return new_cells
+
+
+def print_cell_catalog(
+    cell_store: Dict[str, Dict[str, Any]],
+    cell_order: Sequence[str],
+    limit: Optional[int] = None,
+) -> None:
+    if not cell_order:
+        print("cells: empty")
+        return
+    selected_order = list(cell_order)
+    if isinstance(limit, int) and limit > 0:
+        selected_order = selected_order[-limit:]
+    for cell_id in selected_order:
+        cell = cell_store.get(cell_id)
+        if not isinstance(cell, dict):
+            continue
+        lines = len(str(cell.get("content") or "").splitlines())
+        language = str(cell.get("language") or "text")
+        turn = int(cell.get("turn") or 0)
+        revision = int(cell.get("revision") or 1)
+        preview = extract_cell_preview_line(str(cell.get("content") or ""))
+        if preview:
+            preview = history_preview(preview, limit=64)
+            print(f"{cell_id} [{language}] lines={lines} turn={turn} rev={revision} :: {preview}")
+        else:
+            print(f"{cell_id} [{language}] lines={lines} turn={turn} rev={revision}")
+
+
+def extract_cell_preview_line(content: str) -> str:
+    for raw in reversed(str(content or "").splitlines()):
+        stripped = raw.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def save_cell_to_path(cell: Dict[str, Any], raw_path: str) -> Path:
+    target = Path(raw_path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(cell.get("content") or ""), encoding="utf-8")
+    return target
+
+
+def diff_cell_contents(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> str:
+    left_id = str(left.get("id") or "left")
+    right_id = str(right.get("id") or "right")
+    left_lines = str(left.get("content") or "").splitlines()
+    right_lines = str(right.get("content") or "").splitlines()
+    diff = difflib.unified_diff(
+        left_lines,
+        right_lines,
+        fromfile=left_id,
+        tofile=right_id,
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def execute_cell_locally(
+    cell: Dict[str, Any],
+    timeout_s: int = 30,
+) -> Dict[str, Any]:
+    language = normalize_code_language(str(cell.get("language") or ""))
+    content = str(cell.get("content") or "")
+    if not content.strip():
+        return {"ok": False, "backend": "local", "error": "empty cell content"}
+
+    suffix = language_to_cell_extension(language)
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as handle:
+        handle.write(content)
+        script_path = Path(handle.name)
+
+    runner_cmd: List[str]
+    if language == "python":
+        runner_cmd = ["python3", str(script_path)]
+    elif language == "bash":
+        runner_cmd = ["bash", str(script_path)]
+    elif language in {"javascript", "js"}:
+        runner_cmd = ["node", str(script_path)]
+    elif language in {"typescript", "ts"}:
+        runner_cmd = ["ts-node", str(script_path)]
+    elif language == "ruby":
+        runner_cmd = ["ruby", str(script_path)]
+    elif language == "perl":
+        runner_cmd = ["perl", str(script_path)]
+    else:
+        try:
+            script_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"ok": False, "backend": "local", "error": f"unsupported language for local run: {language}"}
+
+    try:
+        completed = subprocess.run(
+            runner_cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_s)),
+            check=False,
+        )
+        return {
+            "ok": True,
+            "backend": "local",
+            "command": runner_cmd,
+            "exit_code": int(completed.returncode),
+            "stdout": str(completed.stdout or ""),
+            "stderr": str(completed.stderr or ""),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "backend": "local",
+            "command": runner_cmd,
+            "error": f"execution timed out after {int(timeout_s)}s",
+            "stdout": str(exc.stdout or ""),
+            "stderr": str(exc.stderr or ""),
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "backend": "local",
+            "command": runner_cmd,
+            "error": f"runner not found: {runner_cmd[0]}",
+        }
+    finally:
+        try:
+            script_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def resolve_pyreplab_command(explicit_command: Optional[str] = None) -> Optional[List[str]]:
+    raw = str(explicit_command or os.getenv("PYREPLAB_CMD") or "").strip()
+    if raw:
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            return None
+        return parts if parts else None
+    discovered = shutil.which("pyreplab")
+    if discovered:
+        return [discovered]
+    common_candidates = [
+        Path.home() / "Projects" / "pyrepl" / "pyreplab",
+        Path.home() / "pyrepl" / "pyreplab",
+        Path.cwd() / "pyreplab",
+        Path.cwd().parent / "pyrepl" / "pyreplab",
+    ]
+    for candidate in common_candidates:
+        try:
+            if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                return [str(candidate)]
+        except OSError:
+            continue
+    return None
+
+
+def start_pyreplab_session(
+    pyreplab_cmd: Sequence[str],
+    workdir: Path,
+    session_dir: Optional[str] = None,
+    timeout_s: int = 8,
+) -> Dict[str, Any]:
+    if not pyreplab_cmd:
+        return {"ok": False, "error": "pyreplab command is empty"}
+    env = os.environ.copy()
+    if session_dir:
+        env["PYREPLAB_DIR"] = str(session_dir)
+    command = list(pyreplab_cmd) + ["start", "--workdir", str(workdir)]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(3, int(timeout_s)),
+            cwd=str(workdir),
+            env=env,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "command": command, "error": f"runner not found: {pyreplab_cmd[0]}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "command": command, "error": "pyreplab start timed out"}
+    return {"ok": int(proc.returncode) == 0, "command": command, "exit_code": int(proc.returncode)}
+
+
+def stop_pyreplab_session(
+    pyreplab_cmd: Sequence[str],
+    workdir: Path,
+    session_dir: Optional[str] = None,
+    timeout_s: int = 6,
+) -> Dict[str, Any]:
+    if not pyreplab_cmd:
+        return {"ok": False, "error": "pyreplab command is empty"}
+    env = os.environ.copy()
+    if session_dir:
+        env["PYREPLAB_DIR"] = str(session_dir)
+    command = list(pyreplab_cmd) + ["stop"]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(3, int(timeout_s)),
+            cwd=str(workdir),
+            env=env,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "command": command, "error": f"runner not found: {pyreplab_cmd[0]}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "command": command, "error": "pyreplab stop timed out"}
+    return {"ok": int(proc.returncode) == 0, "command": command, "exit_code": int(proc.returncode)}
+
+
+def allocate_pyreplab_session_dir(workdir: Path) -> str:
+    base_dir = Path(str(os.getenv("PYREPLAB_BASE") or "/tmp/pyreplab")).expanduser()
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(workdir.name or "workspace")).strip("_") or "workspace"
+    return str(base_dir / f"sky_prompt_{safe_name}_{os.getpid()}_{int(time.time())}")
+
+
+def resolve_pyreplab_session_dir(
+    pyreplab_cmd: Sequence[str],
+    workdir: Path,
+    timeout_s: int = 6,
+) -> Optional[str]:
+    if not pyreplab_cmd:
+        return None
+    command = list(pyreplab_cmd) + ["dir", "--workdir", str(workdir)]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(3, int(timeout_s)),
+            cwd=str(workdir),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if int(proc.returncode) != 0:
+        return None
+    session_dir = str(proc.stdout or "").strip()
+    return session_dir or None
+
+
+def execute_pyreplab_code(
+    code: str,
+    pyreplab_cmd: Sequence[str],
+    workdir: Path,
+    session_dir: Optional[str] = None,
+    timeout_s: int = 30,
+) -> Dict[str, Any]:
+    content = str(code or "")
+    if not content.strip():
+        return {"ok": False, "backend": "pyreplab", "error": "empty code"}
+    if not pyreplab_cmd:
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "error": "pyreplab command not configured (set --pyreplab-cmd or PYREPLAB_CMD)",
+        }
+
+    base_cmd = list(pyreplab_cmd)
+    resolved_session_dir = str(session_dir or "").strip()
+    env = os.environ.copy()
+    env["PYREPLAB_TIMEOUT"] = str(max(1, int(timeout_s)))
+    if resolved_session_dir:
+        env["PYREPLAB_DIR"] = str(resolved_session_dir)
+
+    warmup = start_pyreplab_session(
+        pyreplab_cmd=base_cmd,
+        workdir=workdir,
+        session_dir=resolved_session_dir,
+        timeout_s=max(5, min(20, int(timeout_s))),
+    )
+    if not warmup.get("ok"):
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "command": warmup.get("command") or (base_cmd + ["start", "--workdir", str(workdir)]),
+            "exit_code": int(warmup.get("exit_code", -1)),
+            "error": str(warmup.get("error") or "pyreplab start failed"),
+        }
+
+    run_cmd = base_cmd + ["run"]
+    try:
+        run_proc = subprocess.run(
+            run_cmd,
+            input=content,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_s) + 10),
+            cwd=str(workdir),
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "command": run_cmd,
+            "error": f"pyreplab run timed out after {int(timeout_s)}s",
+            "stdout": str(exc.stdout or ""),
+            "stderr": str(exc.stderr or ""),
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "command": run_cmd,
+            "error": f"runner not found: {base_cmd[0]}",
+        }
+
+    stdout_text = str(run_proc.stdout or "")
+    stderr_text = str(run_proc.stderr or "")
+    exit_code = int(run_proc.returncode)
+    command_used = run_cmd
+
+    if exit_code == 2:
+        wait_cmd = base_cmd + ["wait"]
+        try:
+            wait_proc = subprocess.run(
+                wait_cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(5, int(timeout_s) + 10),
+                cwd=str(workdir),
+                env=env,
+                check=False,
+            )
+            stdout_text += str(wait_proc.stdout or "")
+            stderr_text += str(wait_proc.stderr or "")
+            exit_code = int(wait_proc.returncode)
+            command_used = wait_cmd
+        except subprocess.TimeoutExpired as exc:
+            stdout_text += str(exc.stdout or "")
+            stderr_text += str(exc.stderr or "")
+            return {
+                "ok": False,
+                "backend": "pyreplab",
+                "command": wait_cmd,
+                "error": f"pyreplab wait timed out after {int(timeout_s)}s",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+            }
+
+    error_message = ""
+    if exit_code != 0:
+        stderr_preview = stderr_text.strip()
+        error_message = stderr_preview or f"pyreplab command failed with exit code {exit_code}"
+
+    return {
+        "ok": exit_code == 0,
+        "backend": "pyreplab",
+        "command": command_used,
+        "exit_code": exit_code,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "error": error_message,
+    }
+
+
+def execute_cell_with_pyreplab(
+    cell: Dict[str, Any],
+    pyreplab_cmd: Sequence[str],
+    workdir: Path,
+    session_dir: Optional[str] = None,
+    timeout_s: int = 30,
+) -> Dict[str, Any]:
+    language = normalize_code_language(str(cell.get("language") or ""))
+    content = str(cell.get("content") or "")
+    if language != "python":
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "error": f"pyreplab backend only supports python (got {language or 'unknown'})",
+        }
+    if not content.strip():
+        return {"ok": False, "backend": "pyreplab", "error": "empty cell content"}
+    if not pyreplab_cmd:
+        return {
+            "ok": False,
+            "backend": "pyreplab",
+            "error": "pyreplab command not configured (set --pyreplab-cmd or PYREPLAB_CMD)",
+        }
+    return execute_pyreplab_code(
+        code=content,
+        pyreplab_cmd=pyreplab_cmd,
+        workdir=workdir,
+        session_dir=session_dir,
+        timeout_s=timeout_s,
+    )
+
+
+def edit_cell_in_editor(
+    cell: Dict[str, Any],
+    workspace_dir: Path,
+) -> Tuple[bool, str]:
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    cell_id = str(cell.get("id") or "cell")
+    suffix = language_to_cell_extension(str(cell.get("language") or ""))
+    draft_path = workspace_dir / f"{cell_id}{suffix}"
+    draft_path.write_text(str(cell.get("content") or ""), encoding="utf-8")
+    editor = os.getenv("EDITOR") or os.getenv("VISUAL") or "vi"
+    try:
+        completed = subprocess.run([editor, str(draft_path)], check=False)
+    except FileNotFoundError:
+        return False, f"editor not found: {editor}"
+    updated = draft_path.read_text(encoding="utf-8")
+    changed = updated != str(cell.get("content") or "")
+    if changed:
+        cell["content"] = updated
+        cell["revision"] = int(cell.get("revision") or 1) + 1
+        return True, f"updated {cell_id} via {editor} ({draft_path})"
+    if completed.returncode != 0:
+        return False, f"editor exited with code {completed.returncode}"
+    return True, f"no changes ({draft_path})"
+
+
+def split_repl_command_args(raw_line: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    try:
+        return shlex.split(raw_line), None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def setup_repl_readline_history(
@@ -2209,6 +3695,8 @@ def run_repl(
     ddm_tools: Sequence[str],
     submit: bool,
     output_format: str,
+    run_backend: str,
+    pyreplab_cmd: Optional[str],
     first_prompt: str,
     wait_timeout_s: int,
     poll_interval_s: float,
@@ -2217,7 +3705,36 @@ def run_repl(
     current_url = url
     submit_enabled = submit
     output_mode = output_format
+    run_backend_mode = (run_backend or DEFAULT_RUN_BACKEND).strip().lower()
+    resolved_pyreplab_cmd = resolve_pyreplab_command(pyreplab_cmd)
+    pyreplab_session_dir: Optional[str] = None
+    if resolved_pyreplab_cmd:
+        pyreplab_session_dir = allocate_pyreplab_session_dir(Path.cwd())
+    if run_backend_mode not in SUPPORTED_RUN_BACKENDS:
+        run_backend_mode = DEFAULT_RUN_BACKEND
+    if run_backend_mode == "pyreplab" and not resolved_pyreplab_cmd:
+        print("backend: pyreplab unavailable; falling back to local")
+        print("hint: install pyreplab, set PYREPLAB_CMD, or pass --pyreplab-cmd '/path/to/pyreplab'")
+        run_backend_mode = "local"
+    elif run_backend_mode == "pyreplab":
+        warmup = start_pyreplab_session(
+            pyreplab_cmd=resolved_pyreplab_cmd or [],
+            workdir=Path.cwd(),
+            session_dir=pyreplab_session_dir,
+            timeout_s=8,
+        )
+        if not warmup.get("ok"):
+            print("backend: pyreplab failed to start; falling back to local")
+            print(f"detail: {warmup.get('error')}")
+            run_backend_mode = "local"
+        else:
+            print("backend: pyreplab ready")
     history: List[Dict[str, Any]] = []
+    turn_index = 0
+    cell_store: Dict[str, Dict[str, Any]] = {}
+    cell_order: List[str] = []
+    cell_counters: Dict[str, int] = {}
+    cell_workspace = Path.cwd() / ".sky_cells"
     readline_mod, readline_history_path = setup_repl_readline_history()
     current_layout_text = navigate_current_page(
         client, agent_id, current_url, navigate_tools, verbose=debug
@@ -2262,10 +3779,25 @@ def run_repl(
             poll_interval_s=poll_interval_s,
             show_dispatch_details=debug,
         )
+        turn_index += 1
+        created_cells = register_turn_cells(
+            turn_result=initial_result,
+            turn_index=turn_index,
+            cell_store=cell_store,
+            cell_order=cell_order,
+            cell_counters=cell_counters,
+        )
+        if created_cells:
+            summary = " ".join(
+                f"{cell['id']}[{cell.get('language')}]"
+                for cell in created_cells
+            )
+            print(f"cells> +{summary}")
         history.append(
             {
                 "prompt": first_prompt,
                 "assistant_text": str(initial_result.get("assistant_text") or ""),
+                "cell_ids": list(initial_result.get("cell_ids") or []),
             }
         )
 
@@ -2285,7 +3817,10 @@ def run_repl(
             if lower in {"/help", "/h"}:
                 print(
                     "/url <url> | /submit on|off | /format markdown|plain|json | "
-                    "/history [n] | /last | /ddm | /exit"
+                    "/backend [local|pyreplab] | "
+                    "/py <code> | /pyfile <path.py> | "
+                    "/history [n] | /last | /cells [n|all] | /show <cell> | /run <cell> [timeout] | "
+                    "/fork <src> [dst] | /edit <cell> | /save <cell> <path> | /diff <a> <b> | /ddm | /exit"
                 )
                 continue
             if lower.startswith("/url "):
@@ -2309,8 +3844,114 @@ def run_repl(
                 else:
                     print("usage: /submit on|off")
                 continue
+            if lower == "/backend" or lower.startswith("/backend "):
+                parts = line.split()
+                if len(parts) == 1:
+                    availability = "available" if resolved_pyreplab_cmd else "unavailable"
+                    print(f"backend: {run_backend_mode} (pyreplab {availability})")
+                    if resolved_pyreplab_cmd:
+                        print("pyreplab_cmd: " + " ".join(resolved_pyreplab_cmd))
+                        if pyreplab_session_dir:
+                            print(f"pyreplab_session: {pyreplab_session_dir}")
+                    else:
+                        print("hint: --pyreplab-cmd '/path/to/pyreplab' or set PYREPLAB_CMD")
+                    continue
+                if len(parts) != 2:
+                    print("usage: /backend [local|pyreplab]")
+                    continue
+                requested = parts[1].strip().lower()
+                if requested not in SUPPORTED_RUN_BACKENDS:
+                    print("usage: /backend [local|pyreplab]")
+                    continue
+                if requested == "pyreplab":
+                    if not resolved_pyreplab_cmd:
+                        print("backend: pyreplab unavailable")
+                        print("hint: --pyreplab-cmd '/path/to/pyreplab' or set PYREPLAB_CMD")
+                        continue
+                    warmup = start_pyreplab_session(
+                        pyreplab_cmd=resolved_pyreplab_cmd,
+                        workdir=Path.cwd(),
+                        session_dir=pyreplab_session_dir,
+                        timeout_s=8,
+                    )
+                    if not warmup.get("ok"):
+                        print("backend: pyreplab failed to start")
+                        print(f"detail: {warmup.get('error')}")
+                        continue
+                    run_backend_mode = "pyreplab"
+                    print("backend: pyreplab ready")
+                else:
+                    run_backend_mode = "local"
+                    print("backend: local")
+                continue
             if lower == "/ddm":
                 maybe_show_ddm(client, agent_id, ddm_tools)
+                continue
+            if lower.startswith("/pyfile "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 2:
+                    print("usage: /pyfile <path.py>")
+                    continue
+                if not resolved_pyreplab_cmd:
+                    print("pyreplab passthrough unavailable")
+                    print("hint: --pyreplab-cmd '/path/to/pyreplab' or set PYREPLAB_CMD")
+                    continue
+                script_path = Path(args[1]).expanduser()
+                try:
+                    code_text = script_path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    print(f"pyreplab passthrough error: cannot read {script_path}: {exc}")
+                    continue
+                result = execute_pyreplab_code(
+                    code=code_text,
+                    pyreplab_cmd=resolved_pyreplab_cmd,
+                    workdir=Path.cwd(),
+                    session_dir=pyreplab_session_dir,
+                    timeout_s=30,
+                )
+                if not result.get("ok"):
+                    print(f"pyreplab passthrough error: {result.get('error')}")
+                command = " ".join(result.get("command") or [])
+                exit_code = int(result.get("exit_code", 0))
+                print(f"pyreplab> file={script_path} exit={exit_code} cmd={command}")
+                stdout_text = str(result.get("stdout") or "").strip()
+                stderr_text = str(result.get("stderr") or "").strip()
+                print("stdout>")
+                print(stdout_text if stdout_text else "(empty)")
+                print("stderr>")
+                print(stderr_text if stderr_text else "(empty)")
+                continue
+            if lower.startswith("/py "):
+                code_text = line[4:].strip()
+                if not code_text:
+                    print("usage: /py <python code>")
+                    continue
+                if not resolved_pyreplab_cmd:
+                    print("pyreplab passthrough unavailable")
+                    print("hint: --pyreplab-cmd '/path/to/pyreplab' or set PYREPLAB_CMD")
+                    continue
+                result = execute_pyreplab_code(
+                    code=code_text,
+                    pyreplab_cmd=resolved_pyreplab_cmd,
+                    workdir=Path.cwd(),
+                    session_dir=pyreplab_session_dir,
+                    timeout_s=30,
+                )
+                if not result.get("ok"):
+                    print(f"pyreplab passthrough error: {result.get('error')}")
+                command = " ".join(result.get("command") or [])
+                exit_code = int(result.get("exit_code", 0))
+                print(f"pyreplab> exit={exit_code} cmd={command}")
+                stdout_text = str(result.get("stdout") or "").strip()
+                stderr_text = str(result.get("stderr") or "").strip()
+                print("stdout>")
+                print(stdout_text if stdout_text else "(empty)")
+                print("stderr>")
+                print(stderr_text if stderr_text else "(empty)")
                 continue
             if lower.startswith("/format "):
                 mode = line.split(None, 1)[1].strip().lower()
@@ -2341,6 +3982,10 @@ def run_repl(
                 else:
                     print("assistant>")
                     print(rendered)
+                cell_ids = list(entry.get("cell_ids") or [])
+                if cell_ids:
+                    print("cells>")
+                    print(" ".join(cell_ids))
                 continue
             if lower == "/history" or lower.startswith("/history "):
                 parts = line.split()
@@ -2366,6 +4011,185 @@ def run_repl(
                         assistant_preview = "(no response captured)"
                     print(f"[{idx}] user: {user_preview}")
                     print(f"    assistant: {assistant_preview}")
+                    cell_ids = list(entry.get("cell_ids") or [])
+                    if cell_ids:
+                        print(f"    cells: {' '.join(cell_ids)}")
+                continue
+            if lower == "/cells" or lower.startswith("/cells "):
+                parts = line.split()
+                limit: Optional[int] = 20
+                if len(parts) == 2:
+                    maybe_limit = parts[1].strip().lower()
+                    if maybe_limit == "all":
+                        limit = None
+                    else:
+                        try:
+                            limit = max(1, int(maybe_limit))
+                        except ValueError:
+                            print("usage: /cells [n|all]")
+                            continue
+                elif len(parts) > 2:
+                    print("usage: /cells [n|all]")
+                    continue
+                print_cell_catalog(cell_store, cell_order, limit=limit)
+                continue
+            if lower.startswith("/show "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 2:
+                    print("usage: /show <cell_id>")
+                    continue
+                cell = cell_store.get(args[1])
+                if not isinstance(cell, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                print(
+                    f"{cell.get('id')} [{cell.get('language')}] "
+                    f"rev={cell.get('revision')} turn={cell.get('turn')}"
+                )
+                print(str(cell.get("content") or ""))
+                continue
+            if lower.startswith("/run "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) < 2 or len(args) > 3:
+                    print("usage: /run <cell_id> [timeout_seconds]")
+                    continue
+                cell = cell_store.get(args[1])
+                if not isinstance(cell, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                timeout_s = 30
+                if len(args) == 3:
+                    try:
+                        timeout_s = max(1, int(args[2]))
+                    except ValueError:
+                        print("usage: /run <cell_id> [timeout_seconds]")
+                        continue
+                language = normalize_code_language(str(cell.get("language") or ""))
+                if run_backend_mode == "pyreplab" and language == "python":
+                    result = execute_cell_with_pyreplab(
+                        cell=cell,
+                        pyreplab_cmd=resolved_pyreplab_cmd or [],
+                        workdir=Path.cwd(),
+                        session_dir=pyreplab_session_dir,
+                        timeout_s=timeout_s,
+                    )
+                elif run_backend_mode == "pyreplab" and language != "python":
+                    print(f"backend: pyreplab supports python only; using local for {language or 'unknown'}")
+                    result = execute_cell_locally(cell, timeout_s=timeout_s)
+                else:
+                    result = execute_cell_locally(cell, timeout_s=timeout_s)
+                if not result.get("ok"):
+                    print(f"run error: {result.get('error')}")
+                    stderr_text = str(result.get("stderr") or "").strip()
+                    stdout_text = str(result.get("stdout") or "").strip()
+                    if stdout_text:
+                        print("stdout>")
+                        print(stdout_text)
+                    if stderr_text:
+                        print("stderr>")
+                        print(stderr_text)
+                    continue
+                command = " ".join(result.get("command") or [])
+                exit_code = int(result.get("exit_code", 0))
+                backend_used = str(result.get("backend") or run_backend_mode)
+                print(f"run> {cell.get('id')} backend={backend_used} exit={exit_code} cmd={command}")
+                stdout_text = str(result.get("stdout") or "").strip()
+                stderr_text = str(result.get("stderr") or "").strip()
+                print("stdout>")
+                print(stdout_text if stdout_text else "(empty)")
+                print("stderr>")
+                print(stderr_text if stderr_text else "(empty)")
+                continue
+            if lower.startswith("/fork "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) not in {2, 3}:
+                    print("usage: /fork <source_cell_id> [new_cell_id]")
+                    continue
+                source = cell_store.get(args[1])
+                if not isinstance(source, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                new_id = args[2] if len(args) == 3 else next_cell_id(cell_counters, str(source.get("language") or ""))
+                if new_id in cell_store:
+                    print(f"cells: id already exists '{new_id}'")
+                    continue
+                forked = dict(source)
+                forked["id"] = new_id
+                forked["parent_id"] = str(source.get("id") or "")
+                forked["revision"] = 1
+                cell_store[new_id] = forked
+                cell_order.append(new_id)
+                print(f"cells> forked {source.get('id')} -> {new_id}")
+                continue
+            if lower.startswith("/save "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 3:
+                    print("usage: /save <cell_id> <path>")
+                    continue
+                cell = cell_store.get(args[1])
+                if not isinstance(cell, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                target = save_cell_to_path(cell, args[2])
+                print(f"saved {args[1]} -> {target}")
+                continue
+            if lower.startswith("/diff "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 3:
+                    print("usage: /diff <cell_a> <cell_b>")
+                    continue
+                left = cell_store.get(args[1])
+                right = cell_store.get(args[2])
+                if not isinstance(left, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                if not isinstance(right, dict):
+                    print(f"cells: unknown id '{args[2]}'")
+                    continue
+                diff_text = diff_cell_contents(left, right)
+                if diff_text:
+                    print(diff_text)
+                else:
+                    print("diff: no differences")
+                continue
+            if lower.startswith("/edit "):
+                args, parse_error = split_repl_command_args(line)
+                if parse_error:
+                    print(f"command parse error: {parse_error}")
+                    continue
+                assert args is not None
+                if len(args) != 2:
+                    print("usage: /edit <cell_id>")
+                    continue
+                cell = cell_store.get(args[1])
+                if not isinstance(cell, dict):
+                    print(f"cells: unknown id '{args[1]}'")
+                    continue
+                ok, message = edit_cell_in_editor(cell, cell_workspace)
+                if ok:
+                    print(f"cells> {message}")
+                else:
+                    print(f"edit error: {message}")
                 continue
             result = dispatch_prompt(
                 client=client,
@@ -2384,13 +4208,35 @@ def run_repl(
                 poll_interval_s=poll_interval_s,
                 show_dispatch_details=debug,
             )
+            turn_index += 1
+            created_cells = register_turn_cells(
+                turn_result=result,
+                turn_index=turn_index,
+                cell_store=cell_store,
+                cell_order=cell_order,
+                cell_counters=cell_counters,
+            )
+            if created_cells:
+                summary = " ".join(
+                    f"{cell['id']}[{cell.get('language')}]"
+                    for cell in created_cells
+                )
+                print(f"cells> +{summary}")
             history.append(
                 {
                     "prompt": line,
                     "assistant_text": str(result.get("assistant_text") or ""),
+                    "cell_ids": list(result.get("cell_ids") or []),
                 }
             )
     finally:
+        if resolved_pyreplab_cmd and pyreplab_session_dir:
+            stop_pyreplab_session(
+                pyreplab_cmd=resolved_pyreplab_cmd,
+                workdir=Path.cwd(),
+                session_dir=pyreplab_session_dir,
+                timeout_s=6,
+            )
         flush_repl_history(readline_mod, readline_history_path)
 
 
@@ -2741,6 +4587,7 @@ def dispatch_prompt(
         turn_result["assistant_text"] = str(response_text or "")
         turn_result["render_complete"] = bool(render_complete)
         turn_result["timed_out"] = bool(timed_out)
+        turn_result["artifacts"] = build_response_artifacts(str(response_text or ""))
         if response_text:
             output_mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
             rendered_output = format_assistant_output(
@@ -2829,6 +4676,11 @@ def main() -> int:
         action="store_true",
         help="Interactive shell mode.",
     )
+    parser.add_argument(
+        "--pyreplab",
+        action="store_true",
+        help="Shortcut for --run-backend pyreplab (auto-launch in interactive mode).",
+    )
     parser.add_argument("--show-ddm", action="store_true", help="Print a ddm read after prompt dispatch.")
     parser.add_argument("--navigate-tool", help="Override navigate tool name.")
     parser.add_argument("--js-tool", help="Override JS tool name.")
@@ -2839,6 +4691,17 @@ def main() -> int:
         default=DEFAULT_OUTPUT_FORMAT,
         help="Assistant response output format (default: markdown).",
     )
+    parser.add_argument(
+        "--run-backend",
+        choices=SUPPORTED_RUN_BACKENDS,
+        default=DEFAULT_RUN_BACKEND,
+        help="Code runner backend used by /run in interactive mode (default: pyreplab).",
+    )
+    parser.add_argument(
+        "--pyreplab-cmd",
+        help="Optional pyreplab command or path (example: '/path/to/pyreplab').",
+    )
+    parser.add_argument("--self-test", action="store_true", help="Run local parser/formatter regression tests.")
     parser.add_argument("--timeout", type=int, default=45, help="HTTP timeout in seconds.")
     parser.add_argument(
         "--wait-timeout",
@@ -2854,6 +4717,12 @@ def main() -> int:
     )
     parser.add_argument("--debug", action="store_true", help="Print raw request/response diagnostics.")
     args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_tests()
+
+    if args.pyreplab:
+        args.run_backend = "pyreplab"
 
     if args.setup_alias:
         target_script = Path(__file__).resolve()
@@ -2960,6 +4829,8 @@ def main() -> int:
             ddm_tools=ddm_tools,
             submit=not args.no_submit,
             output_format=args.output_format,
+            run_backend=args.run_backend,
+            pyreplab_cmd=args.pyreplab_cmd,
             first_prompt=merged_prompt,
             wait_timeout_s=args.wait_timeout,
             poll_interval_s=args.poll_interval,

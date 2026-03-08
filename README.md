@@ -20,6 +20,12 @@ cd sky_prompt
 ./unchained --help
 ```
 
+Optional `pyreplab` backend dependency with `uv`:
+
+```bash
+uv sync --extra pyreplab
+```
+
 Optional alias setup (recommended):
 
 ```bash
@@ -158,8 +164,15 @@ Choose output formatting:
 `json` mode includes structured artifacts for automation:
 - `artifacts.code_blocks` detected scripts
 - `artifacts.command_blocks` runnable shell command groups
+- `artifacts.output_blocks` detected output/result sections
 - `artifacts.copy_items` copy-ready chunks
 - `artifacts.tool_hints` suggested runner commands
+
+Run built-in closed-loop self-tests:
+
+```bash
+./unchained --self-test
+```
 
 ## Custom Alias Setup
 
@@ -190,10 +203,52 @@ Inside interactive mode:
 - `/url <url>` navigate to another site
 - `/submit on|off` toggle auto-submit
 - `/format markdown|plain|json` change response rendering format
+- `/backend [local|pyreplab]` choose `/run` execution backend (default: pyreplab)
+- `/py <code>` passthrough inline Python directly into pyreplab session
+- `/pyfile <path.py>` passthrough a local setup script into pyreplab session
 - `/history [n]` show recent turns (default last 10)
 - `/last` reprint the latest turn using current format mode
+- `/cells [n|all]` list detected runnable code cells
+- `/show <cell_id>` print cell content
+- `/run <cell_id> [timeout_seconds]` execute a cell with the active backend
+- `/fork <source_cell_id> [new_cell_id]` clone a cell for mutation
+- `/edit <cell_id>` open cell in `$EDITOR`/`$VISUAL`
+- `/save <cell_id> <path>` save a cell to disk
+- `/diff <cell_a> <cell_b>` show unified diff between cells
 - `/ddm` run ddm read
 - `/exit` quit
+
+Playground loop example:
+
+```bash
+sky -i
+# ask for code, then:
+/cells
+/py import pandas as pd
+/pyfile ./setup_lab.py
+/run py1
+/fork py1 py2
+/edit py2
+/diff py1 py2
+/run py2
+```
+
+`pyreplab` is now the default `/run` backend. If it is unavailable, the CLI automatically falls back to `local`.
+`/py`, `/pyfile`, and `/run` share the same pyreplab session, so pre-imports persist for later cell runs.
+Each `-i` session uses its own isolated pyreplab session directory to avoid cross-project leakage.
+
+Use an explicit `pyreplab` command path:
+
+```bash
+./unchained -i --run-backend pyreplab --pyreplab-cmd /Users/zhiminzou/Projects/pyrepl/pyreplab
+# or set PYREPLAB_CMD and use /backend pyreplab inside -i
+```
+
+Fast launch shortcut:
+
+```bash
+./unchained -i --pyreplab
+```
 
 ## Add To PATH
 
