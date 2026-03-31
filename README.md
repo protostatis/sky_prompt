@@ -250,7 +250,7 @@ Inside interactive mode:
 - `/url <url>` navigate to another site
 - `/submit on|off` toggle auto-submit
 - `/format markdown|plain|json` change response rendering format
-- `/backend [local|pyreplab]` choose `/run` execution backend (default: pyreplab)
+- `/backend [local|pyreplab]` choose `/run` execution backend (default: local)
 - `/py <code>` passthrough inline Python directly into pyreplab session
 - `/pyfile <path.py>` passthrough a local setup script into pyreplab session
 - `/history [n]` show recent turns (default last 10)
@@ -282,7 +282,7 @@ sky -i
 /run py2
 ```
 
-`pyreplab` is now the default `/run` backend. If it is unavailable, the CLI automatically falls back to `local`.
+`local` is the default `/run` backend. Switch to `pyreplab` when you want persistent Python state across `/py`, `/pyfile`, and `/run`.
 `/py`, `/pyfile`, and `/run` share the same pyreplab session, so pre-imports persist for later cell runs.
 Each `-i` session uses its own isolated pyreplab session directory to avoid cross-project leakage.
 
