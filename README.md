@@ -1,23 +1,32 @@
 # SkyPrompt
 
-Minimal terminal CLI to send prompts into a real browser tab (for sites like `https://chatgpt.com`) through Sky MCP.
+Minimal terminal CLI to send prompts into a real browser tab such as `https://chatgpt.com`.
+
+`sky` now defaults to a local `unchainedsky-cli` transport, so the normal path does not require a Sky API key or Sky agent. If you can open ChatGPT in Chrome and log in with your OpenAI account, `sky` can drive that browser session from the terminal.
 
 ## What It Does
 
-- Connects to `https://api.unchainedsky.com/mcp`
-- Performs MCP initialize + session handshake
+- Drives a local Chrome session through `unchainedsky-cli`
 - Navigates your connected browser to a URL
 - Injects prompt text into visible chat input and optionally submits
 - Supports one-shot mode and interactive shell mode
-- Falls back to native MCP actions (`cdp_type` + `cdp_click`) if JS submit is not confirmed
+- Falls back to native browser actions if JS submit is not confirmed
 - Shows a terminal thinking indicator and waits for render completion before final response capture
+- Still supports the legacy Sky MCP transport with `--transport sky-mcp`
 
 ## Install
 
 ```bash
 git clone https://github.com/protostatis/sky_prompt.git
 cd sky_prompt
+uv tool install unchainedsky-cli
 ./sky --help
+```
+
+Optional local dependency install inside the repo venv:
+
+```bash
+uv sync --extra unchained
 ```
 
 Optional `pyreplab` backend dependency with `uv`:
@@ -35,27 +44,64 @@ sk --help
 
 ## Quickstart
 
-1. Start Sky agent:
+1. Launch Chrome with remote debugging through `unchained` and use a profile that is already logged into ChatGPT:
 
 ```bash
-curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/unchained-agent
-./start.sh --daemon
+unchained launch --use-profile --profile Default https://chatgpt.com
 ```
 
-2. Run `sky` and follow the first-run setup if prompted. If no API key is present, `sky` can launch the upstream installer for you and auto-select daemon start. The current upstream installer still creates `~/unchained-agent/.env`; `sky` imports that into `~/sky-agent/.env` automatically on first run.
-
-3. Run one-shot prompt:
+2. Run a one-shot prompt:
 
 ```bash
-sky -p "Explain MCP in one paragraph"
+./sky -p "Explain MCP in one paragraph"
 ```
 
-4. Run interactive mode:
+3. Run interactive mode:
 
 ```bash
-sky -i
+./sky -i
 ```
+
+## Local Browser Flow
+
+The default transport is:
+
+```bash
+./sky --transport unchained
+```
+
+It expects:
+
+1. `unchained` is installed and available in `PATH`, or you pass `--unchained-cmd`.
+2. Chrome is already running on `--unchained-port` (default `9222`).
+3. The selected Chrome profile is logged into the target site.
+
+Useful flags:
+
+```bash
+./sky --unchained-port 9333 "hello"
+./sky --browser-tab auto "hello"
+./sky --unchained-cmd "uvx unchainedsky-cli" "hello"
+```
+
+If Chrome is not running on the selected port, `sky` will stop early and print the exact `unchained launch ...` command you need.
+
+## Legacy Sky MCP Flow
+
+If you still want to use the hosted Sky MCP path:
+
+```bash
+./sky --transport sky-mcp -p "Explain MCP in one paragraph"
+```
+
+Credentials are read from `~/sky-agent/.env` or the environment:
+
+```bash
+export SKY_API_KEY="uc_live_..."
+export SKY_AGENT_ID="claude-xxxxxxxx"
+```
+
+`sky` still supports the first-run setup/import flow for that legacy transport.
 
 ## Demo
 
@@ -74,32 +120,6 @@ sky -i
 show me a numpy ascii chart for poisson(lambda=4)
 /format plain
 now summarize in 3 bullets
-```
-
-## Prerequisites
-
-1. Install and run the Sky agent on your Mac:
-
-```bash
-curl -fsSL https://api.unchainedsky.com/install.sh | bash
-cd ~/unchained-agent
-./start.sh --daemon
-```
-
-2. Credentials are read from `~/sky-agent/.env` or the process environment:
-
-```bash
-export SKY_API_KEY="uc_live_..."
-export SKY_AGENT_ID="claude-xxxxxxxx"
-```
-
-On first run, if the upstream installer only created `~/unchained-agent/.env`, `sky` will import the API key into `~/sky-agent/.env`. If `SKY_AGENT_ID` is still missing but the API key is present, `sky` will guide you through selecting a connected agent and write it back to `~/sky-agent/.env`.
-
-To find your agent id:
-
-```bash
-curl -sS https://api.unchainedsky.com/api/agents \
-  -H "Authorization: Bearer $SKY_API_KEY"
 ```
 
 ## Quick Usage (Claude-Like)
@@ -272,8 +292,9 @@ sky "Explain what an MCP session id is"
 
 ## Notes
 
-- You must already be logged into the target site in your local Chrome session.
-- `sky`, `sky_prompt.py`, `SKY_*`, and `~/sky-agent/.env` are the supported names.
+- For the default `unchained` transport, you must already be logged into the target site in the Chrome profile you launched.
+- `SKY_API_KEY`, `SKY_AGENT_ID`, and `~/sky-agent/.env` only matter when you opt into `--transport sky-mcp`.
+- `sky` talks to a browser tab, not the OpenAI API directly. For ChatGPT usage, the only account dependency is your normal web login session.
 - On macOS, `SKY_FOREGROUND_BROWSER=submit` (the default) brings Chrome to the foreground for the submit sequence once and then returns focus to the terminal. Set `SKY_FOREGROUND_BROWSER=poll` for aggressive background-safe polling, `SKY_FOREGROUND_BROWSER=0` to disable, or `SKY_BROWSER_APP` to override the browser app name.
 - Different sites use different input DOM patterns; this script targets common chat UIs and may need selector tweaks for edge cases.
 - Use `--debug` to print tool and transport diagnostics.

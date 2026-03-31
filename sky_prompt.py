@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_ENDPOINT = "https://api.unchainedsky.com/mcp"
 DEFAULT_URL = "https://chatgpt.com"
+DEFAULT_TRANSPORT = "unchained"
+SUPPORTED_TRANSPORTS = ("unchained", "sky-mcp")
 DEFAULT_AGENT_ENV_PATH = Path.home() / "sky-agent" / ".env"
 LEGACY_INSTALL_ENV_PATH = Path.home() / "unchained-agent" / ".env"
 DEFAULT_REPL_HISTORY_PATH = Path.home() / ".sky_prompt_history"
@@ -42,6 +44,8 @@ DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
+DEFAULT_UNCHAINED_PORT = int(os.getenv("UNCHAINED_PORT") or "9222")
+DEFAULT_BROWSER_TAB = "auto"
 SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
 ANSI_RESET = "\033[0m"
@@ -392,6 +396,187 @@ class MCPClient:
         if "error" in parsed:
             raise MCPError(str(parsed["error"]))
         return parsed
+
+
+def resolve_unchained_command(explicit_command: Optional[str] = None) -> Optional[List[str]]:
+    raw = str(
+        explicit_command
+        or os.getenv("SKY_UNCHAINED_CMD")
+        or os.getenv("UNCHAINED_CMD")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            return None
+        return parts if parts else None
+
+    discovered = shutil.which("unchained")
+    if discovered:
+        return [discovered]
+    common_candidates = [
+        Path.cwd() / ".venv" / "bin" / "unchained",
+        Path.home() / ".local" / "bin" / "unchained",
+    ]
+    for candidate in common_candidates:
+        try:
+            if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                return [str(candidate)]
+        except OSError:
+            continue
+    return None
+
+
+def build_text_tool_result(stdout_text: str) -> Dict[str, Any]:
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": str(stdout_text or ""),
+            }
+        ]
+    }
+
+
+class LocalCLIClient:
+    def __init__(
+        self,
+        command: Sequence[str],
+        port: int = DEFAULT_UNCHAINED_PORT,
+        tab: str = DEFAULT_BROWSER_TAB,
+        timeout: int = 45,
+        debug: bool = False,
+    ):
+        self.command = list(command)
+        self.port = int(port)
+        self.tab = str(tab or DEFAULT_BROWSER_TAB)
+        self.timeout = int(timeout)
+        self.debug = debug
+
+    def initialize(self) -> None:
+        if not self.command:
+            raise MCPError(
+                "unchained CLI not found. Install it with `uv tool install unchainedsky-cli`, "
+                "or pass --unchained-cmd."
+            )
+        try:
+            self._run(["status"], timeout_s=min(10, max(3, self.timeout)))
+        except MCPError as exc:
+            launch_hint = (
+                f"Start a browser first with: {' '.join(self.command)} "
+                f"--port {self.port} launch --use-profile {DEFAULT_URL}"
+            )
+            raise MCPError(f"{exc}\n{launch_hint}") from exc
+
+    def list_tools(self) -> List[str]:
+        return [
+            "cdp_navigate",
+            "navigate",
+            "js_eval",
+            "execute_js",
+            "cdp_click",
+            "click",
+            "cdp_type",
+            "type_text",
+            "ddm",
+        ]
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        tool_name = str(name or "").strip().lower()
+        args = dict(arguments or {})
+        if tool_name in {"cdp_navigate", "navigate"}:
+            url = str(args.get("url") or args.get("target_url") or "").strip()
+            if not url:
+                raise MCPError("navigate requires a url argument")
+            stdout_text = self._run(["navigate", url])
+            return build_text_tool_result(stdout_text)
+
+        if tool_name in {"js_eval", "execute_js"}:
+            expression = (
+                args.get("expression")
+                or args.get("script")
+                or args.get("js")
+                or args.get("code")
+            )
+            if expression is None:
+                raise MCPError("js tool requires an expression argument")
+            stdout_text = self._run(["js", str(expression)])
+            return build_text_tool_result(stdout_text)
+
+        if tool_name in {"cdp_click", "click"}:
+            selector = str(args.get("selector") or "").strip()
+            if selector:
+                stdout_text = self._run(["click", "--selector", selector])
+                return build_text_tool_result(stdout_text)
+            if "x" not in args or "y" not in args:
+                raise MCPError("click requires x and y coordinates")
+            try:
+                x = int(args.get("x"))
+                y = int(args.get("y"))
+            except (TypeError, ValueError) as exc:
+                raise MCPError("click coordinates must be integers") from exc
+            stdout_text = self._run(["click", "--x", str(x), "--y", str(y)])
+            return build_text_tool_result(stdout_text)
+
+        if tool_name in {"cdp_type", "type_text"}:
+            if "text" not in args:
+                raise MCPError("type tool requires a text argument")
+            text = str(args.get("text") or "")
+            if text == "\n":
+                stdout_text = self._run(["press_enter"])
+            else:
+                stdout_text = self._run(["type", text])
+            return build_text_tool_result(stdout_text)
+
+        if tool_name == "ddm":
+            raw_flags = str(args.get("flags") or "").strip()
+            try:
+                ddm_flags = shlex.split(raw_flags) if raw_flags else []
+            except ValueError as exc:
+                raise MCPError(f"invalid ddm flags: {exc}") from exc
+            stdout_text = self._run(["ddm", *ddm_flags], include_tab=not any(flag == "--tabs" for flag in ddm_flags))
+            return build_text_tool_result(stdout_text)
+
+        raise MCPError(f"Unsupported local tool: {name}")
+
+    def _run(
+        self,
+        argv: Sequence[str],
+        timeout_s: Optional[int] = None,
+        include_tab: bool = True,
+    ) -> str:
+        command = list(self.command)
+        command.extend(["--port", str(self.port)])
+        if include_tab:
+            command.extend(["--tab", self.tab])
+        command.extend(str(part) for part in argv)
+        if self.debug:
+            rendered = " ".join(shlex.quote(part) for part in command)
+            print(f"[debug] local-cli {rendered}", file=sys.stderr)
+        try:
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(3, int(timeout_s or self.timeout)),
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise MCPError(
+                "unchained CLI not found. Install it with `uv tool install unchainedsky-cli`, "
+                "or pass --unchained-cmd."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise MCPError(f"unchained command timed out after {int(timeout_s or self.timeout)}s") from exc
+
+        stdout_text = str(proc.stdout or "")
+        stderr_text = str(proc.stderr or "")
+        if int(proc.returncode) != 0:
+            detail = stderr_text.strip() or stdout_text.strip() or f"exit code {proc.returncode}"
+            raise MCPError(detail)
+        return stdout_text
 
 
 def parse_rpc_response(raw_body: str) -> Optional[Dict[str, Any]]:
@@ -3913,6 +4098,29 @@ result = a + b
                 content = alias_path.read_text(encoding="utf-8")
             self.assertTrue(created)
             self.assertIn('SKY_CLI_NAME="sk" exec python3 "', content)
+
+        def test_resolve_unchained_command_explicit(self) -> None:
+            resolved = resolve_unchained_command("uvx unchainedsky-cli")
+            self.assertEqual(resolved, ["uvx", "unchainedsky-cli"])
+
+        def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="Pressed Enter\n", stderr="")
+                result = client.call_tool("cdp_type", {"text": "\n"})
+            command = run_mock.call_args.args[0]
+            self.assertEqual(command[:5], ["unchained", "--port", "9333", "--tab", "chatgpt"])
+            self.assertEqual(command[-1], "press_enter")
+            self.assertIn("Pressed Enter", extract_text(result))
+
+        def test_local_cli_client_initialize_requires_running_browser(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9222, tab="auto", timeout=5)
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=1, stdout="", stderr="Chrome not running on port 9222\n")
+                with self.assertRaises(MCPError) as exc:
+                    client.initialize()
+            self.assertIn("Chrome not running on port 9222", str(exc.exception))
+            self.assertIn("launch --use-profile", str(exc.exception))
 
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
@@ -8265,7 +8473,7 @@ def maybe_show_ddm(
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog=os.getenv("SKY_CLI_NAME") or Path(sys.argv[0] or "sky").name,
-        description="Simple terminal prompt CLI for websites via Sky MCP.",
+        description="Simple terminal prompt CLI for websites via unchained or Sky MCP.",
     )
     parser.add_argument("prompt_args", nargs="*", help="Prompt text (one-shot mode).")
     parser.add_argument(
@@ -8293,9 +8501,30 @@ def main() -> int:
         action="store_true",
         help="Overwrite existing alias path when using --setup-alias.",
     )
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="MCP server endpoint")
-    parser.add_argument("--api-key", help="Sky API key")
-    parser.add_argument("--agent-id", help="Connected agent_id")
+    parser.add_argument(
+        "--transport",
+        choices=SUPPORTED_TRANSPORTS,
+        default=(os.getenv("SKY_TRANSPORT") or DEFAULT_TRANSPORT),
+        help="Browser transport to use (default: unchained).",
+    )
+    parser.add_argument(
+        "--unchained-cmd",
+        help="Command used for the local unchained transport (example: 'unchained' or 'uvx unchainedsky-cli').",
+    )
+    parser.add_argument(
+        "--unchained-port",
+        type=int,
+        default=DEFAULT_UNCHAINED_PORT,
+        help="Chrome remote debugging port for the unchained transport (default: 9222).",
+    )
+    parser.add_argument(
+        "--browser-tab",
+        default=DEFAULT_BROWSER_TAB,
+        help="Target browser tab id or alias for the unchained transport (default: auto).",
+    )
+    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Sky MCP endpoint (transport=sky-mcp).")
+    parser.add_argument("--api-key", help="Sky API key (transport=sky-mcp).")
+    parser.add_argument("--agent-id", help="Connected agent_id (transport=sky-mcp).")
     parser.add_argument(
         "--no-submit",
         action="store_true",
@@ -8375,79 +8604,99 @@ def main() -> int:
         print(f'try it: {args.setup_alias} -p "hello"')
         return 0
 
-    resolved_api_key, resolved_agent_id, credential_source = resolve_credentials(
-        api_key_arg=args.api_key,
-        agent_id_arg=args.agent_id,
-        endpoint=args.endpoint,
-        timeout=args.timeout,
-    )
-    setup_source: Optional[str] = None
-    if not resolved_api_key or not resolved_agent_id:
-        resolved_api_key, resolved_agent_id, setup_source = maybe_run_first_call_setup(
-            api_key=resolved_api_key,
-            agent_id=resolved_agent_id,
-            endpoint=args.endpoint,
-            timeout=args.timeout,
-        )
-        if setup_source:
-            credential_source = setup_source
-    if not resolved_api_key:
-        if setup_source in {"setup-instructions", "setup-cancelled"}:
-            return 2
-        parser.error(
-            "Missing API key. Pass --api-key, export SKY_API_KEY, "
-            "or set SKY_API_KEY in ~/.sky-agent/.env."
-        )
-    if not resolved_agent_id:
-        if setup_source in {"setup-instructions", "setup-cancelled"}:
-            return 2
-        parser.error(
-            "Missing agent_id. Pass --agent-id, export SKY_AGENT_ID, set SKY_AGENT_ID "
-            "in ~/.sky-agent/.env, or ensure "
-            "https://api.unchainedsky.com/api/agents returns a connected agent."
-        )
-    maybe_migrate_primary_env(
-        api_key=resolved_api_key,
-        agent_id=resolved_agent_id,
-    )
-    if setup_source == "setup-wizard":
-        print(f"Waiting for agent {resolved_agent_id} to connect...")
-        connected, saw_agent, connect_error = wait_for_agent_connection(
-            api_key=resolved_api_key,
-            agent_id=resolved_agent_id,
-            endpoint=args.endpoint,
-            timeout=args.timeout,
-        )
-        if not connected:
-            if connect_error is not None:
-                print(f"Agent connection check failed: {connect_error}")
-            elif saw_agent:
-                print(f"Agent {resolved_agent_id} is not connected yet.")
-            else:
-                print(f"Agent {resolved_agent_id} has not appeared yet.")
-            print("Rerun sky in a few seconds if the agent just started.")
-            return 2
-
     cli_prompt = " ".join(args.prompt_args).strip()
     explicit_prompt = (args.prompt or "").strip()
     stdin_prompt = read_prompt_from_stdin()
     merged_prompt = explicit_prompt or cli_prompt or stdin_prompt
 
-    client = MCPClient(
-        endpoint=args.endpoint,
-        api_key=resolved_api_key,
-        timeout=args.timeout,
-        debug=args.debug,
-    )
+    transport = str(args.transport or DEFAULT_TRANSPORT).strip().lower()
+    resolved_agent_id = ""
+    credential_source = transport
+    if transport == "sky-mcp":
+        resolved_api_key, resolved_agent_id, credential_source = resolve_credentials(
+            api_key_arg=args.api_key,
+            agent_id_arg=args.agent_id,
+            endpoint=args.endpoint,
+            timeout=args.timeout,
+        )
+        setup_source: Optional[str] = None
+        if not resolved_api_key or not resolved_agent_id:
+            resolved_api_key, resolved_agent_id, setup_source = maybe_run_first_call_setup(
+                api_key=resolved_api_key,
+                agent_id=resolved_agent_id,
+                endpoint=args.endpoint,
+                timeout=args.timeout,
+            )
+            if setup_source:
+                credential_source = setup_source
+        if not resolved_api_key:
+            if setup_source in {"setup-instructions", "setup-cancelled"}:
+                return 2
+            parser.error(
+                "Missing API key. Pass --api-key, export SKY_API_KEY, "
+                "or set SKY_API_KEY in ~/.sky-agent/.env."
+            )
+        if not resolved_agent_id:
+            if setup_source in {"setup-instructions", "setup-cancelled"}:
+                return 2
+            parser.error(
+                "Missing agent_id. Pass --agent-id, export SKY_AGENT_ID, set SKY_AGENT_ID "
+                "in ~/.sky-agent/.env, or ensure "
+                "https://api.unchainedsky.com/api/agents returns a connected agent."
+            )
+        maybe_migrate_primary_env(
+            api_key=resolved_api_key,
+            agent_id=resolved_agent_id,
+        )
+        if setup_source == "setup-wizard":
+            print(f"Waiting for agent {resolved_agent_id} to connect...")
+            connected, saw_agent, connect_error = wait_for_agent_connection(
+                api_key=resolved_api_key,
+                agent_id=resolved_agent_id,
+                endpoint=args.endpoint,
+                timeout=args.timeout,
+            )
+            if not connected:
+                if connect_error is not None:
+                    print(f"Agent connection check failed: {connect_error}")
+                elif saw_agent:
+                    print(f"Agent {resolved_agent_id} is not connected yet.")
+                else:
+                    print(f"Agent {resolved_agent_id} has not appeared yet.")
+                print("Rerun sky in a few seconds if the agent just started.")
+                return 2
+
+        client: Any = MCPClient(
+            endpoint=args.endpoint,
+            api_key=resolved_api_key,
+            timeout=args.timeout,
+            debug=args.debug,
+        )
+    else:
+        resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
+        client = LocalCLIClient(
+            command=resolved_unchained_cmd or [],
+            port=args.unchained_port,
+            tab=args.browser_tab,
+            timeout=args.timeout,
+            debug=args.debug,
+        )
 
     client.initialize()
     available_tools = client.list_tools()
     if args.debug and available_tools:
         print(f"[debug] tools={available_tools}", file=sys.stderr)
-        print(
-            f"[debug] using agent_id={resolved_agent_id} credential_source={credential_source}",
-            file=sys.stderr,
-        )
+        if transport == "sky-mcp":
+            print(
+                f"[debug] transport=sky-mcp using agent_id={resolved_agent_id} credential_source={credential_source}",
+                file=sys.stderr,
+            )
+        else:
+            resolved_cmd = " ".join(getattr(client, "command", []) or [])
+            print(
+                f"[debug] transport=unchained cmd={resolved_cmd} port={args.unchained_port} tab={args.browser_tab}",
+                file=sys.stderr,
+            )
 
     navigate_tools = select_tool_candidates(
         preferred=PREFERRED_NAVIGATE_TOOLS,
