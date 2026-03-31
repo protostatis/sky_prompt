@@ -597,8 +597,9 @@ class LocalCLIClient:
         return stdout_text
 
 
-def install_unchained_with_uv(
+def install_python_tool_with_uv(
     uv_cmd: Sequence[str],
+    package: str,
     timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
 ) -> None:
     if not uv_cmd:
@@ -611,7 +612,7 @@ def install_unchained_with_uv(
         "--force",
         "--python",
         "3.10",
-        "unchainedsky-cli",
+        str(package),
     ]
     try:
         proc = subprocess.run(
@@ -631,6 +632,20 @@ def install_unchained_with_uv(
     if int(proc.returncode) != 0:
         detail = str(proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
         raise MCPError(f"uv tool install failed: {detail}")
+
+
+def install_unchained_with_uv(
+    uv_cmd: Sequence[str],
+    timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
+) -> None:
+    install_python_tool_with_uv(uv_cmd=uv_cmd, package="unchainedsky-cli", timeout_s=timeout_s)
+
+
+def install_pyreplab_with_uv(
+    uv_cmd: Sequence[str],
+    timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
+) -> None:
+    install_python_tool_with_uv(uv_cmd=uv_cmd, package="pyreplab", timeout_s=timeout_s)
 
 
 def launch_chatgpt_with_unchained(
@@ -4209,6 +4224,16 @@ result = a + b
                 ["uv", "tool", "install", "--force", "--python", "3.10", "unchainedsky-cli"],
             )
 
+        def test_install_pyreplab_with_uv_runs_tool_install(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+                install_pyreplab_with_uv(["uv"], timeout_s=30)
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command,
+                ["uv", "tool", "install", "--force", "--python", "3.10", "pyreplab"],
+            )
+
         def test_launch_chatgpt_with_unchained_builds_launch_command(self) -> None:
             with mock.patch("subprocess.run") as run_mock:
                 run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
@@ -5122,9 +5147,11 @@ def resolve_pyreplab_command(explicit_command: Optional[str] = None) -> Optional
     if discovered:
         return [discovered]
     common_candidates = [
+        Path.home() / ".local" / "bin" / "pyreplab",
         Path.home() / "Projects" / "pyrepl" / "pyreplab",
         Path.home() / "pyrepl" / "pyreplab",
         Path.cwd() / "pyreplab",
+        Path.cwd() / ".venv" / "bin" / "pyreplab",
         Path.cwd().parent / "pyrepl" / "pyreplab",
     ]
     for candidate in common_candidates:
@@ -8642,7 +8669,7 @@ def main() -> int:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Install unchainedsky-cli with uv if needed and launch ChatGPT in Chrome.",
+        help="Install unchainedsky-cli and pyreplab with uv if needed and launch ChatGPT in Chrome.",
     )
     parser.add_argument(
         "--transport",
@@ -8755,18 +8782,30 @@ def main() -> int:
     if args.setup:
         uv_cmd = resolve_uv_command()
         resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
+        resolved_pyreplab_cmd = resolve_pyreplab_command(args.pyreplab_cmd)
         installed_now = False
         if not resolved_unchained_cmd:
             print("setup: installing unchainedsky-cli with uv")
             install_unchained_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
             installed_now = True
             resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
+        if not resolved_pyreplab_cmd:
+            print("setup: installing pyreplab with uv")
+            install_pyreplab_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
+            installed_now = True
+            resolved_pyreplab_cmd = resolve_pyreplab_command(args.pyreplab_cmd)
         if not resolved_unchained_cmd:
             raise MCPError(
                 "setup completed but unchained was still not found. "
                 "Try `./sky --unchained-cmd ~/.local/bin/unchained`."
             )
+        if not resolved_pyreplab_cmd:
+            raise MCPError(
+                "setup completed but pyreplab was still not found. "
+                "Try `./sky --pyreplab-cmd ~/.local/bin/pyreplab`."
+            )
         print("setup: using " + " ".join(resolved_unchained_cmd))
+        print("setup: using " + " ".join(resolved_pyreplab_cmd))
         print(
             f"setup: launching ChatGPT on port {args.unchained_port} with profile {args.chrome_profile}"
         )

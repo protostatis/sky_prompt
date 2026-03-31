@@ -24,7 +24,7 @@ cd sky_prompt
 
 `./sky --setup` will:
 
-- install `unchainedsky-cli` with `uv` if it is missing
+- install `unchainedsky-cli` and `pyreplab` with `uv` if they are missing
 - launch Chrome to `https://chatgpt.com`
 - tell you the next `./sky` command to run
 
@@ -39,10 +39,11 @@ Optional manual install paths:
 
 ```bash
 uv tool install unchainedsky-cli
+uv tool install pyreplab
 uv sync --extra unchained
 ```
 
-Optional `pyreplab` backend dependency with `uv`:
+Optional repo-local `pyreplab` dependency with `uv`:
 
 ```bash
 uv sync --extra pyreplab
