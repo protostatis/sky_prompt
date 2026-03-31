@@ -19,13 +19,26 @@ Minimal terminal CLI to send prompts into a real browser tab such as `https://ch
 ```bash
 git clone https://github.com/protostatis/sky_prompt.git
 cd sky_prompt
-uv tool install unchainedsky-cli
-./sky --help
+./sky --setup
 ```
 
-Optional local dependency install inside the repo venv:
+`./sky --setup` will:
+
+- install `unchainedsky-cli` with `uv` if it is missing
+- launch Chrome to `https://chatgpt.com`
+- tell you the next `./sky` command to run
+
+If `uv` is not installed yet:
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+./sky --setup
+```
+
+Optional manual install paths:
+
+```bash
+uv tool install unchainedsky-cli
 uv sync --extra unchained
 ```
 
@@ -44,19 +57,21 @@ sk --help
 
 ## Quickstart
 
-1. Launch Chrome with remote debugging through `unchained` and use a profile that is already logged into ChatGPT:
+1. Run setup:
 
 ```bash
-unchained launch --use-profile --profile Default https://chatgpt.com
+./sky --setup
 ```
 
-2. Run a one-shot prompt:
+2. If ChatGPT is not already logged in for that Chrome profile, finish the login in the opened browser tab.
+
+3. Run a one-shot prompt:
 
 ```bash
 ./sky -p "Explain MCP in one paragraph"
 ```
 
-3. Run interactive mode:
+4. Run interactive mode:
 
 ```bash
 ./sky -i
@@ -70,7 +85,13 @@ The default transport is:
 ./sky --transport unchained
 ```
 
-It expects:
+The simplest path is:
+
+```bash
+./sky --setup
+```
+
+Manual flow if you want more control:
 
 1. `unchained` is installed and available in `PATH`, or you pass `--unchained-cmd`.
 2. Chrome is already running on `--unchained-port` (default `9222`).
@@ -79,6 +100,8 @@ It expects:
 Useful flags:
 
 ```bash
+./sky --setup --chrome-profile "Profile 3"
+./sky --setup --unchained-port 9333
 ./sky --unchained-port 9333 "hello"
 ./sky --browser-tab auto "hello"
 ./sky --unchained-cmd "uvx unchainedsky-cli" "hello"

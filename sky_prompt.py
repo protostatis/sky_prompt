@@ -36,6 +36,7 @@ _FOREGROUND_BROWSER_CONTEXT_STACK: List[str] = []
 DEFAULT_WAIT_TIMEOUT = 180
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_INSTALL_TIMEOUT = 600
+DEFAULT_LOCAL_SETUP_TIMEOUT = 900
 DEFAULT_AGENT_DISCOVERY_GRACE_SECONDS = 20
 DEFAULT_AGENT_DISCOVERY_POLL_SECONDS = 2.0
 DEFAULT_RENDER_STABLE_POLLS = 3
@@ -46,6 +47,7 @@ DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
 DEFAULT_UNCHAINED_PORT = int(os.getenv("UNCHAINED_PORT") or "9222")
 DEFAULT_BROWSER_TAB = "auto"
+DEFAULT_CHROME_PROFILE = str(os.getenv("SKY_CHROME_PROFILE") or "Default").strip() or "Default"
 SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
 ANSI_RESET = "\033[0m"
@@ -428,6 +430,22 @@ def resolve_unchained_command(explicit_command: Optional[str] = None) -> Optiona
     return None
 
 
+def resolve_uv_command() -> Optional[List[str]]:
+    discovered = shutil.which("uv")
+    if discovered:
+        return [discovered]
+    common_candidates = [
+        Path.home() / ".local" / "bin" / "uv",
+    ]
+    for candidate in common_candidates:
+        try:
+            if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                return [str(candidate)]
+        except OSError:
+            continue
+    return None
+
+
 def build_text_tool_result(stdout_text: str) -> Dict[str, Any]:
     return {
         "content": [
@@ -457,8 +475,8 @@ class LocalCLIClient:
     def initialize(self) -> None:
         if not self.command:
             raise MCPError(
-                "unchained CLI not found. Install it with `uv tool install unchainedsky-cli`, "
-                "or pass --unchained-cmd."
+                "unchained CLI not found. Run `./sky --setup`, install it with "
+                "`uv tool install unchainedsky-cli`, or pass --unchained-cmd."
             )
         try:
             self._run(["status"], timeout_s=min(10, max(3, self.timeout)))
@@ -565,8 +583,8 @@ class LocalCLIClient:
             )
         except FileNotFoundError as exc:
             raise MCPError(
-                "unchained CLI not found. Install it with `uv tool install unchainedsky-cli`, "
-                "or pass --unchained-cmd."
+                "unchained CLI not found. Run `./sky --setup`, install it with "
+                "`uv tool install unchainedsky-cli`, or pass --unchained-cmd."
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise MCPError(f"unchained command timed out after {int(timeout_s or self.timeout)}s") from exc
@@ -577,6 +595,79 @@ class LocalCLIClient:
             detail = stderr_text.strip() or stdout_text.strip() or f"exit code {proc.returncode}"
             raise MCPError(detail)
         return stdout_text
+
+
+def install_unchained_with_uv(
+    uv_cmd: Sequence[str],
+    timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
+) -> None:
+    if not uv_cmd:
+        raise MCPError(
+            "uv is not installed. Install uv first, then rerun `./sky --setup`."
+        )
+    command = list(uv_cmd) + [
+        "tool",
+        "install",
+        "--force",
+        "--python",
+        "3.10",
+        "unchainedsky-cli",
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(30, int(timeout_s)),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise MCPError(
+            "uv is not installed. Install uv first, then rerun `./sky --setup`."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise MCPError(f"uv tool install timed out after {int(timeout_s)}s") from exc
+    if int(proc.returncode) != 0:
+        detail = str(proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        raise MCPError(f"uv tool install failed: {detail}")
+
+
+def launch_chatgpt_with_unchained(
+    unchained_cmd: Sequence[str],
+    port: int,
+    profile: str,
+    url: str = DEFAULT_URL,
+    timeout_s: int = 60,
+) -> str:
+    if not unchained_cmd:
+        raise MCPError("unchained CLI not found after setup")
+    command = list(unchained_cmd) + [
+        "--port",
+        str(int(port)),
+        "launch",
+        "--use-profile",
+        "--profile",
+        str(profile or DEFAULT_CHROME_PROFILE),
+        str(url or DEFAULT_URL),
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(10, int(timeout_s)),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise MCPError("unchained CLI not found after setup") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise MCPError(f"unchained launch timed out after {int(timeout_s)}s") from exc
+    if int(proc.returncode) != 0:
+        detail = str(proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        raise MCPError(f"unable to launch Chrome through unchained: {detail}")
+    return str(proc.stdout or "").strip()
 
 
 def parse_rpc_response(raw_body: str) -> Optional[Dict[str, Any]]:
@@ -4103,6 +4194,47 @@ result = a + b
             resolved = resolve_unchained_command("uvx unchainedsky-cli")
             self.assertEqual(resolved, ["uvx", "unchainedsky-cli"])
 
+        def test_resolve_uv_command_prefers_path(self) -> None:
+            with mock.patch("shutil.which", return_value="/usr/local/bin/uv"):
+                resolved = resolve_uv_command()
+            self.assertEqual(resolved, ["/usr/local/bin/uv"])
+
+        def test_install_unchained_with_uv_runs_tool_install(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+                install_unchained_with_uv(["uv"], timeout_s=30)
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command,
+                ["uv", "tool", "install", "--force", "--python", "3.10", "unchainedsky-cli"],
+            )
+
+        def test_launch_chatgpt_with_unchained_builds_launch_command(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
+                output = launch_chatgpt_with_unchained(
+                    ["unchained"],
+                    port=9333,
+                    profile="Profile 3",
+                    url="https://chatgpt.com",
+                    timeout_s=10,
+                )
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "unchained",
+                    "--port",
+                    "9333",
+                    "launch",
+                    "--use-profile",
+                    "--profile",
+                    "Profile 3",
+                    "https://chatgpt.com",
+                ],
+            )
+            self.assertIn("Chrome started", output)
+
         def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
             client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
             with mock.patch("subprocess.run") as run_mock:
@@ -4121,6 +4253,12 @@ result = a + b
                     client.initialize()
             self.assertIn("Chrome not running on port 9222", str(exc.exception))
             self.assertIn("launch --use-profile", str(exc.exception))
+
+        def test_local_cli_client_missing_command_mentions_setup(self) -> None:
+            client = LocalCLIClient([], port=9222, tab="auto", timeout=5)
+            with self.assertRaises(MCPError) as exc:
+                client.initialize()
+            self.assertIn("./sky --setup", str(exc.exception))
 
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
@@ -8502,6 +8640,11 @@ def main() -> int:
         help="Overwrite existing alias path when using --setup-alias.",
     )
     parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Install unchainedsky-cli with uv if needed and launch ChatGPT in Chrome.",
+    )
+    parser.add_argument(
         "--transport",
         choices=SUPPORTED_TRANSPORTS,
         default=(os.getenv("SKY_TRANSPORT") or DEFAULT_TRANSPORT),
@@ -8521,6 +8664,11 @@ def main() -> int:
         "--browser-tab",
         default=DEFAULT_BROWSER_TAB,
         help="Target browser tab id or alias for the unchained transport (default: auto).",
+    )
+    parser.add_argument(
+        "--chrome-profile",
+        default=DEFAULT_CHROME_PROFILE,
+        help="Chrome profile used by --setup when launching ChatGPT (default: Default).",
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Sky MCP endpoint (transport=sky-mcp).")
     parser.add_argument("--api-key", help="Sky API key (transport=sky-mcp).")
@@ -8602,6 +8750,39 @@ def main() -> int:
             print(f"PATH missing {alias_dir}")
             print(f'add this to your shell rc: export PATH="{alias_dir}:$PATH"')
         print(f'try it: {args.setup_alias} -p "hello"')
+        return 0
+
+    if args.setup:
+        uv_cmd = resolve_uv_command()
+        resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
+        installed_now = False
+        if not resolved_unchained_cmd:
+            print("setup: installing unchainedsky-cli with uv")
+            install_unchained_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
+            installed_now = True
+            resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
+        if not resolved_unchained_cmd:
+            raise MCPError(
+                "setup completed but unchained was still not found. "
+                "Try `./sky --unchained-cmd ~/.local/bin/unchained`."
+            )
+        print("setup: using " + " ".join(resolved_unchained_cmd))
+        print(
+            f"setup: launching ChatGPT on port {args.unchained_port} with profile {args.chrome_profile}"
+        )
+        launch_output = launch_chatgpt_with_unchained(
+            resolved_unchained_cmd,
+            port=args.unchained_port,
+            profile=args.chrome_profile,
+            url=args.url,
+            timeout_s=60,
+        )
+        if launch_output:
+            print(launch_output)
+        print("setup complete")
+        if installed_now:
+            print("next: finish logging into ChatGPT in the opened browser if needed")
+        print('then run: ./sky -p "hello"')
         return 0
 
     cli_prompt = " ".join(args.prompt_args).strip()
