@@ -463,14 +463,22 @@ class LocalCLIClient:
         command: Sequence[str],
         port: int = DEFAULT_UNCHAINED_PORT,
         tab: str = DEFAULT_BROWSER_TAB,
+        chrome_profile: str = DEFAULT_CHROME_PROFILE,
+        startup_url: str = DEFAULT_URL,
+        auto_launch: bool = False,
         timeout: int = 45,
         debug: bool = False,
     ):
         self.command = list(command)
         self.port = int(port)
         self.tab = str(tab or DEFAULT_BROWSER_TAB)
+        self.chrome_profile = str(chrome_profile or DEFAULT_CHROME_PROFILE)
+        self.startup_url = str(startup_url or DEFAULT_URL)
+        self.auto_launch = bool(auto_launch)
         self.timeout = int(timeout)
         self.debug = debug
+        self.did_auto_launch = False
+        self.last_launch_output = ""
 
     def initialize(self) -> None:
         if not self.command:
@@ -481,9 +489,21 @@ class LocalCLIClient:
         try:
             self._run(["status"], timeout_s=min(10, max(3, self.timeout)))
         except MCPError as exc:
+            if self.auto_launch:
+                launch_output = launch_chatgpt_with_unchained(
+                    self.command,
+                    port=self.port,
+                    profile=self.chrome_profile,
+                    url=self.startup_url,
+                    timeout_s=max(20, self.timeout),
+                )
+                self.did_auto_launch = True
+                self.last_launch_output = str(launch_output or "").strip()
+                self._run(["status"], timeout_s=min(10, max(3, self.timeout)))
+                return
             launch_hint = (
-                f"Start a browser first with: {' '.join(self.command)} "
-                f"--port {self.port} launch --use-profile {DEFAULT_URL}"
+                f"Start a browser first with: {' '.join(self.command)} --port {self.port} "
+                f"launch --use-profile --profile {self.chrome_profile} {self.startup_url}"
             )
             raise MCPError(f"{exc}\n{launch_hint}") from exc
 
@@ -4278,6 +4298,38 @@ result = a + b
                     client.initialize()
             self.assertIn("Chrome not running on port 9222", str(exc.exception))
             self.assertIn("launch --use-profile", str(exc.exception))
+
+        def test_local_cli_client_initialize_auto_launches_browser(self) -> None:
+            module_name = LocalCLIClient.__module__
+            client = LocalCLIClient(
+                ["unchained"],
+                port=9224,
+                tab="auto",
+                chrome_profile="Profile 3",
+                startup_url="https://chatgpt.com",
+                auto_launch=True,
+                timeout=5,
+            )
+            with mock.patch.object(
+                client,
+                "_run",
+                side_effect=[MCPError("Chrome not running on port 9224"), "Chrome -> Chrome"],
+            ) as run_mock:
+                with mock.patch(
+                    f"{module_name}.launch_chatgpt_with_unchained",
+                    return_value="Chrome started\n",
+                ) as launch_mock:
+                    client.initialize()
+            self.assertTrue(client.did_auto_launch)
+            self.assertEqual(client.last_launch_output, "Chrome started")
+            self.assertEqual(run_mock.call_count, 2)
+            launch_mock.assert_called_once_with(
+                ["unchained"],
+                port=9224,
+                profile="Profile 3",
+                url="https://chatgpt.com",
+                timeout_s=20,
+            )
 
         def test_local_cli_client_missing_command_mentions_setup(self) -> None:
             client = LocalCLIClient([], port=9222, tab="auto", timeout=5)
@@ -8659,17 +8711,17 @@ def main() -> int:
     parser.add_argument(
         "--alias-dir",
         default=str(DEFAULT_ALIAS_DIR),
-        help="Directory used by --setup-alias (default: ~/.local/bin).",
+        help="Directory used by --setup-alias and the default sky launcher during --setup (default: ~/.local/bin).",
     )
     parser.add_argument(
         "--force-alias",
         action="store_true",
-        help="Overwrite existing alias path when using --setup-alias.",
+        help="Overwrite existing alias path when using --setup or --setup-alias.",
     )
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Install unchainedsky-cli and pyreplab with uv if needed and launch ChatGPT in Chrome.",
+        help="Install unchainedsky-cli and pyreplab, add a sky launcher, and launch ChatGPT in Chrome.",
     )
     parser.add_argument(
         "--transport",
@@ -8695,7 +8747,7 @@ def main() -> int:
     parser.add_argument(
         "--chrome-profile",
         default=DEFAULT_CHROME_PROFILE,
-        help="Chrome profile used by --setup when launching ChatGPT (default: Default).",
+        help="Chrome profile used by --setup and automatic local browser launch (default: Default).",
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Sky MCP endpoint (transport=sky-mcp).")
     parser.add_argument("--api-key", help="Sky API key (transport=sky-mcp).")
@@ -8784,6 +8836,11 @@ def main() -> int:
         resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
         resolved_pyreplab_cmd = resolve_pyreplab_command(args.pyreplab_cmd)
         installed_now = False
+        alias_dir = Path(args.alias_dir).expanduser()
+        target_script = Path(__file__).resolve()
+        alias_path: Optional[Path] = None
+        alias_created = False
+        alias_error: Optional[str] = None
         if not resolved_unchained_cmd:
             print("setup: installing unchainedsky-cli with uv")
             install_unchained_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
@@ -8804,8 +8861,26 @@ def main() -> int:
                 "setup completed but pyreplab was still not found. "
                 "Try `./sky --pyreplab-cmd ~/.local/bin/pyreplab`."
             )
+        try:
+            alias_path, alias_created = install_alias_launcher(
+                alias_name="sky",
+                alias_dir=alias_dir,
+                target_script=target_script,
+                force=args.force_alias,
+            )
+        except MCPError as exc:
+            alias_error = str(exc)
         print("setup: using " + " ".join(resolved_unchained_cmd))
         print("setup: using " + " ".join(resolved_pyreplab_cmd))
+        if alias_path is not None:
+            status_label = "installed" if alias_created else "already installed"
+            print(f"setup: {status_label} sky launcher at {alias_path}")
+        elif alias_error:
+            print(f"setup: skipped sky launcher: {alias_error}")
+        alias_on_path = bool(alias_path) and path_contains_dir(alias_dir)
+        if alias_path is not None and not alias_on_path:
+            print(f"setup: PATH missing {alias_dir}")
+            print(f'setup: add this to your shell rc: export PATH="{alias_dir}:$PATH"')
         print(
             f"setup: launching ChatGPT on port {args.unchained_port} with profile {args.chrome_profile}"
         )
@@ -8821,7 +8896,12 @@ def main() -> int:
         print("setup complete")
         if installed_now:
             print("next: finish logging into ChatGPT in the opened browser if needed")
-        print('then run: ./sky -p "hello"')
+        if alias_on_path:
+            print('then run: sky -p "hello"')
+        else:
+            print('then run: ./sky -p "hello"')
+            if alias_path is not None:
+                print('after PATH update, you can use: sky -p "hello"')
         return 0
 
     cli_prompt = " ".join(args.prompt_args).strip()
@@ -8898,11 +8978,21 @@ def main() -> int:
             command=resolved_unchained_cmd or [],
             port=args.unchained_port,
             tab=args.browser_tab,
+            chrome_profile=args.chrome_profile,
+            startup_url=args.url,
+            auto_launch=True,
             timeout=args.timeout,
             debug=args.debug,
         )
 
     client.initialize()
+    if transport == "unchained" and getattr(client, "did_auto_launch", False):
+        print(
+            f"browser: launched {args.url} on port {args.unchained_port} with profile {args.chrome_profile}"
+        )
+        launch_output = str(getattr(client, "last_launch_output", "") or "").strip()
+        if launch_output:
+            print(launch_output)
     available_tools = client.list_tools()
     if args.debug and available_tools:
         print(f"[debug] tools={available_tools}", file=sys.stderr)

@@ -25,8 +25,9 @@ cd sky_prompt
 `./sky --setup` will:
 
 - install `unchainedsky-cli` and `pyreplab` with `uv` if they are missing
+- install a `sky` launcher in `~/.local/bin` when possible
 - launch Chrome to `https://chatgpt.com`
-- tell you the next `./sky` command to run
+- tell you the next `sky` command to run
 
 If `uv` is not installed yet:
 
@@ -49,7 +50,7 @@ Optional repo-local `pyreplab` dependency with `uv`:
 uv sync --extra pyreplab
 ```
 
-Optional alias setup:
+Custom alias setup if you want a second command name such as `sk`:
 
 ```bash
 ./sky --setup-alias sk
@@ -69,13 +70,13 @@ sk --help
 3. Run a one-shot prompt:
 
 ```bash
-./sky -p "Explain MCP in one paragraph"
+sky -p "Explain MCP in one paragraph"
 ```
 
 4. Run interactive mode:
 
 ```bash
-./sky -i
+sky -i
 ```
 
 ## Local Browser Flow
@@ -95,7 +96,7 @@ The simplest path is:
 Manual flow if you want more control:
 
 1. `unchained` is installed and available in `PATH`, or you pass `--unchained-cmd`.
-2. Chrome is already running on `--unchained-port` (default `9222`).
+2. `sky` will auto-launch Chrome on `--unchained-port` (default `9222`) if nothing is already listening there.
 3. The selected Chrome profile is logged into the target site.
 
 Useful flags:
@@ -108,7 +109,7 @@ Useful flags:
 ./sky --unchained-cmd "uvx unchainedsky-cli" "hello"
 ```
 
-If Chrome is not running on the selected port, `sky` will stop early and print the exact `unchained launch ...` command you need.
+If `~/.local/bin` is not on `PATH`, `./sky --setup` will still work but your shell will not see the installed `sky` launcher until you add that directory to `PATH`.
 
 ## Legacy Sky MCP Flow
 
@@ -224,7 +225,8 @@ Developer test loop (recommended while iterating):
 
 ## Custom Alias Setup
 
-Install any command name you want (for example `sk`):
+`./sky --setup` already tries to install `sky` into `~/.local/bin`.
+Use this when you want a second command name instead, for example `sk`:
 
 ```bash
 ./sky --setup-alias sk
@@ -302,10 +304,10 @@ Fast launch shortcut:
 
 ## Add To PATH
 
-If you want it globally like `claude`:
+If `./sky --setup` reported that `~/.local/bin` is missing from `PATH`, add it:
 
 ```bash
-ln -sf /Users/zhiminzou/Projects/sky_prompt/sky ~/.local/bin/sky
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Then run:
