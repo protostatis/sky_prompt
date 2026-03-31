@@ -322,7 +322,10 @@ sky "Explain what an MCP session id is"
 - For the default `unchained` transport, you must already be logged into the target site in the Chrome profile you launched.
 - `SKY_API_KEY`, `SKY_AGENT_ID`, and `~/sky-agent/.env` only matter when you opt into `--transport sky-mcp`.
 - `sky` talks to a browser tab, not the OpenAI API directly. For ChatGPT usage, the only account dependency is your normal web login session.
+- The main CLI is intended to work on macOS and Linux anywhere `unchainedsky-cli`, Chrome, and Python are available.
+- Browser foregrounding and window parking are macOS-only conveniences. On Linux and other non-macOS platforms, `sky` now skips that focus management and leaves the browser/window state alone.
 - On macOS, `SKY_FOREGROUND_BROWSER=submit` (the default) brings Chrome to the foreground for the submit sequence once and then returns focus to the terminal. Set `SKY_FOREGROUND_BROWSER=poll` for aggressive background-safe polling, `SKY_FOREGROUND_BROWSER=0` to disable, or `SKY_BROWSER_APP` to override the browser app name.
+- `scripts/test_install_terminal.sh` is macOS-only because it drives Terminal through `osascript`; it is not the cross-platform install test path.
 - Different sites use different input DOM patterns; this script targets common chat UIs and may need selector tweaks for edge cases.
 - Use `--debug` to print tool and transport diagnostics.
 - Interactive mode clears stale draft text on startup.

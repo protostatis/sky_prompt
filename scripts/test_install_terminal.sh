@@ -108,6 +108,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "error: scripts/test_install_terminal.sh is macOS-only" >&2
+  echo "detail: it launches Terminal via osascript to exercise the first-run flow" >&2
+  exit 2
+fi
+
 if [[ -z "$TEMP_HOME" ]]; then
   TEMP_HOME="$(mktemp -d /tmp/sky-install-terminal.XXXXXX)"
 fi

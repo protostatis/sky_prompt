@@ -4589,10 +4589,14 @@ result = a + b
             self.assertIsNone(timeout_s)
             self.assertIn("no current cell", str(error or ""))
 
-        def test_browser_foreground_mode_defaults_to_submit(self) -> None:
-            self.assertEqual(browser_foreground_mode({}), "submit")
-            self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
-            self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
+        def test_browser_foreground_mode_defaults_by_platform(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(browser_foreground_mode({}), "submit")
+                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
+                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
+            with mock.patch.object(sys, "platform", "linux"):
+                self.assertEqual(browser_foreground_mode({}), "off")
+                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
 
         def test_browser_window_parking_enabled_defaults_on_darwin(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
@@ -4674,6 +4678,13 @@ result = a + b
                     ):
                         with foreground_browser_context("pulse"):
                             pass
+            self.assertEqual(activate_mock.call_args_list, [])
+
+        def test_foreground_browser_context_is_noop_off_darwin(self) -> None:
+            with mock.patch.object(sys, "platform", "linux"):
+                with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                    with foreground_browser_context("hold"):
+                        pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_call_js_expression_pulses_browser_in_pulse_context(self) -> None:
@@ -6476,7 +6487,10 @@ def read_live_repl_input(
 
 def browser_foreground_mode(env: Optional[Mapping[str, str]] = None) -> str:
     values = env or os.environ
-    raw = str(values.get("SKY_FOREGROUND_BROWSER", "submit") or "").strip().lower()
+    default_mode = "submit" if sys.platform == "darwin" else "off"
+    raw = str(values.get("SKY_FOREGROUND_BROWSER", default_mode) or "").strip().lower()
+    if sys.platform != "darwin":
+        return "off"
     if raw in {"0", "false", "off", "no", "none"}:
         return "off"
     if raw in {"1", "true", "on", "yes", "poll", "always", "aggressive"}:
@@ -6645,7 +6659,7 @@ def foreground_browser_context(mode: str) -> Iterable[None]:
     resolved_mode = str(mode or "off").strip().lower()
     if resolved_mode not in {"off", "hold", "pulse"}:
         resolved_mode = "off"
-    if resolved_mode == "off":
+    if resolved_mode == "off" or sys.platform != "darwin":
         yield
         return
     browser_app = browser_application_name_from_env()
