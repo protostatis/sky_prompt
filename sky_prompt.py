@@ -3932,6 +3932,34 @@ result = a + b
             self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
             self.assertIn("7", str(result.get("stdout") or ""))
 
+        def test_create_local_python_tool_shims_creates_pip_wrapper(self) -> None:
+            shim_dir = create_local_python_tool_shims("/tmp/python with spaces/bin/python3")
+            try:
+                pip_path = shim_dir / "pip"
+                python3_path = shim_dir / "python3"
+                self.assertTrue(pip_path.exists())
+                self.assertTrue(python3_path.exists())
+                pip_content = pip_path.read_text(encoding="utf-8")
+                python_content = python3_path.read_text(encoding="utf-8")
+            finally:
+                shutil.rmtree(shim_dir, ignore_errors=True)
+
+            self.assertIn("-m pip", pip_content)
+            self.assertIn("python3", python_content)
+            self.assertIn("python with spaces/bin/python3", pip_content)
+
+        def test_execute_cell_locally_bash_uses_python_shims_when_path_missing(self) -> None:
+            cell = {
+                "id": "sh1",
+                "language": "bash",
+                "content": "python3 -c \"print('BASH_OK')\"",
+            }
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                result = execute_cell_locally(cell, timeout_s=10)
+            self.assertTrue(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
+            self.assertIn("BASH_OK", str(result.get("stdout") or ""))
+
         def test_execute_cell_locally_keyboard_interrupt_returns_cancelled(self) -> None:
             cell = {
                 "id": "py4",
@@ -5094,6 +5122,46 @@ def resolve_run_request(
     return target, timeout_s, None
 
 
+def resolve_local_python_command() -> str:
+    executable = str(getattr(sys, "executable", "") or "").strip()
+    if executable:
+        try:
+            if Path(executable).exists():
+                return executable
+        except OSError:
+            pass
+    for candidate in ("python3", "python"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return "python3"
+
+
+def create_local_python_tool_shims(python_cmd: str) -> Path:
+    shim_dir = Path(tempfile.mkdtemp(prefix="sky_prompt_shims_"))
+    quoted_python = shlex.quote(str(python_cmd))
+    wrappers = {
+        "python": f"#!/bin/sh\nexec {quoted_python} \"$@\"\n",
+        "python3": f"#!/bin/sh\nexec {quoted_python} \"$@\"\n",
+        "pip": f"#!/bin/sh\nexec {quoted_python} -m pip \"$@\"\n",
+        "pip3": f"#!/bin/sh\nexec {quoted_python} -m pip \"$@\"\n",
+    }
+    for name, body in wrappers.items():
+        path = shim_dir / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    return shim_dir
+
+
+def build_local_run_env(shim_dir: Optional[Path] = None) -> Dict[str, str]:
+    env = dict(os.environ)
+    if shim_dir is None:
+        return env
+    current_path = str(env.get("PATH") or "")
+    env["PATH"] = str(shim_dir) if not current_path else f"{shim_dir}{os.pathsep}{current_path}"
+    return env
+
+
 def execute_cell_locally(
     cell: Dict[str, Any],
     workdir: Optional[Path] = None,
@@ -5105,10 +5173,12 @@ def execute_cell_locally(
         return {"ok": False, "backend": "local", "error": "empty cell content"}
     workdir_path = Path(workdir or Path.cwd())
     script_path: Optional[Path] = None
+    shim_dir: Optional[Path] = None
     input_text: Optional[str] = None
+    python_cmd = resolve_local_python_command()
 
     if language == "python":
-        runner_cmd = ["python3", "-"]
+        runner_cmd = [python_cmd, "-"]
         input_text = content
     elif language in {"bash", "javascript", "js", "typescript", "ts", "ruby", "perl"}:
         suffix = language_to_cell_extension(language)
@@ -5116,7 +5186,8 @@ def execute_cell_locally(
             handle.write(content)
             script_path = Path(handle.name)
         if language == "bash":
-            runner_cmd = ["bash", str(script_path)]
+            shim_dir = create_local_python_tool_shims(python_cmd)
+            runner_cmd = [shutil.which("bash") or "/bin/bash", str(script_path)]
         elif language in {"javascript", "js"}:
             runner_cmd = ["node", str(script_path)]
         elif language in {"typescript", "ts"}:
@@ -5136,6 +5207,7 @@ def execute_cell_locally(
             text=True,
             timeout=max(1, int(timeout_s)),
             cwd=str(workdir_path),
+            env=build_local_run_env(shim_dir),
             check=False,
         )
         exit_code = int(completed.returncode)
@@ -5183,6 +5255,11 @@ def execute_cell_locally(
         if script_path is not None:
             try:
                 script_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if shim_dir is not None:
+            try:
+                shutil.rmtree(shim_dir, ignore_errors=True)
             except Exception:
                 pass
 

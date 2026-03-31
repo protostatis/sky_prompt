@@ -285,7 +285,8 @@ sky -i
 /run py2
 ```
 
-`local` is the default `/run` backend. Switch to `pyreplab` when you want persistent Python state across `/py`, `/pyfile`, and `/run`.
+`local` is the default `/run` backend. It runs Python and bash cells directly in the current workspace, and shell cells get `python`/`python3`/`pip` shims that point at the same interpreter `sky` is using.
+Switch to `pyreplab` when you want persistent Python state across `/py`, `/pyfile`, and `/run`.
 `/py`, `/pyfile`, and `/run` share the same pyreplab session, so pre-imports persist for later cell runs.
 Each `-i` session uses its own isolated pyreplab session directory to avoid cross-project leakage.
 
