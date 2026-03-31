@@ -2439,9 +2439,13 @@ def looks_like_python_continuation_line(raw_line: str) -> bool:
         return False
     if re.fullmatch(r"[\])}\s,]+", stripped):
         return True
+    if re.match(r"^[\])}]+(?:\.[A-Za-z_][A-Za-z0-9_]*.*)?$", stripped):
+        return True
     if stripped.startswith(("[", "]", "(", ")", "{", "}")) and "," in stripped:
         return True
     if stripped.endswith(("]", ")", "}", ",")) and "," in stripped:
+        return True
+    if re.match(r"^(?:['\"][^'\"]+['\"]|[A-Za-z_][A-Za-z0-9_]*)\s*:\s*.+,?$", stripped):
         return True
     if stripped in {"pass", "break", "continue"}:
         return True
@@ -3679,6 +3683,81 @@ if __name__ == "__main__":
             self.assertIn('canvas[height - 1 - y][x] = "*"', content)
             self.assertIn('print ("".join (row))', content)
             self.assertIn('print (f"\\nMin: {min_val:.2f} | Max: {max_val:.2f}")', content)
+            self.assertTrue(bool(block.get("syntax_valid")))
+
+        def test_weekly_ascii_candles_script_keeps_helper_function(self) -> None:
+            sample = """Nice—this is a fun one. Let’s turn stock data into weekly ASCII candlestick charts.
+We’ll:
+- Pull daily data
+- Resample to weekly OHLC
+- Render candles using text
+## 🐍 Full Python Script (ASCII Weekly Candles)
+
+Python
+import yfinance as yf
+import pandas as pd
+
+def get_weekly_data (ticker):
+    data = yf.download (ticker, period="1y", interval="1d")
+
+    # Convert to weekly OHLC
+    weekly = data.resample ('W').agg ({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last'
+    }).dropna ()
+
+    return weekly
+
+def ascii_candles (data, height=20):
+    max_price = data['High'].max ()
+    min_price = data['Low'].min ()
+    price_range = max_price - min_price
+
+    def scale (price):
+        return int ((price - min_price) / price_range * (height - 1))
+
+    canvas = [[" " for _ in range (len (data))] for _ in range (height)]
+
+    for i, (_, row) in enumerate (data.iterrows ()):
+        o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
+
+        high = scale (h)
+        low = scale (l)
+        open_ = scale (o)
+        close = scale (c)
+
+        # Draw wick
+        for y in range (low, high + 1):
+            canvas[height - 1 - y][i] = "|"
+
+        # Draw body
+        top = max (open_, close)
+        bottom = min (open_, close)
+
+        for y in range (bottom, top + 1):
+            canvas[height - 1 - y][i] = "█" if c >= o else "░"
+
+    # Print chart
+    for row in canvas:
+        print ("".join (row))
+
+# Run it
+ticker = "AAPL"
+weekly_data = get_weekly_data (ticker)
+ascii_candles (weekly_data)
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            block = artifacts["code_blocks"][0]
+            content = str(block.get("content") or "")
+            self.assertIn("import yfinance as yf", content)
+            self.assertIn("def get_weekly_data (ticker):", content)
+            self.assertIn("'Close': 'last'", content)
+            self.assertIn("}).dropna ()", content)
+            self.assertIn('canvas[height - 1 - y][i] = "█" if c >= o else "░"', content)
+            self.assertIn("weekly_data = get_weekly_data (ticker)", content)
             self.assertTrue(bool(block.get("syntax_valid")))
 
         def test_fenced_python_merges_indented_tail(self) -> None:
