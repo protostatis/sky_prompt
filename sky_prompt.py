@@ -44,7 +44,7 @@ DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
-DEFAULT_RUN_BACKEND = "local"
+DEFAULT_RUN_BACKEND = "pyreplab"
 DEFAULT_UNCHAINED_PORT = int(os.getenv("UNCHAINED_PORT") or "9222")
 DEFAULT_BROWSER_TAB = "auto"
 DEFAULT_CHROME_PROFILE = str(os.getenv("SKY_CHROME_PROFILE") or "Default").strip() or "Default"
@@ -9029,7 +9029,7 @@ def main() -> int:
         "--run-backend",
         choices=SUPPORTED_RUN_BACKENDS,
         default=DEFAULT_RUN_BACKEND,
-        help="Code runner backend used by /run in interactive mode (default: local).",
+        help="Code runner backend used by /run in interactive mode (default: pyreplab; falls back to local if unavailable).",
     )
     parser.add_argument(
         "--pyreplab-cmd",

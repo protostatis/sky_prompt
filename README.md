@@ -253,7 +253,7 @@ Inside interactive mode:
 - `/url <url>` navigate to another site
 - `/submit on|off` toggle auto-submit
 - `/format markdown|plain|json` change response rendering format
-- `/backend [local|pyreplab]` choose `/run` execution backend (default: local)
+- `/backend [local|pyreplab]` choose `/run` execution backend (default: pyreplab, falls back to local if unavailable)
 - `/py <code>` passthrough inline Python directly into pyreplab session
 - `/pyfile <path.py>` passthrough a local setup script into pyreplab session
 - `/history [n]` show recent turns (default last 10)
@@ -285,8 +285,8 @@ sky -i
 /run py2
 ```
 
-`local` is the default `/run` backend. It runs Python and bash cells directly in the current workspace, and shell cells get `python`/`python3`/`pip` shims that point at the same interpreter `sky` is using.
-Switch to `pyreplab` when you want persistent Python state across `/py`, `/pyfile`, and `/run`.
+`pyreplab` is the default `/run` backend when it is available, and `sky` falls back to `local` if it is not.
+`local` still handles bash and other non-Python cells directly in the current workspace, and shell cells get `python`/`python3`/`pip` shims that point at the same interpreter `sky` is using.
 `/py`, `/pyfile`, and `/run` share the same pyreplab session, so pre-imports persist for later cell runs.
 Each `-i` session uses its own isolated pyreplab session directory to avoid cross-project leakage.
 
