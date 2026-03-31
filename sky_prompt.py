@@ -2159,7 +2159,7 @@ def infer_language_from_code(content: str) -> str:
 
 
 def python_snippet_is_valid(content: str) -> bool:
-    snippet = str(content or "").strip()
+    snippet = str(content or "").strip("\n")
     if not snippet:
         return False
     try:
@@ -2416,6 +2416,11 @@ def looks_like_python_code_line(raw_line: str) -> bool:
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+\s*=", stripped):
         return True
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*(?:[\+\-\*/%@]?=)", stripped):
+        return True
+    if re.match(
+        r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\]|\.[A-Za-z_][A-Za-z0-9_]*)+\s*(?:[\+\-\*/%@]?=)",
+        stripped,
+    ):
         return True
     if re.match(r"^print\s*\(", stripped):
         return True
@@ -3604,6 +3609,77 @@ result = a + b
             block = artifacts["code_blocks"][0]
             self.assertEqual(block.get("language"), "python")
             self.assertIn("result = a + b", block.get("content", ""))
+
+        def test_python_snippet_is_valid_rejects_unexpected_indent(self) -> None:
+            self.assertFalse(
+                python_snippet_is_valid(
+                    "    print('x')\n\ndef main():\n    pass\n"
+                )
+            )
+
+        def test_ascii_plot_script_keeps_full_python_block(self) -> None:
+            sample = """Here’s a simple Python script that:
+- pulls the last year of stock data
+- converts it into an ASCII chart (no GUI needed)
+### 📜 Full script (ASCII stock plot)
+
+Python
+import yfinance as yf
+import numpy as np
+from datetime import datetime, timedelta
+
+def ascii_plot (data, width=80, height=20):
+    # Normalize data to fit chart height
+    min_val = np.min (data)
+    max_val = np.max (data)
+    scaled = (data - min_val) / (max_val - min_val + 1e-9)
+    scaled = (scaled * (height - 1)).astype (int)
+
+    # Downsample to fit width
+    if len (scaled) > width:
+        idx = np.linspace (0, len (scaled) - 1, width).astype (int)
+        scaled = scaled[idx]
+
+    # Create empty canvas
+    canvas = [[" " for _ in range (len (scaled))] for _ in range (height)]
+
+    # Plot points
+    for x, y in enumerate (scaled):
+        canvas[height - 1 - y][x] = "*"
+
+    # Print chart
+    for row in canvas:
+        print ("".join (row))
+
+    print (f"\\nMin: {min_val:.2f} | Max: {max_val:.2f}")
+
+def main ():
+    ticker = "AAPL"
+
+    end_date = datetime.today ()
+    start_date = end_date - timedelta (days=365)
+
+    # Download data
+    df = yf.download (ticker, start=start_date, end=end_date)
+
+    # Use closing prices
+    close_prices = df["Close"].values
+
+    # Plot ASCII chart
+    ascii_plot (close_prices)
+
+if __name__ == "__main__":
+    main ()
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 1)
+            block = artifacts["code_blocks"][0]
+            content = str(block.get("content") or "")
+            self.assertIn("import yfinance as yf", content)
+            self.assertIn('canvas[height - 1 - y][x] = "*"', content)
+            self.assertIn('print ("".join (row))', content)
+            self.assertIn('print (f"\\nMin: {min_val:.2f} | Max: {max_val:.2f}")', content)
+            self.assertTrue(bool(block.get("syntax_valid")))
 
         def test_fenced_python_merges_indented_tail(self) -> None:
             sample = """```python
