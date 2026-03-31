@@ -4662,6 +4662,34 @@ result = a + b
             self.assertTrue(lines)
             self.assertTrue(any("/focus <cell|@ref>" in line for line in lines))
 
+        def test_normalize_repl_pasted_text_collapses_multiline_traceback(self) -> None:
+            raw = (
+                "run error: boom\r\n"
+                "Traceback (most recent call last):\r\n"
+                "  File \"<stdin>\", line 1, in <module>\r\n"
+                "ValueError: bad value\r\n"
+            )
+            normalized = normalize_repl_pasted_text(raw)
+            self.assertIn("run error: boom", normalized)
+            self.assertIn("\\n Traceback (most recent call last):", normalized)
+            self.assertIn("\\n ValueError: bad value", normalized)
+            self.assertNotIn("\r", normalized)
+            self.assertNotIn("\n", normalized)
+
+        def test_read_bracketed_paste_stops_at_terminator(self) -> None:
+            payload = "first line\nsecond line"
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, (payload + "\x1b[201~tail").encode("utf-8"))
+                os.close(write_fd)
+                write_fd = -1
+                result = read_bracketed_paste(read_fd)
+            finally:
+                os.close(read_fd)
+                if write_fd >= 0:
+                    os.close(write_fd)
+            self.assertEqual(result, payload)
+
         def test_resolve_run_request_rejects_missing_current_cell(self) -> None:
             cell_id, timeout_s, error = resolve_run_request(["/run"], current_cell_id=None)
             self.assertIsNone(cell_id)
@@ -6372,6 +6400,40 @@ def read_escape_sequence(fd: int) -> str:
     return "".join(chunks)
 
 
+def normalize_repl_pasted_text(raw_text: str) -> str:
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return ""
+    text = text.replace("\t", "    ")
+    if "\n" not in text:
+        return text
+    parts = text.split("\n")
+    while parts and not parts[0].strip():
+        parts.pop(0)
+    while parts and not parts[-1].strip():
+        parts.pop()
+    if not parts:
+        return ""
+    return " \\n ".join(parts)
+
+
+def read_bracketed_paste(fd: int) -> str:
+    terminator = "\x1b[201~"
+    chunks: List[str] = []
+    recent = ""
+    while True:
+        piece = os.read(fd, 1)
+        if not piece:
+            break
+        char = piece.decode("utf-8", "ignore")
+        chunks.append(char)
+        recent = (recent + char)[-len(terminator) :]
+        if recent == terminator:
+            joined = "".join(chunks)
+            return joined[: -len(terminator)]
+    return "".join(chunks)
+
+
 def read_live_repl_input(
     prompt: str,
     *,
@@ -6402,6 +6464,18 @@ def read_live_repl_input(
     def reset_completion_state() -> None:
         nonlocal completion_state
         completion_state = None
+
+    def insert_text(text: str) -> None:
+        nonlocal buffer
+        nonlocal cursor
+        nonlocal history_index
+        chunk = str(text or "")
+        if not chunk:
+            return
+        buffer = buffer[:cursor] + chunk + buffer[cursor:]
+        cursor += len(chunk)
+        history_index = len(history_entries)
+        reset_completion_state()
 
     def move_to_input_origin() -> None:
         if last_block_lines > 1:
@@ -6458,6 +6532,8 @@ def read_live_repl_input(
 
     try:
         tty.setraw(fd)
+        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.flush()
         render(panel_hidden=False)
         while True:
             raw = os.read(fd, 1)
@@ -6504,6 +6580,11 @@ def read_live_repl_input(
                 continue
             if ch == "\x1b":
                 sequence = read_escape_sequence(fd)
+                if sequence == "\x1b[200~":
+                    pasted = normalize_repl_pasted_text(read_bracketed_paste(fd))
+                    insert_text(pasted)
+                    render(panel_hidden=False)
+                    continue
                 if sequence == "\x1b":
                     reset_completion_state()
                     render(panel_hidden=True)
@@ -6555,12 +6636,11 @@ def read_live_repl_input(
                 render(panel_hidden=last_panel_hidden)
                 continue
             if ch and ch >= " ":
-                buffer = buffer[:cursor] + ch + buffer[cursor:]
-                cursor += len(ch)
-                history_index = len(history_entries)
-                reset_completion_state()
+                insert_text(ch)
                 render(panel_hidden=False)
     finally:
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
