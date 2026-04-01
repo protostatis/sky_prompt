@@ -1,0 +1,15 @@
+[project]
+name = "sky-prompt"
+version = "0.1.0"
+description = "Minimal terminal CLI to prompt browser chat UIs through a local browser or Sky MCP."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+unchained = ["unchainedsky-cli"]
+pyreplab = ["pyreplab"]
+
+[tool.uv]
+package = false
