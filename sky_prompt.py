@@ -4703,6 +4703,48 @@ result = a + b
             self.assertEqual([str(ref.get("handle") or "") for ref in refs], ["@1", "@2"])
             self.assertEqual([str(ref.get("cell_id") or "") for ref in refs], ["py1", "sh1"])
 
+        def test_build_turn_action_refs_uses_distinct_cells_when_source_ids_repeat(self) -> None:
+            turn_result: Dict[str, Any] = {
+                "assistant_text": "",
+                "artifacts": {
+                    "response_items": [
+                        {
+                            "id": "code_inferred_1",
+                            "type": "code_block",
+                            "language": "python",
+                            "content": "print(1)",
+                            "executable": True,
+                        },
+                        {
+                            "id": "code_inferred_1",
+                            "type": "code_block",
+                            "language": "python",
+                            "content": "print(2)",
+                            "executable": True,
+                        },
+                    ]
+                },
+            }
+            created_cells = [
+                {
+                    "id": "py1",
+                    "kind": "code_block",
+                    "source_id": "code_inferred_1",
+                    "language": "python",
+                    "content": "print(1)",
+                },
+                {
+                    "id": "py2",
+                    "kind": "code_block",
+                    "source_id": "code_inferred_1",
+                    "language": "python",
+                    "content": "print(2)",
+                },
+            ]
+            refs = build_turn_action_refs(turn_result, created_cells)
+            self.assertEqual([str(ref.get("handle") or "") for ref in refs], ["@1", "@2"])
+            self.assertEqual([str(ref.get("cell_id") or "") for ref in refs], ["py1", "py2"])
+
         def test_render_interactive_turn_output_inlines_action_refs(self) -> None:
             assistant_text = "Python\nx = 1\nprint(x)\n"
             turn_result: Dict[str, Any] = {
@@ -4771,7 +4813,37 @@ result = a + b
             )
             self.assertTrue(panel)
             self.assertIn("preview>", panel[0])
+            self.assertGreater(len(panel), 1)
+            self.assertIn("```python", panel)
+            self.assertIn("print(x)", "\n".join(panel))
+
+        def test_build_live_repl_panel_lines_shows_run_summary_without_target(self) -> None:
+            assistant_text = "Python\nx = 1\nprint(x)\n\nDone\n"
+            turn_result: Dict[str, Any] = {
+                "assistant_text": assistant_text,
+                "artifacts": build_response_artifacts(assistant_text),
+            }
+            store: Dict[str, Dict[str, Any]] = {}
+            order: List[str] = []
+            counters: Dict[str, int] = {}
+            new_cells = register_turn_cells(turn_result, 1, store, order, counters)
+            refs = build_turn_action_refs(turn_result, new_cells)
+            turn_view = build_interactive_turn_view(
+                assistant_text=assistant_text,
+                output_format="markdown",
+                artifacts=turn_result.get("artifacts"),
+                action_refs=refs,
+            )
+            panel = build_live_repl_panel_lines(
+                "/run ",
+                current_cell_id="py1",
+                action_refs=refs,
+                action_ref_index=build_action_ref_index(refs),
+                turn_view=turn_view,
+            )
+            self.assertTrue(panel)
             self.assertEqual(len(panel), 1)
+            self.assertIn("preview>", panel[0])
             self.assertIn("print(x)", panel[0])
 
         def test_build_live_repl_panel_lines_shows_help_list_for_slash(self) -> None:
@@ -6103,27 +6175,65 @@ def build_turn_action_refs(
         artifacts = build_response_artifacts(str(turn_result.get("assistant_text") or ""))
         turn_result["artifacts"] = artifacts
 
-    source_to_cell: Dict[str, Dict[str, Any]] = {}
+    source_to_cells: Dict[str, List[Dict[str, Any]]] = {}
     for cell in created_cells:
         source_id = str(cell.get("source_id") or "").strip()
-        if source_id and source_id not in source_to_cell:
-            source_to_cell[source_id] = cell
+        if source_id:
+            source_to_cells.setdefault(source_id, []).append(cell)
+
+    def item_language(item: Dict[str, Any]) -> str:
+        return normalize_code_language(str(item.get("language") or "")) or "text"
+
+    def item_content(item: Dict[str, Any]) -> str:
+        return str(item.get("content") or "").strip("\n")
+
+    def find_matching_cell(
+        item: Dict[str, Any],
+        used_cell_ids: Set[str],
+    ) -> Optional[Dict[str, Any]]:
+        source_id = str(item.get("id") or "").strip()
+        item_kind = str(item.get("type") or "").strip()
+        language = item_language(item)
+        content = item_content(item)
+
+        for candidate in list(source_to_cells.get(source_id, [])):
+            candidate_id = str(candidate.get("id") or "").strip()
+            if candidate_id and candidate_id not in used_cell_ids:
+                return candidate
+
+        for candidate in created_cells:
+            candidate_id = str(candidate.get("id") or "").strip()
+            if candidate_id and candidate_id in used_cell_ids:
+                continue
+            if str(candidate.get("kind") or "").strip() != item_kind:
+                continue
+            candidate_language = normalize_code_language(str(candidate.get("language") or "")) or "text"
+            if candidate_language != language:
+                continue
+            candidate_content = str(candidate.get("content") or "").strip("\n")
+            if candidate_content == content:
+                return candidate
+        return None
 
     refs: List[Dict[str, Any]] = []
     next_index = 1
+    used_cell_ids: Set[str] = set()
     for item in list(artifacts.get("response_items") or []):
         if str(item.get("type") or "") not in {"code_block", "command_block"}:
             continue
         if not bool(item.get("executable")):
             continue
         source_id = str(item.get("id") or "").strip()
-        cell = source_to_cell.get(source_id)
+        cell = find_matching_cell(item, used_cell_ids)
         if not isinstance(cell, dict):
             continue
+        cell_id = str(cell.get("id") or "").strip()
+        if cell_id:
+            used_cell_ids.add(cell_id)
         refs.append(
             {
                 "handle": f"@{next_index}",
-                "cell_id": str(cell.get("id") or ""),
+                "cell_id": cell_id,
                 "source_id": source_id,
                 "language": normalize_code_language(str(item.get("language") or "")) or "text",
                 "kind": str(item.get("type") or ""),
@@ -7192,6 +7302,15 @@ def build_live_repl_panel_lines(
             raw_target = None
             if len(tokens) >= 2:
                 raw_target = str(tokens[1] or "")
+            if raw_target:
+                preview = build_live_ref_preview_lines(
+                    raw_target,
+                    current_cell_id=current_cell_id,
+                    action_ref_index=action_ref_index,
+                    turn_view=turn_view,
+                )
+                if preview:
+                    return preview
             preview = build_live_ref_preview_summary_lines(
                 raw_target,
                 current_cell_id=current_cell_id,
@@ -7545,17 +7664,13 @@ def read_live_repl_input(
     cursor = 0
     history_index = len(history_entries)
     history_draft = ""
-    last_block_lines = 1
     last_panel_hidden = False
     completion_state: Optional[Dict[str, Any]] = None
-    completion_panel_hidden = False
     history_view_from_start = False
 
     def reset_completion_state() -> None:
         nonlocal completion_state
-        nonlocal completion_panel_hidden
         completion_state = None
-        completion_panel_hidden = False
 
     def insert_text(text: str) -> None:
         nonlocal buffer
@@ -7572,12 +7687,9 @@ def read_live_repl_input(
         reset_completion_state()
 
     def move_to_input_origin() -> None:
-        if last_block_lines > 1:
-            sys.stdout.write(f"\x1b[{last_block_lines - 1}A")
         sys.stdout.write("\r")
 
     def render(panel_hidden: bool = False) -> None:
-        nonlocal last_block_lines
         nonlocal last_panel_hidden
         width = shutil.get_terminal_size((100, 24)).columns
         input_line, cursor_col = format_repl_input_line(
@@ -7588,7 +7700,7 @@ def read_live_repl_input(
             prefer_start=history_view_from_start,
         )
         panel_lines: List[str] = []
-        effective_panel_hidden = bool(panel_hidden or completion_panel_hidden)
+        effective_panel_hidden = bool(panel_hidden)
         if not effective_panel_hidden and callable(panel_builder):
             try:
                 raw_panel_lines = list(panel_builder(buffer, cursor) or [])
@@ -7610,7 +7722,6 @@ def read_live_repl_input(
         if cursor_col > 0:
             sys.stdout.write(f"\x1b[{cursor_col}C")
         sys.stdout.flush()
-        last_block_lines = 1 + len(panel_lines)
         last_panel_hidden = effective_panel_hidden
 
     def finalize_line() -> None:
@@ -7619,15 +7730,10 @@ def read_live_repl_input(
         sys.stdout.write(f"{prompt}{buffer}\r\n")
         sys.stdout.flush()
 
-    def show_panel() -> None:
-        nonlocal completion_panel_hidden
-        completion_panel_hidden = False
-
     def apply_completion() -> bool:
         nonlocal buffer
         nonlocal cursor
         nonlocal completion_state
-        nonlocal completion_panel_hidden
         next_buffer, next_cursor, next_state = apply_repl_completion_state(
             buffer,
             cursor,
@@ -7641,8 +7747,6 @@ def read_live_repl_input(
             or next_state != completion_state
         )
         buffer, cursor, completion_state = next_buffer, next_cursor, next_state
-        if changed:
-            completion_panel_hidden = True
         return changed
 
     try:
@@ -7686,12 +7790,10 @@ def read_live_repl_input(
                 render(panel_hidden=False)
                 continue
             if ch == "\x01":
-                show_panel()
                 cursor = 0
                 render(panel_hidden=False)
                 continue
             if ch == "\x05":
-                show_panel()
                 cursor = len(buffer)
                 render(panel_hidden=False)
                 continue
@@ -7731,31 +7833,26 @@ def read_live_repl_input(
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[C", "\x1bOC"}:
-                    show_panel()
                     history_view_from_start = False
                     cursor = min(len(buffer), cursor + 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[D", "\x1bOD"}:
-                    show_panel()
                     history_view_from_start = False
                     cursor = max(0, cursor - 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[H", "\x1bOH"}:
-                    show_panel()
                     history_view_from_start = False
                     cursor = 0
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[F", "\x1bOF"}:
-                    show_panel()
                     history_view_from_start = False
                     cursor = len(buffer)
                     render(panel_hidden=False)
                     continue
                 if sequence == "\x1b[3~":
-                    show_panel()
                     if cursor < len(buffer):
                         buffer = buffer[:cursor] + buffer[cursor + 1 :]
                         history_view_from_start = False
