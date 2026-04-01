@@ -478,6 +478,17 @@ def describe_browser_launch_target(profile: str, launch_mode: str) -> str:
     return f"profile {str(profile or DEFAULT_CHROME_PROFILE)}"
 
 
+def format_command_for_display(command: Sequence[Any]) -> str:
+    parts = [str(part) for part in command or [] if str(part)]
+    if not parts:
+        return ""
+    first = parts[0]
+    first_name = Path(first).name if "/" in first or "\\" in first else first
+    if first_name == "pyreplab":
+        parts[0] = "pyreplab"
+    return " ".join(parts)
+
+
 def build_text_tool_result(stdout_text: str) -> Dict[str, Any]:
     return {
         "content": [
@@ -5432,6 +5443,10 @@ result = a + b
             )
             self.assertIn("Chrome started", output)
 
+        def test_format_command_for_display_shortens_pyreplab_path(self) -> None:
+            rendered = format_command_for_display(["/Users/demo/.local/bin/pyreplab", "run"])
+            self.assertEqual(rendered, "pyreplab run")
+
         def test_launch_chatgpt_with_unchained_builds_guest_command(self) -> None:
             with mock.patch("subprocess.run") as run_mock:
                 run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
@@ -9613,7 +9628,7 @@ def run_repl(
                 )
                 if not result.get("ok"):
                     print(f"pyreplab passthrough error: {result.get('error')}")
-                command = " ".join(result.get("command") or [])
+                command = format_command_for_display(result.get("command") or [])
                 exit_code = int(result.get("exit_code", 0))
                 print(f"pyreplab> file={script_path} exit={exit_code} cmd={command}")
                 stdout_text = str(result.get("stdout") or "").strip()
@@ -9641,7 +9656,7 @@ def run_repl(
                 )
                 if not result.get("ok"):
                     print(f"pyreplab passthrough error: {result.get('error')}")
-                command = " ".join(result.get("command") or [])
+                command = format_command_for_display(result.get("command") or [])
                 exit_code = int(result.get("exit_code", 0))
                 print(f"pyreplab> exit={exit_code} cmd={command}")
                 stdout_text = str(result.get("stdout") or "").strip()
@@ -9830,7 +9845,7 @@ def run_repl(
                         print("stderr>")
                         print(stderr_text)
                     continue
-                command = " ".join(result.get("command") or [])
+                command = format_command_for_display(result.get("command") or [])
                 exit_code = int(result.get("exit_code", 0))
                 backend_used = str(result.get("backend") or run_backend_mode)
                 print(f"run> {cell.get('id')} backend={backend_used} exit={exit_code} cmd={command}")
