@@ -1,15 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sky-prompt"
 version = "0.1.0"
 description = "Minimal terminal CLI to prompt browser chat UIs through a local browser or Sky MCP."
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9"
-dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "SkyPrompt contributors" }]
+keywords = ["cli", "browser", "chatgpt", "automation", "terminal"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "unchainedsky-cli",
+    "pyreplab",
+]
 
-[project.optional-dependencies]
-unchained = ["unchainedsky-cli"]
-pyreplab = ["pyreplab"]
+[project.urls]
+Homepage = "https://github.com/protostatis/sky_prompt"
+Repository = "https://github.com/protostatis/sky_prompt"
+Issues = "https://github.com/protostatis/sky_prompt/issues"
 
-[tool.uv]
-package = false
+[project.scripts]
+sky = "sky_prompt:main"
+
+[tool.setuptools]
+py-modules = ["sky_prompt"]

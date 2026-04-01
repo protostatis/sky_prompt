@@ -50,6 +50,7 @@ DEFAULT_RUN_BACKEND = "pyreplab"
 DEFAULT_UNCHAINED_PORT = int(os.getenv("UNCHAINED_PORT") or "9222")
 DEFAULT_BROWSER_TAB = "auto"
 DEFAULT_CHROME_PROFILE = str(os.getenv("SKY_CHROME_PROFILE") or "Default").strip() or "Default"
+SUPPORTED_BROWSER_LAUNCH_MODES = ("profile", "incognito", "guest")
 SUPPORTED_RUN_BACKENDS = ("local", "pyreplab")
 SUPPORTED_OUTPUT_FORMATS = ("markdown", "plain", "json")
 ANSI_RESET = "\033[0m"
@@ -448,6 +449,35 @@ def resolve_uv_command() -> Optional[List[str]]:
     return None
 
 
+def cli_command_name() -> str:
+    return str(os.getenv("SKY_CLI_NAME") or Path(sys.argv[0] or "sky").name or "sky")
+
+
+def normalize_browser_launch_mode(raw_mode: Optional[str]) -> str:
+    mode = str(raw_mode or "profile").strip().lower()
+    if mode not in SUPPORTED_BROWSER_LAUNCH_MODES:
+        return "profile"
+    return mode
+
+
+def render_unchained_launch_args(profile: str, launch_mode: str) -> str:
+    mode = normalize_browser_launch_mode(launch_mode)
+    if mode == "guest":
+        return "launch --chrome-arg=--guest"
+    if mode == "incognito":
+        return "launch --chrome-arg=--incognito"
+    return f'launch --use-profile --profile {shlex.quote(str(profile or DEFAULT_CHROME_PROFILE))}'
+
+
+def describe_browser_launch_target(profile: str, launch_mode: str) -> str:
+    mode = normalize_browser_launch_mode(launch_mode)
+    if mode == "guest":
+        return "guest mode"
+    if mode == "incognito":
+        return "incognito mode"
+    return f"profile {str(profile or DEFAULT_CHROME_PROFILE)}"
+
+
 def build_text_tool_result(stdout_text: str) -> Dict[str, Any]:
     return {
         "content": [
@@ -466,6 +496,7 @@ class LocalCLIClient:
         port: int = DEFAULT_UNCHAINED_PORT,
         tab: str = DEFAULT_BROWSER_TAB,
         chrome_profile: str = DEFAULT_CHROME_PROFILE,
+        browser_launch_mode: str = "profile",
         startup_url: str = DEFAULT_URL,
         auto_launch: bool = False,
         timeout: int = 45,
@@ -475,6 +506,7 @@ class LocalCLIClient:
         self.port = int(port)
         self.tab = str(tab or DEFAULT_BROWSER_TAB)
         self.chrome_profile = str(chrome_profile or DEFAULT_CHROME_PROFILE)
+        self.browser_launch_mode = normalize_browser_launch_mode(browser_launch_mode)
         self.startup_url = str(startup_url or DEFAULT_URL)
         self.auto_launch = bool(auto_launch)
         self.timeout = int(timeout)
@@ -485,7 +517,7 @@ class LocalCLIClient:
     def initialize(self) -> None:
         if not self.command:
             raise MCPError(
-                "unchained CLI not found. Run `./sky --setup`, install it with "
+                f"unchained CLI not found. Run `{cli_command_name()} --setup`, install it with "
                 "`uv tool install unchainedsky-cli`, or pass --unchained-cmd."
             )
         try:
@@ -496,6 +528,7 @@ class LocalCLIClient:
                     self.command,
                     port=self.port,
                     profile=self.chrome_profile,
+                    launch_mode=self.browser_launch_mode,
                     url=self.startup_url,
                     timeout_s=max(20, self.timeout),
                 )
@@ -505,7 +538,7 @@ class LocalCLIClient:
                 return
             launch_hint = (
                 f"Start a browser first with: {' '.join(self.command)} --port {self.port} "
-                f"launch --use-profile --profile {self.chrome_profile} {self.startup_url}"
+                f"{render_unchained_launch_args(self.chrome_profile, self.browser_launch_mode)} {self.startup_url}"
             )
             raise MCPError(f"{exc}\n{launch_hint}") from exc
 
@@ -605,7 +638,7 @@ class LocalCLIClient:
             )
         except FileNotFoundError as exc:
             raise MCPError(
-                "unchained CLI not found. Run `./sky --setup`, install it with "
+                f"unchained CLI not found. Run `{cli_command_name()} --setup`, install it with "
                 "`uv tool install unchainedsky-cli`, or pass --unchained-cmd."
             ) from exc
         except subprocess.TimeoutExpired as exc:
@@ -626,7 +659,7 @@ def install_python_tool_with_uv(
 ) -> None:
     if not uv_cmd:
         raise MCPError(
-            "uv is not installed. Install uv first, then rerun `./sky --setup`."
+            f"uv is not installed. Install uv first, then rerun `{cli_command_name()} --setup`."
         )
     command = list(uv_cmd) + [
         "tool",
@@ -647,7 +680,7 @@ def install_python_tool_with_uv(
         )
     except FileNotFoundError as exc:
         raise MCPError(
-            "uv is not installed. Install uv first, then rerun `./sky --setup`."
+            f"uv is not installed. Install uv first, then rerun `{cli_command_name()} --setup`."
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise MCPError(f"uv tool install timed out after {int(timeout_s)}s") from exc
@@ -690,7 +723,7 @@ def ensure_local_setup_tooling(
     if not resolved_unchained_cmd:
         raise MCPError(
             "setup completed but unchained was still not found. "
-            "Try `./sky --unchained-cmd ~/.local/bin/unchained`."
+            f"Try `{cli_command_name()} --unchained-cmd ~/.local/bin/unchained`."
         )
 
     if not resolved_pyreplab_cmd:
@@ -713,6 +746,7 @@ def launch_chatgpt_with_unchained(
     unchained_cmd: Sequence[str],
     port: int,
     profile: str,
+    launch_mode: str = "profile",
     url: str = DEFAULT_URL,
     timeout_s: int = 60,
 ) -> str:
@@ -722,11 +756,21 @@ def launch_chatgpt_with_unchained(
         "--port",
         str(int(port)),
         "launch",
-        "--use-profile",
-        "--profile",
-        str(profile or DEFAULT_CHROME_PROFILE),
-        str(url or DEFAULT_URL),
     ]
+    mode = normalize_browser_launch_mode(launch_mode)
+    if mode == "guest":
+        command.append("--chrome-arg=--guest")
+    elif mode == "incognito":
+        command.append("--chrome-arg=--incognito")
+    else:
+        command.extend(
+            [
+                "--use-profile",
+                "--profile",
+                str(profile or DEFAULT_CHROME_PROFILE),
+            ]
+        )
+    command.append(str(url or DEFAULT_URL))
     try:
         proc = subprocess.run(
             command,
@@ -5368,6 +5412,7 @@ result = a + b
                     ["unchained"],
                     port=9333,
                     profile="Profile 3",
+                    launch_mode="profile",
                     url="https://chatgpt.com",
                     timeout_s=10,
                 )
@@ -5386,6 +5431,54 @@ result = a + b
                 ],
             )
             self.assertIn("Chrome started", output)
+
+        def test_launch_chatgpt_with_unchained_builds_guest_command(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
+                launch_chatgpt_with_unchained(
+                    ["unchained"],
+                    port=9334,
+                    profile="Default",
+                    launch_mode="guest",
+                    url="https://chatgpt.com",
+                    timeout_s=10,
+                )
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "unchained",
+                    "--port",
+                    "9334",
+                    "launch",
+                    "--chrome-arg=--guest",
+                    "https://chatgpt.com",
+                ],
+            )
+
+        def test_launch_chatgpt_with_unchained_builds_incognito_command(self) -> None:
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
+                launch_chatgpt_with_unchained(
+                    ["unchained"],
+                    port=9335,
+                    profile="Profile 3",
+                    launch_mode="incognito",
+                    url="https://chatgpt.com",
+                    timeout_s=10,
+                )
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "unchained",
+                    "--port",
+                    "9335",
+                    "launch",
+                    "--chrome-arg=--incognito",
+                    "https://chatgpt.com",
+                ],
+            )
 
         def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
             client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
@@ -5406,6 +5499,20 @@ result = a + b
             self.assertIn("Chrome not running on port 9222", str(exc.exception))
             self.assertIn("launch --use-profile", str(exc.exception))
 
+        def test_local_cli_client_initialize_guest_hint_mentions_guest(self) -> None:
+            client = LocalCLIClient(
+                ["unchained"],
+                port=9222,
+                tab="auto",
+                browser_launch_mode="guest",
+                timeout=5,
+            )
+            with mock.patch("subprocess.run") as run_mock:
+                run_mock.return_value = mock.Mock(returncode=1, stdout="", stderr="Chrome not running on port 9222\n")
+                with self.assertRaises(MCPError) as exc:
+                    client.initialize()
+            self.assertIn("launch --chrome-arg=--guest", str(exc.exception))
+
         def test_local_cli_client_initialize_auto_launches_browser(self) -> None:
             module_name = LocalCLIClient.__module__
             client = LocalCLIClient(
@@ -5413,6 +5520,7 @@ result = a + b
                 port=9224,
                 tab="auto",
                 chrome_profile="Profile 3",
+                browser_launch_mode="profile",
                 startup_url="https://chatgpt.com",
                 auto_launch=True,
                 timeout=5,
@@ -5434,6 +5542,7 @@ result = a + b
                 ["unchained"],
                 port=9224,
                 profile="Profile 3",
+                launch_mode="profile",
                 url="https://chatgpt.com",
                 timeout_s=20,
             )
@@ -5442,7 +5551,7 @@ result = a + b
             client = LocalCLIClient([], port=9222, tab="auto", timeout=5)
             with self.assertRaises(MCPError) as exc:
                 client.initialize()
-            self.assertIn("./sky --setup", str(exc.exception))
+            self.assertIn("--setup", str(exc.exception))
 
         def test_resolve_pyreplab_command_explicit(self) -> None:
             resolved = resolve_pyreplab_command("pyreplab --workdir /tmp/demo")
@@ -10479,7 +10588,18 @@ def main() -> int:
     parser.add_argument(
         "--chrome-profile",
         default=DEFAULT_CHROME_PROFILE,
-        help="Chrome profile used by --setup and automatic local browser launch (default: Default).",
+        help="Chrome profile used by --setup and automatic local browser launch in profile mode (default: Default).",
+    )
+    launch_mode_group = parser.add_mutually_exclusive_group()
+    launch_mode_group.add_argument(
+        "--incognito",
+        action="store_true",
+        help="Auto-launch a fresh Chrome window in incognito mode instead of reusing a named profile.",
+    )
+    launch_mode_group.add_argument(
+        "--guest",
+        action="store_true",
+        help="Auto-launch Chrome in guest mode instead of reusing a named profile.",
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Sky MCP endpoint (transport=sky-mcp).")
     parser.add_argument("--api-key", help="Sky API key (transport=sky-mcp).")
@@ -10544,6 +10664,12 @@ def main() -> int:
     if args.pyreplab:
         args.run_backend = "pyreplab"
 
+    browser_launch_mode = "profile"
+    if args.incognito:
+        browser_launch_mode = "incognito"
+    elif args.guest:
+        browser_launch_mode = "guest"
+
     if args.setup_alias:
         target_script = Path(__file__).resolve()
         alias_dir = Path(args.alias_dir).expanduser()
@@ -10605,12 +10731,14 @@ def main() -> int:
             print(f"setup: PATH missing {alias_dir}")
             print(f'setup: add this to your shell rc: export PATH="{alias_dir}:$PATH"')
         print(
-            f"setup: launching ChatGPT on port {args.unchained_port} with profile {args.chrome_profile}"
+            "setup: launching ChatGPT on port "
+            f"{args.unchained_port} with {describe_browser_launch_target(args.chrome_profile, browser_launch_mode)}"
         )
         launch_output = launch_chatgpt_with_unchained(
             resolved_unchained_cmd,
             port=args.unchained_port,
             profile=args.chrome_profile,
+            launch_mode=browser_launch_mode,
             url=args.url,
             timeout_s=60,
         )
@@ -10702,6 +10830,7 @@ def main() -> int:
             port=args.unchained_port,
             tab=args.browser_tab,
             chrome_profile=args.chrome_profile,
+            browser_launch_mode=browser_launch_mode,
             startup_url=args.url,
             auto_launch=True,
             timeout=args.timeout,
@@ -10711,7 +10840,8 @@ def main() -> int:
     client.initialize()
     if transport == "unchained" and getattr(client, "did_auto_launch", False):
         print(
-            f"browser: launched {args.url} on port {args.unchained_port} with profile {args.chrome_profile}"
+            "browser: launched "
+            f"{args.url} on port {args.unchained_port} with {describe_browser_launch_target(args.chrome_profile, browser_launch_mode)}"
         )
         launch_output = str(getattr(client, "last_launch_output", "") or "").strip()
         if launch_output:

@@ -17,40 +17,40 @@ Released under the MIT License. See [`LICENSE`](./LICENSE).
 
 ## Install
 
+Requires Python 3.10+.
+
 ```bash
-git clone https://github.com/protostatis/sky_prompt.git
-cd sky_prompt
-./sky --setup
+pip install sky-prompt
+sky --setup
 ```
 
-`./sky --setup` will:
+`sky --setup` will:
 
-- install `unchainedsky-cli` and `pyreplab` with `uv` if they are missing
+- install `unchainedsky-cli` and `pyreplab` if they are missing
 - install a `sky` launcher in `~/.local/bin` when possible
 - launch Chrome to `https://chatgpt.com`
 - tell you the next `sky` command to run
 
 If `pyreplab` install fails, setup still completes and interactive `/run` falls back to `local` until `pyreplab` is installed.
 
-If `uv` is not installed yet:
+If you want to run from a git checkout instead of PyPI:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/protostatis/sky_prompt.git
+cd sky_prompt
 ./sky --setup
 ```
 
-Optional manual install paths:
+Optional manual dependency installs:
 
 ```bash
-uv tool install unchainedsky-cli
-uv tool install pyreplab
-uv sync --extra unchained
+pip install unchainedsky-cli pyreplab
 ```
 
-Optional repo-local `pyreplab` dependency with `uv`:
+Optional repo-local development install with `uv`:
 
 ```bash
-uv sync --extra pyreplab
+uv sync
 ```
 
 Custom alias setup if you want a second command name such as `sk`:
@@ -65,10 +65,10 @@ sk --help
 1. Run setup:
 
 ```bash
-./sky --setup
+sky --setup
 ```
 
-2. If ChatGPT is not already logged in for that Chrome profile, finish the login in the opened browser tab.
+2. If ChatGPT is not already logged in for that browser session, finish the login in the opened browser tab.
 
 3. Run a one-shot prompt:
 
@@ -87,39 +87,43 @@ sky -i
 The default transport is:
 
 ```bash
-./sky --transport unchained
+sky --transport unchained
 ```
 
 The simplest path is:
 
 ```bash
-./sky --setup
+sky --setup
 ```
 
 Manual flow if you want more control:
 
 1. `unchained` is installed and available in `PATH`, or you pass `--unchained-cmd`.
 2. `sky` will auto-launch Chrome on `--unchained-port` (default `9222`) if nothing is already listening there.
-3. The selected Chrome profile is logged into the target site.
+3. In the default profile mode, the selected Chrome profile is logged into the target site.
 
 Useful flags:
 
 ```bash
-./sky --setup --chrome-profile "Profile 3"
-./sky --setup --unchained-port 9333
-./sky --unchained-port 9333 "hello"
-./sky --browser-tab auto "hello"
-./sky --unchained-cmd "uvx unchainedsky-cli" "hello"
+sky --setup --chrome-profile "Profile 3"
+sky --setup --incognito
+sky --setup --guest
+sky --setup --unchained-port 9333
+sky --unchained-port 9333 "hello"
+sky --browser-tab auto "hello"
+sky --unchained-cmd "uvx unchainedsky-cli" "hello"
 ```
 
-If `~/.local/bin` is not on `PATH`, `./sky --setup` will still work but your shell will not see the installed `sky` launcher until you add that directory to `PATH`.
+`--incognito` and `--guest` auto-launch a fresh Chrome session instead of reusing a named profile. Those modes usually require logging into ChatGPT again in that window.
+
+If `~/.local/bin` is not on `PATH`, `sky --setup` will still work but your shell may not see the installed `sky` launcher until you add that directory to `PATH`.
 
 ## Legacy Sky MCP Flow
 
 If you still want to use the hosted Sky MCP path:
 
 ```bash
-./sky --transport sky-mcp -p "Explain MCP in one paragraph"
+sky --transport sky-mcp -p "Explain MCP in one paragraph"
 ```
 
 Credentials are read from `~/sky-agent/.env` or the environment:
@@ -155,13 +159,13 @@ now summarize in 3 bullets
 One-shot prompt:
 
 ```bash
-./sky "Summarize MCP in one paragraph"
+sky "Summarize MCP in one paragraph"
 ```
 
 Interactive shell mode (default when no prompt is passed):
 
 ```bash
-./sky
+sky
 ```
 
 Inside `-i`, Up/Down arrows recall your previous prompts (saved in `~/.sky_prompt_history`).
@@ -169,41 +173,41 @@ Inside `-i`, Up/Down arrows recall your previous prompts (saved in `~/.sky_promp
 Explicit flags:
 
 ```bash
-./sky -prompt "Hello from prompt mode"
-./sky -chat
+sky -prompt "Hello from prompt mode"
+sky -chat
 ```
 
 Read prompt from stdin:
 
 ```bash
 echo "Write a haiku about browser automation" | \
-./sky
+sky
 ```
 
 Fill only, do not submit:
 
 ```bash
-./sky --no-submit "Draft text only"
+sky --no-submit "Draft text only"
 ```
 
 Tune response waiting:
 
 ```bash
-./sky --wait-timeout 240 --poll-interval 1.0 "Long response request"
+sky --wait-timeout 240 --poll-interval 1.0 "Long response request"
 ```
 
 Use another website:
 
 ```bash
-./sky --url https://chatgpt.com "What is MCP?"
+sky --url https://chatgpt.com "What is MCP?"
 ```
 
 Choose output formatting:
 
 ```bash
-./sky --output-format markdown "Explain MCP"
-./sky --output-format plain "Explain MCP"
-./sky --output-format json "Explain MCP"
+sky --output-format markdown "Explain MCP"
+sky --output-format plain "Explain MCP"
+sky --output-format json "Explain MCP"
 ```
 
 `json` mode includes structured artifacts for automation:
@@ -228,18 +232,18 @@ Developer test loop (recommended while iterating):
 
 ## Custom Alias Setup
 
-`./sky --setup` already tries to install `sky` into `~/.local/bin`.
+`sky --setup` already tries to install `sky` into `~/.local/bin`.
 Use this when you want a second command name instead, for example `sk`:
 
 ```bash
-./sky --setup-alias sk
+sky --setup-alias sk
 ```
 
 Optional flags:
 
 ```bash
-./sky --setup-alias sk --alias-dir ~/.local/bin
-./sky --setup-alias sk --force-alias
+sky --setup-alias sk --alias-dir ~/.local/bin
+sky --setup-alias sk --force-alias
 ```
 
 Then run:
@@ -296,19 +300,19 @@ Each `-i` session uses its own isolated pyreplab session directory to avoid cros
 Use an explicit `pyreplab` command path:
 
 ```bash
-./sky -i --run-backend pyreplab --pyreplab-cmd /path/to/pyreplab
+sky -i --run-backend pyreplab --pyreplab-cmd /path/to/pyreplab
 # or set PYREPLAB_CMD and use /backend pyreplab inside -i
 ```
 
 Fast launch shortcut:
 
 ```bash
-./sky -i --pyreplab
+sky -i --pyreplab
 ```
 
 ## Add To PATH
 
-If `./sky --setup` reported that `~/.local/bin` is missing from `PATH`, add it:
+If `sky --setup` reported that `~/.local/bin` is missing from `PATH`, add it:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -322,7 +326,7 @@ sky "Explain what an MCP session id is"
 
 ## Notes
 
-- For the default `unchained` transport, you must already be logged into the target site in the Chrome profile you launched.
+- For the default `unchained` transport, profile mode reuses the Chrome profile you launched. `--incognito` and `--guest` create a fresh browser session instead.
 - `SKY_API_KEY`, `SKY_AGENT_ID`, and `~/sky-agent/.env` only matter when you opt into `--transport sky-mcp`.
 - `sky` talks to a browser tab, not the OpenAI API directly. For ChatGPT usage, the only account dependency is your normal web login session.
 - The main CLI is intended to work on macOS and Linux anywhere `unchainedsky-cli`, Chrome, and Python are available.
