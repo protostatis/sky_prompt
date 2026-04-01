@@ -1341,6 +1341,47 @@ def build_assistant_probe_expression() -> str:
     return cleanText(node.innerText || node.textContent || "");
   }
 
+  function currentInputText(el) {
+    if (!el) return "";
+    if ("value" in el) return String(el.value || "");
+    return String(el.textContent || "");
+  }
+
+  function findVisibleInput() {
+    const inputSelectors = [
+      'textarea[placeholder*="message" i]',
+      'textarea',
+      '[contenteditable="true"][role="textbox"]',
+      'div[role="textbox"][contenteditable="true"]',
+      'div[contenteditable="true"]'
+    ];
+    for (const sel of inputSelectors) {
+      const candidates = Array.from(document.querySelectorAll(sel));
+      const input = candidates.find((node) => visible(node));
+      if (input) return input;
+    }
+    return null;
+  }
+
+  function isDisabled(el) {
+    if (!el) return true;
+    if ("disabled" in el && !!el.disabled) return true;
+    return String(el.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+  }
+
+  function findVisibleSendButton() {
+    return Array.from(document.querySelectorAll("button,[role='button']")).find((node) => {
+      if (!visible(node)) return false;
+      const label = String(
+        node.getAttribute("aria-label") ||
+        node.innerText ||
+        node.getAttribute("title") ||
+        ""
+      ).toLowerCase();
+      return /(send prompt|send|submit)/.test(label);
+    }) || null;
+  }
+
   function assistantActionAnchors() {
     const labels = new Set([
       "copy",
@@ -1452,6 +1493,8 @@ def build_assistant_probe_expression() -> str:
   const userTexts = extractUserTexts();
   const latestAssistant = assistantTexts.length ? assistantTexts[assistantTexts.length - 1] : "";
   const latestUser = userTexts.length ? userTexts[userTexts.length - 1] : "";
+  const input = findVisibleInput();
+  const send = findVisibleSendButton();
 
   return JSON.stringify({
     ok: true,
@@ -1464,6 +1507,10 @@ def build_assistant_probe_expression() -> str:
     user_count: userTexts.length,
     latest_user_text: latestUser,
     latest_user_hash: simpleHash(latestUser),
+    composer_visible: !!input,
+    composer_text: cleanText(currentInputText(input)),
+    send_visible: !!send,
+    send_enabled: !!send && !isDisabled(send),
     generating: isGenerating(),
     extractor: "probe_v1"
   });
@@ -5120,6 +5167,8 @@ result = a + b
             self.assertIn("assistant_shell_count", expr)
             self.assertIn("response_nav_count", expr)
             self.assertIn("empty_assistant_shell", expr)
+            self.assertIn("composer_text", expr)
+            self.assertIn("send_enabled", expr)
 
         def test_snapshot_expression_uses_action_anchors_and_avoids_generic_div_candidate(self) -> None:
             expr = build_assistant_snapshot_expression()
@@ -5188,6 +5237,42 @@ result = a + b
             self.assertTrue(state.get("visible"))
             self.assertEqual(read_mock.call_count, 2)
             sleep_mock.assert_called_once()
+
+        def test_probe_indicates_submit_when_composer_cleared(self) -> None:
+            self.assertTrue(
+                probe_indicates_submit(
+                    baseline_probe={"assistant_count": 1, "latest_hash": "same", "user_count": 1, "latest_user_hash": "u1"},
+                    probe={
+                        "assistant_count": 1,
+                        "latest_hash": "same",
+                        "user_count": 1,
+                        "latest_user_hash": "u1",
+                        "composer_text": "",
+                        "send_visible": False,
+                        "send_enabled": False,
+                        "generating": False,
+                    },
+                    expected_prompt="hello, can you teach me a how to build a neural network in numpy",
+                )
+            )
+
+        def test_probe_indicates_submit_rejects_uncleared_composer_without_turn_change(self) -> None:
+            self.assertFalse(
+                probe_indicates_submit(
+                    baseline_probe={"assistant_count": 1, "latest_hash": "same", "user_count": 1, "latest_user_hash": "u1"},
+                    probe={
+                        "assistant_count": 1,
+                        "latest_hash": "same",
+                        "user_count": 1,
+                        "latest_user_hash": "u1",
+                        "composer_text": "hello, can you teach me a how to build a neural network in numpy",
+                        "send_visible": True,
+                        "send_enabled": True,
+                        "generating": False,
+                    },
+                    expected_prompt="hello, can you teach me a how to build a neural network in numpy",
+                )
+            )
 
         def test_dispatch_prompt_prefers_native_submit_when_click_tools_exist(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
@@ -7261,6 +7346,24 @@ def probe_has_new_user_turn(
     return expected_norm[:80] in current_norm or current_norm[:80] in expected_norm
 
 
+def probe_has_cleared_composer(
+    probe: Optional[Dict[str, Any]],
+    expected_prompt: str,
+) -> bool:
+    if not probe:
+        return False
+    expected_norm = normalize_for_match(expected_prompt)
+    if not expected_norm:
+        return False
+    composer_norm = normalize_for_match(str((probe or {}).get("composer_text") or ""))
+    if composer_norm:
+        return False
+    generating = bool((probe or {}).get("generating"))
+    send_visible = bool((probe or {}).get("send_visible"))
+    send_enabled = bool((probe or {}).get("send_enabled"))
+    return generating or (not send_visible) or (not send_enabled)
+
+
 def probe_indicates_submit(
     baseline_probe: Optional[Dict[str, Any]],
     probe: Optional[Dict[str, Any]],
@@ -7269,6 +7372,8 @@ def probe_indicates_submit(
     if not probe:
         return False
     if probe_has_new_user_turn(baseline_probe, probe, expected_prompt):
+        return True
+    if probe_has_cleared_composer(probe, expected_prompt):
         return True
 
     baseline_count = int((baseline_probe or {}).get("assistant_count") or 0)
@@ -7287,10 +7392,7 @@ def wait_for_assistant_response(
     client: MCPClient,
     agent_id: str,
     js_tools: Sequence[str],
-    baseline_count: int,
-    baseline_hash: str,
-    baseline_user_count: int,
-    baseline_user_hash: str,
+    baseline_probe: Optional[Dict[str, Any]],
     expected_prompt: str,
     timeout_s: int,
     poll_interval_s: float,
@@ -7308,6 +7410,10 @@ def wait_for_assistant_response(
     saw_generating = False
     generating_stopped_at: Optional[float] = None
     previous_generating: Optional[bool] = None
+    baseline_count = int((baseline_probe or {}).get("assistant_count") or 0)
+    baseline_hash = str((baseline_probe or {}).get("latest_hash") or "")
+    baseline_user_count = int((baseline_probe or {}).get("user_count") or 0)
+    baseline_user_hash = str((baseline_probe or {}).get("latest_user_hash") or "")
 
     while True:
         elapsed = time.time() - start
@@ -7363,6 +7469,12 @@ def wait_for_assistant_response(
                     expected_norm[:80] in user_norm or user_norm[:80] in expected_norm
                 ):
                     user_submitted = True
+        if not user_submitted and probe_indicates_submit(
+            baseline_probe=baseline_probe,
+            probe=probe,
+            expected_prompt=expected_prompt,
+        ):
+            user_submitted = True
 
         # Some pages don't expose user turns reliably; when generation clearly started and
         # assistant output changed, treat prompt as submitted to avoid false negatives.
@@ -9252,16 +9364,13 @@ def dispatch_prompt(
                 client=client,
                 agent_id=agent_id,
                 js_tools=js_tools,
-                baseline_count=baseline_count,
-                baseline_hash=baseline_hash,
-                baseline_user_count=baseline_user_count,
-                baseline_user_hash=baseline_user_hash,
+                baseline_probe=baseline_probe,
                 expected_prompt=prompt,
                 timeout_s=wait_timeout_s,
                 poll_interval_s=poll_interval_s,
                 debug=show_dispatch_details,
             )
-        if (not user_submitted) and type_tools and (not native_submit_default):
+        if not user_submitted:
             with foreground_browser_context(submit_focus_mode):
                 pre_retry_probe = read_assistant_probe(
                     client=client,
@@ -9278,7 +9387,7 @@ def dispatch_prompt(
                     maybe_latest = str((pre_retry_probe or {}).get("latest_text") or "").strip()
                     if maybe_latest:
                         response_text = maybe_latest
-                else:
+                elif type_tools and (not native_submit_default):
                     retry_status = cdp_fallback_submit(
                         client=client,
                         agent_id=agent_id,
@@ -9296,22 +9405,22 @@ def dispatch_prompt(
                     if show_dispatch_details:
                         print(f"[final-retry] {json.dumps(retry_status)}")
 
-                retry_baseline = read_assistant_probe(
-                    client=client,
-                    agent_id=agent_id,
-                    js_tools=js_tools,
-                    label="final-retry baseline",
-                )
-            if not user_submitted and "retry_baseline" in locals():
+                if not user_submitted and type_tools and (not native_submit_default):
+                    retry_baseline = read_assistant_probe(
+                        client=client,
+                        agent_id=agent_id,
+                        js_tools=js_tools,
+                        label="final-retry baseline",
+                    )
+                else:
+                    retry_baseline = None
+            if not user_submitted and retry_baseline:
                 with foreground_browser_context(poll_focus_mode):
                     response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
                         client=client,
                         agent_id=agent_id,
                         js_tools=js_tools,
-                        baseline_count=int((retry_baseline or {}).get("assistant_count") or 0),
-                        baseline_hash=str((retry_baseline or {}).get("latest_hash") or ""),
-                        baseline_user_count=int((retry_baseline or {}).get("user_count") or 0),
-                        baseline_user_hash=str((retry_baseline or {}).get("latest_user_hash") or ""),
+                        baseline_probe=retry_baseline,
                         expected_prompt=prompt,
                         timeout_s=min(20, max(8, wait_timeout_s)),
                         poll_interval_s=poll_interval_s,
