@@ -1301,6 +1301,464 @@ def build_network_request_spy_dump_expression(limit: int = 12) -> str:
 """.strip()
 
 
+def build_live_response_observer_install_expression() -> str:
+    return """
+(() => {
+  function cleanText(value) {
+    let text = String(value || "");
+    text = text.replace(/\\r\\n/g, "\\n").replace(/\\u00a0/g, " ");
+    text = text.replace(/[ \\t]+/g, " ");
+    text = text.replace(/\\n{3,}/g, "\\n\\n");
+    return text.trim();
+  }
+
+  function simpleHash(value) {
+    let hash = 0;
+    for (let i = 0; i < value.length; i++) {
+      hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+    }
+    return String(hash);
+  }
+
+  function visible(el) {
+    if (!el) return false;
+    if (String(el.getAttribute("aria-hidden") || "").toLowerCase() === "true") return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function pushUnique(target, value) {
+    if (!value) return;
+    const normalized = cleanText(value);
+    if (!normalized) return;
+    if (!target.includes(normalized)) target.push(normalized);
+  }
+
+  function nodeText(node) {
+    if (!node) return "";
+    return cleanText(node.innerText || node.textContent || "");
+  }
+
+  function currentInputText(el) {
+    if (!el) return "";
+    if ("value" in el) return String(el.value || "");
+    return String(el.textContent || "");
+  }
+
+  function findVisibleInput() {
+    const inputSelectors = [
+      'textarea[placeholder*="message" i]',
+      'textarea',
+      '[contenteditable="true"][role="textbox"]',
+      'div[role="textbox"][contenteditable="true"]',
+      'div[contenteditable="true"]'
+    ];
+    for (const sel of inputSelectors) {
+      const candidates = Array.from(document.querySelectorAll(sel));
+      const input = candidates.find((node) => visible(node));
+      if (input) return input;
+    }
+    return null;
+  }
+
+  function isDisabled(el) {
+    if (!el) return true;
+    if ("disabled" in el && !!el.disabled) return true;
+    return String(el.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+  }
+
+  function findVisibleSendButton() {
+    return Array.from(document.querySelectorAll("button,[role='button']")).find((node) => {
+      if (!visible(node)) return false;
+      const label = String(
+        node.getAttribute("aria-label") ||
+        node.innerText ||
+        node.getAttribute("title") ||
+        ""
+      ).toLowerCase();
+      return /(send prompt|send|submit)/.test(label);
+    }) || null;
+  }
+
+  function assistantActionAnchors() {
+    const labels = new Set([
+      "copy",
+      "good response",
+      "bad response",
+      "share",
+      "more actions",
+      "read aloud",
+    ]);
+    return Array.from(document.querySelectorAll('main button, main [role="button"]')).filter((node) => {
+      if (!visible(node)) return false;
+      const label = cleanText(
+        node.innerText ||
+        node.getAttribute("aria-label") ||
+        node.getAttribute("title") ||
+        ""
+      ).toLowerCase();
+      return labels.has(label);
+    });
+  }
+
+  function extractAssistantTexts() {
+    const texts = [];
+
+    for (const node of Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'))) {
+      const t = nodeText(node);
+      if (t.length >= 8) pushUnique(texts, t);
+    }
+
+    if (!texts.length) {
+      for (const turn of Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"], main article, main [role="article"]'))) {
+        const explicitAssistant = turn.querySelector('[data-message-author-role="assistant"]');
+        const explicitUser = turn.querySelector('[data-message-author-role="user"]');
+        if (explicitUser && !explicitAssistant) continue;
+        const candidate = explicitAssistant || turn;
+        const t = nodeText(candidate);
+        if (t.length >= 8) pushUnique(texts, t);
+      }
+    }
+
+    if (!texts.length) {
+      for (const anchor of assistantActionAnchors()) {
+        const block = anchor.closest('[data-testid^="conversation-turn-"], article, section, div');
+        const t = nodeText(block || anchor.parentElement || anchor);
+        if (t.length >= 8) pushUnique(texts, t);
+      }
+    }
+
+    return texts;
+  }
+
+  function extractUserTexts() {
+    const texts = [];
+
+    for (const node of Array.from(document.querySelectorAll('[data-message-author-role="user"]'))) {
+      const t = nodeText(node);
+      if (t.length >= 1) pushUnique(texts, t);
+    }
+
+    if (!texts.length) {
+      for (const turn of Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"], main article, main [role="article"]'))) {
+        const explicitUser = turn.querySelector('[data-message-author-role="user"]');
+        if (!explicitUser) continue;
+        const t = nodeText(explicitUser);
+        if (t.length >= 1) pushUnique(texts, t);
+      }
+    }
+
+    return texts;
+  }
+
+  function isGenerating() {
+    const stopSelectors = [
+      'button[data-testid*="stop" i]',
+      'button[aria-label*="stop" i]',
+      'button[title*="stop" i]',
+      '[aria-label*="stop generating" i]'
+    ];
+    for (const sel of stopSelectors) {
+      const candidates = Array.from(document.querySelectorAll(sel));
+      if (candidates.some((el) => visible(el))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function takeSnapshot() {
+    const assistantTexts = extractAssistantTexts();
+    const userTexts = extractUserTexts();
+    const latestAssistant = assistantTexts.length ? assistantTexts[assistantTexts.length - 1] : "";
+    const latestUser = userTexts.length ? userTexts[userTexts.length - 1] : "";
+    const input = findVisibleInput();
+    const send = findVisibleSendButton();
+    return {
+      assistantCount: assistantTexts.length,
+      latestText: latestAssistant,
+      latestHash: simpleHash(latestAssistant),
+      userCount: userTexts.length,
+      latestUserText: latestUser,
+      latestUserHash: simpleHash(latestUser),
+      composerText: cleanText(currentInputText(input)),
+      sendVisible: !!send,
+      sendEnabled: !!send && !isDisabled(send),
+      generating: isGenerating(),
+    };
+  }
+
+  if (window.__skyResponseObserver && typeof window.__skyResponseObserver.read === "function") {
+    try {
+      window.__skyResponseObserver.refresh("reinstall");
+    } catch (_) {}
+    return JSON.stringify({ ok: true, installed: true, already: true });
+  }
+
+  const observer = {
+    installed: true,
+    turn: 0,
+    turnPreparedTs: 0,
+    turnRequestCount: 0,
+    turnResponseCount: 0,
+    turnActiveRequests: 0,
+    lastTurnEventTs: 0,
+    lastTextChangeTs: 0,
+    latestText: "",
+    latestHash: "",
+    assistantCount: 0,
+    latestUserText: "",
+    latestUserHash: "",
+    userCount: 0,
+    composerText: "",
+    sendVisible: false,
+    sendEnabled: false,
+    generating: false,
+    mutationVersion: 0,
+    pendingRefresh: false,
+    submitDetected: false,
+    baselineAssistantCount: 0,
+    baselineAssistantHash: "",
+    baselineUserCount: 0,
+    baselineUserHash: "",
+    looksRelevant(method, url, body) {
+      const methodText = String(method || "GET").toUpperCase();
+      const urlText = String(url || "").toLowerCase();
+      const bodyText = String(body || "").toLowerCase();
+      if (!urlText && !bodyText) return false;
+      if (/(telemetry|analytics|segment|sentry|statsig|featuregates|track|log)/.test(urlText)) {
+        return false;
+      }
+      if (/(backend-api|conversation|messages|response|responses|prompt|chat)/.test(urlText)) {
+        return true;
+      }
+      if (methodText !== "GET" && bodyText.length >= 80 && /(message|messages|prompt|conversation|model|content)/.test(bodyText)) {
+        return true;
+      }
+      return false;
+    },
+    refresh(reason) {
+      const snapshot = takeSnapshot();
+      const now = Date.now();
+      if (snapshot.latestHash !== this.latestHash || snapshot.assistantCount !== this.assistantCount) {
+        this.lastTextChangeTs = now;
+      }
+      this.latestText = snapshot.latestText;
+      this.latestHash = snapshot.latestHash;
+      this.assistantCount = snapshot.assistantCount;
+      this.latestUserText = snapshot.latestUserText;
+      this.latestUserHash = snapshot.latestUserHash;
+      this.userCount = snapshot.userCount;
+      this.composerText = snapshot.composerText;
+      this.sendVisible = snapshot.sendVisible;
+      this.sendEnabled = snapshot.sendEnabled;
+      this.generating = snapshot.generating;
+      if (reason === "mutation") {
+        this.mutationVersion += 1;
+      }
+      if (
+        this.turnPreparedTs &&
+        !this.submitDetected &&
+        (
+          this.turnRequestCount > 0 ||
+          this.userCount > this.baselineUserCount ||
+          (this.latestUserHash && this.baselineUserHash && this.latestUserHash !== this.baselineUserHash) ||
+          this.generating
+        )
+      ) {
+        this.submitDetected = true;
+      }
+      return snapshot;
+    },
+    scheduleRefresh(reason) {
+      if (this.pendingRefresh) return;
+      this.pendingRefresh = true;
+      window.setTimeout(() => {
+        this.pendingRefresh = false;
+        try {
+          this.refresh(reason || "scheduled");
+        } catch (_) {}
+      }, 0);
+    },
+    trackRequestStart(meta) {
+      if (!meta || !meta.relevant || !this.turnPreparedTs) return;
+      this.turnRequestCount += 1;
+      this.turnActiveRequests += 1;
+      this.lastTurnEventTs = Date.now();
+      this.submitDetected = true;
+    },
+    trackRequestFinish(meta) {
+      if (!meta || !meta.relevant || !this.turnPreparedTs) return;
+      this.turnResponseCount += 1;
+      this.turnActiveRequests = Math.max(0, this.turnActiveRequests - 1);
+      this.lastTurnEventTs = Date.now();
+      this.scheduleRefresh("network");
+    },
+    prepareTurn() {
+      this.refresh("prepare");
+      this.turn += 1;
+      this.turnPreparedTs = Date.now();
+      this.turnRequestCount = 0;
+      this.turnResponseCount = 0;
+      this.turnActiveRequests = 0;
+      this.lastTurnEventTs = this.turnPreparedTs;
+      this.submitDetected = false;
+      this.baselineAssistantCount = this.assistantCount;
+      this.baselineAssistantHash = this.latestHash;
+      this.baselineUserCount = this.userCount;
+      this.baselineUserHash = this.latestUserHash;
+      return this.read();
+    },
+    read() {
+      this.refresh("read");
+      return {
+        ok: true,
+        installed: true,
+        observer: "live_v1",
+        turn: this.turn,
+        prepared: !!this.turnPreparedTs,
+        turn_request_count: this.turnRequestCount,
+        turn_response_count: this.turnResponseCount,
+        turn_active_requests: this.turnActiveRequests,
+        last_turn_event_ts: this.lastTurnEventTs,
+        last_text_change_ts: this.lastTextChangeTs,
+        latest_text: this.latestText,
+        latest_hash: this.latestHash,
+        assistant_count: this.assistantCount,
+        latest_user_text: this.latestUserText,
+        latest_user_hash: this.latestUserHash,
+        user_count: this.userCount,
+        composer_text: this.composerText,
+        send_visible: this.sendVisible,
+        send_enabled: this.sendEnabled,
+        generating: this.generating,
+        mutation_version: this.mutationVersion,
+        submit_detected: this.submitDetected,
+        baseline_assistant_count: this.baselineAssistantCount,
+        baseline_assistant_hash: this.baselineAssistantHash,
+        baseline_user_count: this.baselineUserCount,
+        baseline_user_hash: this.baselineUserHash,
+      };
+    },
+  };
+
+  const mutationTarget = document.documentElement || document.body;
+  if (mutationTarget && typeof MutationObserver !== "undefined") {
+    try {
+      observer.mutationObserver = new MutationObserver(() => observer.scheduleRefresh("mutation"));
+      observer.mutationObserver.observe(mutationTarget, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["aria-busy", "disabled", "aria-disabled"],
+      });
+    } catch (_) {}
+  }
+
+  if (typeof window.fetch === "function" && !window.__skyResponseObserverPatchedFetch) {
+    window.__skyResponseObserverPatchedFetch = true;
+    const originalFetch = window.fetch;
+    window.fetch = function(...args) {
+      const input = args.length ? args[0] : null;
+      const init = args.length > 1 ? args[1] : null;
+      let method = "GET";
+      let url = "";
+      let body = "";
+      try {
+        method = String((init && init.method) || (input && input.method) || "GET");
+      } catch (_) {}
+      try {
+        url = typeof input === "string" ? input : String((input && input.url) || "");
+      } catch (_) {}
+      try {
+        if (init && typeof init.body === "string") {
+          body = init.body;
+        } else if (input && typeof input.body === "string") {
+          body = input.body;
+        }
+      } catch (_) {}
+      const meta = {
+        relevant: observer.looksRelevant(method, url, body),
+        method: method,
+        url: url,
+      };
+      observer.trackRequestStart(meta);
+      const result = originalFetch.apply(this, args);
+      if (!result || typeof result.then !== "function") {
+        return result;
+      }
+      return result.then(
+        (response) => {
+          observer.trackRequestFinish(meta);
+          return response;
+        },
+        (error) => {
+          observer.trackRequestFinish(meta);
+          throw error;
+        }
+      );
+    };
+  }
+
+  if (window.XMLHttpRequest && XMLHttpRequest.prototype && !window.__skyResponseObserverPatchedXHR) {
+    window.__skyResponseObserverPatchedXHR = true;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this.__skyObserverMethod = String(method || "GET");
+      this.__skyObserverUrl = String(url || "");
+      return originalOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+      const bodyText = typeof body === "string" ? body : "";
+      const meta = {
+        relevant: observer.looksRelevant(this.__skyObserverMethod, this.__skyObserverUrl, bodyText),
+        method: String(this.__skyObserverMethod || "GET"),
+        url: String(this.__skyObserverUrl || ""),
+      };
+      this.__skyObserverMeta = meta;
+      observer.trackRequestStart(meta);
+      this.addEventListener("loadend", () => {
+        observer.trackRequestFinish(this.__skyObserverMeta || meta);
+      }, { once: true });
+      return originalSend.call(this, body);
+    };
+  }
+
+  observer.refresh("install");
+  window.__skyResponseObserver = observer;
+  return JSON.stringify({ ok: true, installed: true, already: false });
+})()
+""".strip()
+
+
+def build_live_response_observer_prepare_expression() -> str:
+    return """
+(() => {
+  const observer = window.__skyResponseObserver;
+  if (!observer || typeof observer.prepareTurn !== "function") {
+    return JSON.stringify({ ok: false, error: "missing_observer" });
+  }
+  return JSON.stringify(observer.prepareTurn());
+})()
+""".strip()
+
+
+def build_live_response_observer_read_expression() -> str:
+    return """
+(() => {
+  const observer = window.__skyResponseObserver;
+  if (!observer || typeof observer.read !== "function") {
+    return JSON.stringify({ ok: false, error: "missing_observer" });
+  }
+  return JSON.stringify(observer.read());
+})()
+""".strip()
+
+
 def build_assistant_probe_expression() -> str:
     return """
 (() => {
@@ -2116,6 +2574,73 @@ def read_page_network_request_spy_log(
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
+
+
+def install_live_response_observer(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> bool:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_live_response_observer_install_expression(),
+            label="response observer install",
+        )
+    except MCPError:
+        return False
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    return isinstance(state, dict) and bool(state.get("ok"))
+
+
+def prepare_live_response_observer(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> Dict[str, Any]:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_live_response_observer_prepare_expression(),
+            label="response observer prepare",
+        )
+    except MCPError:
+        return {}
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return {}
+    return state
+
+
+def read_live_response_observer_state(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> Dict[str, Any]:
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression=build_live_response_observer_read_expression(),
+            label="response observer read",
+        )
+    except MCPError:
+        return {}
+
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return {}
+    return state
 
 
 def capture_final_assistant_text(
@@ -5239,6 +5764,14 @@ result = a + b
             self.assertIn("XMLHttpRequest.prototype.open", expr)
             self.assertIn("window.__skyNetworkSpyLog", expr)
 
+        def test_live_response_observer_expression_tracks_turn_state(self) -> None:
+            expr = build_live_response_observer_install_expression()
+            self.assertIn("MutationObserver", expr)
+            self.assertIn("turnActiveRequests", expr)
+            self.assertIn("submitDetected", expr)
+            self.assertIn("looksRelevant", expr)
+            self.assertIn("window.__skyResponseObserver", expr)
+
         def test_read_page_network_request_spy_log_returns_dict_rows(self) -> None:
             with mock.patch(
                 __name__ + ".call_js_expression",
@@ -5258,6 +5791,57 @@ result = a + b
                 rows,
                 [{"kind": "fetch", "url": "https://example.invalid"}, {"bad": True}],
             )
+
+        def test_read_live_response_observer_state_returns_dict(self) -> None:
+            with mock.patch(
+                __name__ + ".call_js_expression",
+                return_value=(
+                    "js_eval",
+                    {},
+                    '{"ok":true,"prepared":true,"latest_text":"hello","turn_active_requests":0}',
+                    {"ok": True, "prepared": True, "latest_text": "hello", "turn_active_requests": 0},
+                ),
+            ):
+                state = read_live_response_observer_state(
+                    client=mock.Mock(),
+                    agent_id="agent-test",
+                    js_tools=["js_eval"],
+                )
+            self.assertEqual(
+                state,
+                {"ok": True, "prepared": True, "latest_text": "hello", "turn_active_requests": 0},
+            )
+
+        def test_emit_response_stream_delta_prints_incremental_suffix(self) -> None:
+            stream_state = {
+                "streamed": False,
+                "ended_with_newline": True,
+                "needs_final_render": False,
+                "last_emitted_text": "",
+            }
+            with mock.patch("builtins.print") as print_mock:
+                emit_response_stream_delta("Hello world", stream_state)
+                emit_response_stream_delta("Hello world!", stream_state)
+            self.assertTrue(stream_state.get("streamed"))
+            self.assertEqual(stream_state.get("last_emitted_text"), "Hello world!")
+            self.assertFalse(stream_state.get("needs_final_render"))
+            self.assertEqual(len(print_mock.call_args_list), 3)
+            self.assertIn("assistant>", print_mock.call_args_list[0].args[0])
+            self.assertEqual(print_mock.call_args_list[1].args[0], "Hello world")
+            self.assertEqual(print_mock.call_args_list[2].args[0], "!")
+
+        def test_emit_response_stream_delta_marks_rewrite_for_final_render(self) -> None:
+            stream_state = {
+                "streamed": False,
+                "ended_with_newline": True,
+                "needs_final_render": False,
+                "last_emitted_text": "Hello world",
+            }
+            with mock.patch("builtins.print") as print_mock:
+                emit_response_stream_delta("Rewritten answer", stream_state)
+            self.assertTrue(stream_state.get("needs_final_render"))
+            self.assertEqual(stream_state.get("last_emitted_text"), "Rewritten answer")
+            print_mock.assert_not_called()
 
         def test_wait_for_visible_send_button_state_retries_until_visible(self) -> None:
             with mock.patch(
@@ -5318,36 +5902,38 @@ result = a + b
         def test_dispatch_prompt_prefers_native_submit_when_click_tools_exist(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
             with mock.patch(__name__ + ".read_assistant_probe", return_value={}) as probe_mock:
-                with mock.patch(
-                    __name__ + ".cdp_fallback_submit",
-                    return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
-                ) as native_submit_mock:
-                    with mock.patch(__name__ + ".call_js_expression") as call_js_mock:
+                with mock.patch(__name__ + ".install_live_response_observer", return_value=True):
+                    with mock.patch(__name__ + ".prepare_live_response_observer", return_value={"ok": True}):
                         with mock.patch(
-                            __name__ + ".wait_for_assistant_response",
-                            return_value=(None, True, False, True),
-                        ):
-                            with mock.patch(
-                                __name__ + ".capture_final_assistant_text",
-                                return_value=(None, None),
-                            ):
+                            __name__ + ".cdp_fallback_submit",
+                            return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
+                        ) as native_submit_mock:
+                            with mock.patch(__name__ + ".call_js_expression") as call_js_mock:
                                 with mock.patch(
-                                    __name__ + ".summarize_missing_assistant_response",
-                                    return_value="assistant> (timed out waiting after fallback submit)",
+                                    __name__ + ".wait_for_assistant_response",
+                                    return_value=(None, True, False, True),
                                 ):
-                                    with mock.patch("builtins.print"):
-                                        dispatch_prompt(
-                                            client=client,
-                                            agent_id="agent-test",
-                                            prompt="hello",
-                                            js_tools=["js_eval"],
-                                            click_tools=["cdp_click"],
-                                            type_tools=["cdp_type"],
-                                            ddm_tools=["ddm"],
-                                            submit=True,
-                                            layout_text="",
-                                            wait_for_response=True,
-                                        )
+                                    with mock.patch(
+                                        __name__ + ".capture_final_assistant_text",
+                                        return_value=(None, None),
+                                    ):
+                                        with mock.patch(
+                                            __name__ + ".summarize_missing_assistant_response",
+                                            return_value="assistant> (timed out waiting after fallback submit)",
+                                        ):
+                                            with mock.patch("builtins.print"):
+                                                dispatch_prompt(
+                                                    client=client,
+                                                    agent_id="agent-test",
+                                                    prompt="hello",
+                                                    js_tools=["js_eval"],
+                                                    click_tools=["cdp_click"],
+                                                    type_tools=["cdp_type"],
+                                                    ddm_tools=["ddm"],
+                                                    submit=True,
+                                                    layout_text="",
+                                                    wait_for_response=True,
+                                                )
             native_submit_mock.assert_called_once()
             call_js_mock.assert_not_called()
             self.assertGreaterEqual(probe_mock.call_count, 2)
@@ -7468,6 +8054,55 @@ def probe_indicates_submit(
     )
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def emit_response_stream_delta(
+    current_text: str,
+    stream_state: Optional[Dict[str, Any]],
+) -> None:
+    if stream_state is None:
+        return
+
+    previous_text = str(stream_state.get("last_emitted_text") or "")
+    current = str(current_text or "")
+    if not current or current == previous_text:
+        return
+
+    delta = ""
+    needs_final_render = False
+    if current.startswith(previous_text):
+        delta = current[len(previous_text) :]
+    else:
+        prefix_len = common_prefix_length(previous_text, current)
+        if prefix_len >= max(32, int(len(previous_text) * 0.7)):
+            delta = current[prefix_len:]
+            needs_final_render = prefix_len < len(previous_text)
+        else:
+            needs_final_render = True
+
+    if not delta and not needs_final_render:
+        return
+
+    if not bool(stream_state.get("streamed")) and delta:
+        print("\r" + (" " * 64) + "\rassistant>")
+        stream_state["streamed"] = True
+        stream_state["ended_with_newline"] = True
+
+    if delta:
+        print(delta, end="", flush=True)
+        stream_state["ended_with_newline"] = delta.endswith("\n")
+
+    if needs_final_render:
+        stream_state["needs_final_render"] = True
+    stream_state["last_emitted_text"] = current
+
+
 def wait_for_assistant_response(
     client: MCPClient,
     agent_id: str,
@@ -7477,6 +8112,7 @@ def wait_for_assistant_response(
     timeout_s: int,
     poll_interval_s: float,
     debug: bool = False,
+    stream_state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], bool, bool, bool]:
     spinner = ["|", "/", "-", "\\"]
     spin_i = 0
@@ -7498,6 +8134,8 @@ def wait_for_assistant_response(
     while True:
         elapsed = time.time() - start
         if elapsed >= timeout_s:
+            if stream_state and stream_state.get("streamed") and not stream_state.get("ended_with_newline"):
+                print()
             if debug:
                 print(
                     f"\n[debug] render timeout elapsed={elapsed:.1f}s "
@@ -7507,14 +8145,21 @@ def wait_for_assistant_response(
             print("\rthinking... timeout reached                       ")
             return (last_text or None), user_submitted, False, True
 
-        probe = read_assistant_probe(
+        probe = read_live_response_observer_state(
             client=client,
             agent_id=agent_id,
             js_tools=js_tools,
-            label="assistant probe",
         )
-        if probe is None:
-            probe = {}
+        observer_ready = bool(probe.get("ok")) and bool(probe.get("prepared"))
+        if not observer_ready:
+            probe = read_assistant_probe(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+                label="assistant probe",
+            )
+            if probe is None:
+                probe = {}
 
         current_count = int(probe.get("assistant_count") or 0)
         current_hash = str(probe.get("latest_hash") or "")
@@ -7534,6 +8179,9 @@ def wait_for_assistant_response(
         elif changed and current_text and generating_stopped_at is None:
             generating_stopped_at = time.time()
 
+        if changed and current_text:
+            emit_response_stream_delta(current_text, stream_state)
+
         user_changed = (current_user_count > baseline_user_count) or (
             current_user_hash and baseline_user_hash and current_user_hash != baseline_user_hash
         )
@@ -7549,6 +8197,8 @@ def wait_for_assistant_response(
                     expected_norm[:80] in user_norm or user_norm[:80] in expected_norm
                 ):
                     user_submitted = True
+        if bool(probe.get("submit_detected")):
+            user_submitted = True
         if not user_submitted and probe_indicates_submit(
             baseline_probe=baseline_probe,
             probe=probe,
@@ -7580,36 +8230,61 @@ def wait_for_assistant_response(
         settled_for = 0.0
         if generating_stopped_at is not None:
             settled_for = max(0.0, time.time() - generating_stopped_at)
+        network_idle_for = 0.0
+        last_turn_event_ts = float(probe.get("last_turn_event_ts") or 0.0)
+        if last_turn_event_ts > 0:
+            network_idle_for = max(0.0, time.time() - (last_turn_event_ts / 1000.0))
+        text_idle_for = 0.0
+        last_text_change_ts = float(probe.get("last_text_change_ts") or 0.0)
+        if last_text_change_ts > 0:
+            text_idle_for = max(0.0, time.time() - (last_text_change_ts / 1000.0))
+        turn_request_count = int(probe.get("turn_request_count") or 0)
+        turn_active_requests = int(probe.get("turn_active_requests") or 0)
+        interception_complete = (
+            turn_request_count > 0
+            and turn_active_requests <= 0
+            and network_idle_for >= 0.35
+            and text_idle_for >= 0.35
+        )
 
         render_complete = user_submitted and changed and current_text and (not generating) and (
-            (stable_polls >= stable_required and settled_for >= settle_seconds) or elapsed >= 35
+            interception_complete
+            or (stable_polls >= stable_required and settled_for >= settle_seconds)
+            or elapsed >= 35
         )
         if render_complete:
+            if stream_state and stream_state.get("streamed") and not stream_state.get("ended_with_newline"):
+                print()
             if debug:
                 print(
                     f"\n[debug] render complete settled={settled_for:.2f}s stable={stable_polls} "
                     f"assistant_count={current_count}",
                     file=sys.stderr,
                 )
-            print("\rthinking... done                                 ")
+            if not (stream_state and stream_state.get("streamed")):
+                print("\rthinking... done                                 ")
             return current_text, user_submitted, True, False
 
         if not user_submitted and (not generating) and (not changed) and elapsed >= min(14.0, float(timeout_s)):
+            if stream_state and stream_state.get("streamed") and not stream_state.get("ended_with_newline"):
+                print()
             if debug:
                 print(
                     f"\n[debug] submit not confirmed elapsed={elapsed:.1f}s",
                     file=sys.stderr,
                 )
-            print("\rthinking... submit not confirmed                  ")
+            if not (stream_state and stream_state.get("streamed")):
+                print("\rthinking... submit not confirmed                  ")
             return (last_text or None), False, False, False
 
-        spinner_char = spinner[spin_i % len(spinner)]
-        spin_i += 1
-        print(
-            f"\rthinking {spinner_char} ({int(elapsed)}s)",
-            end="",
-            flush=True,
-        )
+        if not (stream_state and stream_state.get("streamed")):
+            spinner_char = spinner[spin_i % len(spinner)]
+            spin_i += 1
+            print(
+                f"\rthinking {spinner_char} ({int(elapsed)}s)",
+                end="",
+                flush=True,
+            )
         time.sleep(max(0.1, poll_interval_s))
 
 
@@ -8516,12 +9191,13 @@ def run_repl(
                 action_refs=active_action_refs,
             )
             rendered_output = str(active_turn_view.get("rendered_output") or "")
-            if output_mode == "json":
-                print(rendered_output)
-            else:
-                print("assistant>")
-                print(colorize_markdown_text_for_terminal(rendered_output))
             turn_result["rendered_output"] = rendered_output
+            if bool(turn_result.get("requires_final_print", True)):
+                if output_mode == "json":
+                    print(rendered_output)
+                else:
+                    print("assistant>")
+                    print(colorize_markdown_text_for_terminal(rendered_output))
         else:
             active_turn_view = None
 
@@ -9322,14 +9998,16 @@ def dispatch_prompt(
     poll_interval_s: float = DEFAULT_POLL_INTERVAL,
     show_dispatch_details: bool = False,
 ) -> Dict[str, Any]:
+    output_mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
     turn_result: Dict[str, Any] = {
         "prompt": prompt,
         "submitted": bool(submit),
         "assistant_text": "",
-        "output_format": (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip(),
+        "output_format": output_mode,
         "render_complete": False,
         "timed_out": False,
         "fallback_used": False,
+        "requires_final_print": False,
     }
     response_text: Optional[str] = None
     final_snapshot: Optional[Dict[str, Any]] = None
@@ -9337,6 +10015,8 @@ def dispatch_prompt(
     timed_out = False
     baseline_probe = None
     fallback_used = False
+    response_observer_ready = False
+    stream_state: Optional[Dict[str, Any]] = None
     native_submit_default = bool(submit and click_tools)
     foreground_mode = browser_foreground_mode() if submit else "off"
     submit_focus_mode = "hold" if (submit and foreground_mode in {"submit", "poll"}) else "off"
@@ -9350,6 +10030,18 @@ def dispatch_prompt(
                 js_tools=js_tools,
                 label="assistant baseline probe",
             )
+            response_observer_ready = install_live_response_observer(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
+            if response_observer_ready:
+                prepared_state = prepare_live_response_observer(
+                    client=client,
+                    agent_id=agent_id,
+                    js_tools=js_tools,
+                )
+                response_observer_ready = bool(prepared_state.get("ok"))
         if submit and show_dispatch_details:
             install_page_network_request_spy(
                 client=client,
@@ -9416,6 +10108,12 @@ def dispatch_prompt(
                 label="post-submit probe",
             )
             if not probe_has_new_user_turn(baseline_probe, post_dispatch_probe, prompt):
+                if response_observer_ready:
+                    prepare_live_response_observer(
+                        client=client,
+                        agent_id=agent_id,
+                        js_tools=js_tools,
+                    )
                 retry_status = cdp_fallback_submit(
                     client=client,
                     agent_id=agent_id,
@@ -9439,6 +10137,16 @@ def dispatch_prompt(
         capture_baseline_hash = baseline_hash
         baseline_user_count = int((baseline_probe or {}).get("user_count") or 0)
         baseline_user_hash = str((baseline_probe or {}).get("latest_user_hash") or "")
+        stream_state: Optional[Dict[str, Any]]
+        if output_mode == "json":
+            stream_state = None
+        else:
+            stream_state = {
+                "streamed": False,
+                "ended_with_newline": True,
+                "needs_final_render": False,
+                "last_emitted_text": "",
+            }
         with foreground_browser_context(poll_focus_mode):
             response_text, user_submitted, render_complete, timed_out = wait_for_assistant_response(
                 client=client,
@@ -9449,6 +10157,7 @@ def dispatch_prompt(
                 timeout_s=wait_timeout_s,
                 poll_interval_s=poll_interval_s,
                 debug=show_dispatch_details,
+                stream_state=stream_state,
             )
         if not user_submitted:
             with foreground_browser_context(submit_focus_mode):
@@ -9468,6 +10177,12 @@ def dispatch_prompt(
                     if maybe_latest:
                         response_text = maybe_latest
                 elif type_tools and (not native_submit_default):
+                    if response_observer_ready:
+                        prepare_live_response_observer(
+                            client=client,
+                            agent_id=agent_id,
+                            js_tools=js_tools,
+                        )
                     retry_status = cdp_fallback_submit(
                         client=client,
                         agent_id=agent_id,
@@ -9505,6 +10220,7 @@ def dispatch_prompt(
                         timeout_s=min(20, max(8, wait_timeout_s)),
                         poll_interval_s=poll_interval_s,
                         debug=show_dispatch_details,
+                        stream_state=stream_state,
                     )
                 capture_baseline_hash = str((retry_baseline or {}).get("latest_hash") or capture_baseline_hash)
         if not user_submitted:
@@ -9526,19 +10242,30 @@ def dispatch_prompt(
         turn_result["render_complete"] = bool(render_complete)
         turn_result["timed_out"] = bool(timed_out)
         turn_result["artifacts"] = build_response_artifacts(str(response_text or ""))
+        turn_result["streamed_output"] = bool(stream_state and stream_state.get("streamed"))
 
     if response_text:
-        output_mode = (output_format or DEFAULT_OUTPUT_FORMAT).lower().strip()
         rendered_output = format_assistant_output(
             text=response_text,
             output_format=output_mode,
             snapshot=final_snapshot,
         )
+        streamed_output = bool(turn_result.get("streamed_output"))
+        needs_final_render = bool(stream_state and stream_state.get("needs_final_render"))
         if output_mode == "json":
-            print(rendered_output)
+            should_print = bool(echo_result)
         else:
-            print("assistant>")
-            print(colorize_markdown_text_for_terminal(rendered_output))
+            should_print = bool(echo_result) and not (streamed_output and not needs_final_render)
+        if should_print:
+            if output_mode == "json":
+                print(rendered_output)
+            else:
+                print("assistant>")
+                print(colorize_markdown_text_for_terminal(rendered_output))
+        turn_result["requires_final_print"] = not should_print and not (
+            streamed_output and output_mode != "json" and not needs_final_render
+        )
+        turn_result["final_output_printed"] = bool(should_print or (streamed_output and output_mode != "json" and not needs_final_render))
         turn_result["rendered_output"] = rendered_output
     elif wait_for_response and submit:
         if show_dispatch_details:
