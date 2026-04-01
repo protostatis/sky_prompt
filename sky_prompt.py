@@ -279,7 +279,7 @@ class MCPClient:
             "params": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "sky-prompt-cli", "version": "0.1.0"},
+                "clientInfo": {"name": "sky-prompt-cli", "version": "0.2.0"},
             },
         }
         response = self._rpc_request(payload, include_session=False, allow_empty=False)
@@ -6017,10 +6017,17 @@ result = a + b
                 self.assertEqual(browser_foreground_mode({}), "off")
                 self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
 
-        def test_browser_window_parking_enabled_defaults_on_darwin(self) -> None:
+        def test_browser_window_parking_disabled_by_default_on_darwin(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
-                self.assertTrue(browser_window_parking_enabled({}))
-                self.assertFalse(browser_window_parking_enabled({"SKY_FOREGROUND_BROWSER_PARK": "0"}))
+                self.assertFalse(browser_window_parking_enabled({}))
+                self.assertTrue(browser_window_parking_enabled({"SKY_FOREGROUND_BROWSER_PARK": "1"}))
+
+        def test_apply_browser_parking_override_sets_env(self) -> None:
+            env: Dict[str, str] = {}
+            apply_browser_parking_override(False, env)
+            self.assertEqual(env.get("SKY_FOREGROUND_BROWSER_PARK"), "0")
+            apply_browser_parking_override(True, env)
+            self.assertEqual(env.get("SKY_FOREGROUND_BROWSER_PARK"), "1")
 
         def test_offscreen_window_bounds_keeps_window_size(self) -> None:
             self.assertEqual(
@@ -8361,13 +8368,20 @@ def browser_application_name_from_env(env: Optional[Mapping[str, str]] = None) -
 
 def browser_window_parking_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
     values = env or os.environ
-    default = "1" if sys.platform == "darwin" else "0"
+    default = "0"
     raw = str(values.get("SKY_FOREGROUND_BROWSER_PARK", default) or "").strip().lower()
     if raw in {"0", "false", "off", "no", "none"}:
         return False
     if raw in {"1", "true", "on", "yes", "auto"}:
         return sys.platform == "darwin"
     return sys.platform == "darwin"
+
+
+def apply_browser_parking_override(enabled: Optional[bool], env: Optional[Dict[str, str]] = None) -> None:
+    if enabled is None:
+        return
+    target = env if env is not None else os.environ
+    target["SKY_FOREGROUND_BROWSER_PARK"] = "1" if bool(enabled) else "0"
 
 
 def terminal_application_name_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
@@ -11000,6 +11014,17 @@ def main() -> int:
         "--pyreplab-cmd",
         help="Optional pyreplab command or path (example: '/path/to/pyreplab').",
     )
+    parking_group = parser.add_mutually_exclusive_group()
+    parking_group.add_argument(
+        "--browser-parking",
+        action="store_true",
+        help="Enable the legacy macOS offscreen window move during browser focus management.",
+    )
+    parking_group.add_argument(
+        "--no-browser-parking",
+        action="store_true",
+        help="Disable the macOS offscreen window move used during browser focus management (default).",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run local parser/formatter regression tests.")
     parser.add_argument("--timeout", type=int, default=45, help="HTTP timeout in seconds.")
     parser.add_argument(
@@ -11022,6 +11047,13 @@ def main() -> int:
 
     if args.pyreplab:
         args.run_backend = "pyreplab"
+
+    browser_parking_override: Optional[bool] = None
+    if args.browser_parking:
+        browser_parking_override = True
+    elif args.no_browser_parking:
+        browser_parking_override = False
+    apply_browser_parking_override(browser_parking_override)
 
     browser_launch_mode = "profile"
     if args.incognito:
