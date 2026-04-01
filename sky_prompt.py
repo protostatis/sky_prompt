@@ -5360,6 +5360,13 @@ result = a + b
             self.assertTrue(created)
             self.assertIn('SKY_CLI_NAME="sk" exec python3 "', content)
 
+        def test_clear_terminal_screen_emits_ansi_clear(self) -> None:
+            module_name = clear_terminal_screen.__module__
+            with mock.patch(f"{module_name}.terminal_colors_enabled", return_value=True):
+                with mock.patch("builtins.print") as print_mock:
+                    clear_terminal_screen()
+            print_mock.assert_called_once_with("\033[3J\033[2J\033[H", end="", flush=True)
+
         def test_resolve_unchained_command_explicit(self) -> None:
             resolved = resolve_unchained_command("uvx unchainedsky-cli")
             self.assertEqual(resolved, ["uvx", "unchainedsky-cli"])
@@ -7067,6 +7074,12 @@ def language_ansi_color(language: str) -> str:
     if normalized in LANGUAGE_ANSI_BY_LANGUAGE:
         return LANGUAGE_ANSI_BY_LANGUAGE[normalized]
     return LANGUAGE_ANSI_BY_LANGUAGE.get("text", "")
+
+
+def clear_terminal_screen() -> None:
+    if not terminal_colors_enabled():
+        return
+    print("\033[3J\033[2J\033[H", end="", flush=True)
 
 
 def ansi_wrap(text: str, *styles: str, enabled: bool = True) -> str:
@@ -9379,6 +9392,7 @@ def run_repl(
             run_backend_mode = "local"
         else:
             print("backend: pyreplab ready")
+    clear_terminal_screen()
     history: List[Dict[str, Any]] = []
     history_entries = load_repl_history_entries()
     turn_index = 0
