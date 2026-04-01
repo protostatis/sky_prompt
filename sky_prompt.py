@@ -4199,7 +4199,8 @@ result = a + b
             )
             self.assertTrue(panel)
             self.assertIn("preview>", panel[0])
-            self.assertIn("print(x)", "\n".join(panel))
+            self.assertEqual(len(panel), 1)
+            self.assertIn("print(x)", panel[0])
 
         def test_build_live_repl_panel_lines_shows_help_list_for_slash(self) -> None:
             panel = build_live_repl_panel_lines(
@@ -6395,6 +6396,44 @@ def build_live_ref_preview_lines(
     return [header] + body
 
 
+def build_live_ref_preview_summary_lines(
+    raw_target: Optional[str],
+    current_cell_id: Optional[str],
+    action_ref_index: Mapping[str, str],
+    turn_view: Optional[Dict[str, Any]],
+) -> List[str]:
+    if not isinstance(turn_view, dict):
+        return []
+    resolved_target, target_error = resolve_cell_reference(
+        raw_target,
+        current_cell_id=current_cell_id,
+        action_ref_index=dict(action_ref_index),
+    )
+    if target_error:
+        return [f"preview> {target_error}"]
+    ref_spans = turn_view.get("ref_spans")
+    preview_lines = list(turn_view.get("preview_lines") or [])
+    if not isinstance(ref_spans, dict) or not preview_lines:
+        return []
+    raw_key = str(raw_target or "").strip()
+    span = ref_spans.get(raw_key) or ref_spans.get(str(resolved_target or "").strip())
+    if not isinstance(span, dict):
+        return []
+    start_line = max(0, int(span.get("start_line") or 0))
+    end_line = max(start_line, int(span.get("end_line") or start_line))
+    body_lines = preview_lines[start_line : min(len(preview_lines), end_line + 1)]
+    summary_lines = [line for line in body_lines if line.strip() and line_fence_language(line) is None]
+    summary = summarize_cell_preview("\n".join(summary_lines or body_lines), limit=96)
+    header = (
+        f"preview> {span.get('handle') or raw_key or resolved_target or 'current'} "
+        f"{span.get('cell_id') or resolved_target or current_cell_id or ''} "
+        f"[{span.get('language') or 'text'}]"
+    ).rstrip()
+    if summary:
+        return [f"{header} :: {summary}"]
+    return [header]
+
+
 def build_live_repl_panel_lines(
     buffer: str,
     *,
@@ -6425,6 +6464,20 @@ def build_live_repl_panel_lines(
             return ["help> commands"] + help_lines
 
     if first in REPL_REF_COMMANDS:
+        if first == "/run":
+            raw_target = None
+            if len(tokens) >= 2:
+                raw_target = str(tokens[1] or "")
+            preview = build_live_ref_preview_summary_lines(
+                raw_target,
+                current_cell_id=current_cell_id,
+                action_ref_index=action_ref_index,
+                turn_view=turn_view,
+            )
+            if preview:
+                return preview
+            return []
+
         if first == "/diff":
             if len(tokens) >= 2:
                 preview = build_live_ref_preview_lines(
