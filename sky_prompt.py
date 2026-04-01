@@ -4662,6 +4662,27 @@ result = a + b
             self.assertTrue(lines)
             self.assertTrue(any("/focus <cell|@ref>" in line for line in lines))
 
+        def test_format_repl_input_line_history_view_prefers_start(self) -> None:
+            line, cursor_col = format_repl_input_line(
+                "> ",
+                "abcdefghijklmnopqrstuvwxyz",
+                cursor=len("abcdefghijklmnopqrstuvwxyz"),
+                width=12,
+                prefer_start=True,
+            )
+            self.assertEqual(line, "> abcdefg...")
+            self.assertEqual(cursor_col, len(line))
+
+        def test_format_repl_input_line_default_shows_tail_near_cursor(self) -> None:
+            line, cursor_col = format_repl_input_line(
+                "> ",
+                "abcdefghijklmnopqrstuvwxyz",
+                cursor=len("abcdefghijklmnopqrstuvwxyz"),
+                width=12,
+            )
+            self.assertEqual(line, "> ...tuvwxyz")
+            self.assertEqual(cursor_col, len(line))
+
         def test_normalize_repl_pasted_text_collapses_multiline_traceback(self) -> None:
             raw = (
                 "run error: boom\r\n"
@@ -6350,7 +6371,14 @@ def apply_repl_completion_state(
     return next_buffer, next_cursor, next_state
 
 
-def format_repl_input_line(prompt: str, buffer: str, cursor: int, width: int) -> Tuple[str, int]:
+def format_repl_input_line(
+    prompt: str,
+    buffer: str,
+    cursor: int,
+    width: int,
+    *,
+    prefer_start: bool = False,
+) -> Tuple[str, int]:
     prompt_text = str(prompt or "")
     content = str(buffer or "")
     available = max(8, int(width) - len(prompt_text))
@@ -6358,7 +6386,10 @@ def format_repl_input_line(prompt: str, buffer: str, cursor: int, width: int) ->
         return prompt_text + content, len(prompt_text) + min(len(content), max(0, cursor))
 
     safe_cursor = max(0, min(len(content), int(cursor)))
-    window_start = min(max(0, safe_cursor - available + 1), max(0, len(content) - available))
+    if prefer_start:
+        window_start = 0
+    else:
+        window_start = min(max(0, safe_cursor - available + 1), max(0, len(content) - available))
     window_end = min(len(content), window_start + available)
     prefix = "..." if window_start > 0 else ""
     suffix = "..." if window_end < len(content) else ""
@@ -6460,6 +6491,7 @@ def read_live_repl_input(
     last_block_lines = 1
     last_panel_hidden = False
     completion_state: Optional[Dict[str, Any]] = None
+    history_view_from_start = False
 
     def reset_completion_state() -> None:
         nonlocal completion_state
@@ -6469,12 +6501,14 @@ def read_live_repl_input(
         nonlocal buffer
         nonlocal cursor
         nonlocal history_index
+        nonlocal history_view_from_start
         chunk = str(text or "")
         if not chunk:
             return
         buffer = buffer[:cursor] + chunk + buffer[cursor:]
         cursor += len(chunk)
         history_index = len(history_entries)
+        history_view_from_start = False
         reset_completion_state()
 
     def move_to_input_origin() -> None:
@@ -6486,7 +6520,13 @@ def read_live_repl_input(
         nonlocal last_block_lines
         nonlocal last_panel_hidden
         width = shutil.get_terminal_size((100, 24)).columns
-        input_line, cursor_col = format_repl_input_line(prompt, buffer, cursor, width)
+        input_line, cursor_col = format_repl_input_line(
+            prompt,
+            buffer,
+            cursor,
+            width,
+            prefer_start=history_view_from_start,
+        )
         panel_lines: List[str] = []
         if not panel_hidden and callable(panel_builder):
             try:
@@ -6596,6 +6636,7 @@ def read_live_repl_input(
                         history_index = max(0, history_index - 1)
                         buffer = history_entries[history_index]
                         cursor = len(buffer)
+                        history_view_from_start = True
                         reset_completion_state()
                     render(panel_hidden=False)
                     continue
@@ -6608,28 +6649,34 @@ def read_live_repl_input(
                             history_index = len(history_entries)
                             buffer = history_draft
                         cursor = len(buffer)
+                        history_view_from_start = True
                         reset_completion_state()
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[C", "\x1bOC"}:
+                    history_view_from_start = False
                     cursor = min(len(buffer), cursor + 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[D", "\x1bOD"}:
+                    history_view_from_start = False
                     cursor = max(0, cursor - 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[H", "\x1bOH"}:
+                    history_view_from_start = False
                     cursor = 0
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[F", "\x1bOF"}:
+                    history_view_from_start = False
                     cursor = len(buffer)
                     render(panel_hidden=False)
                     continue
                 if sequence == "\x1b[3~":
                     if cursor < len(buffer):
                         buffer = buffer[:cursor] + buffer[cursor + 1 :]
+                        history_view_from_start = False
                         reset_completion_state()
                     render(panel_hidden=False)
                     continue
