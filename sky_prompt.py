@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import bisect
 import codeop
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -487,6 +489,89 @@ def format_command_for_display(command: Sequence[Any]) -> str:
     if first_name == "pyreplab":
         parts[0] = "pyreplab"
     return " ".join(parts)
+
+
+def normalize_stream_output_for_display(raw_output: Any) -> Tuple[str, bool]:
+    text = "" if raw_output is None else str(raw_output)
+    if text == "":
+        return "", True
+    return text.rstrip("\r\n"), False
+
+
+def sanitize_text_for_terminal(text: Any, stream: Any = None) -> str:
+    raw = "" if text is None else str(text)
+    target = stream if stream is not None else sys.stdout
+    encoding = str(getattr(target, "encoding", "") or "utf-8")
+    try:
+        return raw.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    except LookupError:
+        return raw.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
+def print_terminal_text(text: Any, *, end: str = "\n", flush: bool = False) -> None:
+    print(sanitize_text_for_terminal(text), end=end, flush=flush)
+
+
+def python_code_uses_input(code: str) -> bool:
+    source = str(code or "")
+    if "input" not in source:
+        return False
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return bool(re.search(r"(?<!\.)\binput\s*\(", source)) or bool(re.search(r"\bbuiltins\.input\s*\(", source))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "input":
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "input":
+            if isinstance(func.value, ast.Name) and func.value.id in {"builtins", "__builtins__"}:
+                return True
+    return False
+
+
+def wrap_pyreplab_code_with_input_lines(code: str, stdin_lines: Sequence[str]) -> str:
+    payload = json.dumps([str(line) for line in stdin_lines])
+    indented_code = textwrap.indent(str(code or ""), "    ")
+    return (
+        "import builtins as __sky_builtins\n"
+        "__sky_saved_input = __sky_builtins.input\n"
+        f"__sky_input_lines = iter({payload})\n"
+        "def __sky_input(prompt=''):\n"
+        "    print(str(prompt or ''), end='', flush=True)\n"
+        "    try:\n"
+        "        return next(__sky_input_lines)\n"
+        "    except StopIteration:\n"
+        "        raise EOFError('EOF when reading a line')\n"
+        "__sky_builtins.input = __sky_input\n"
+        "try:\n"
+        f"{indented_code}\n"
+        "finally:\n"
+        "    __sky_builtins.input = __sky_saved_input\n"
+        "    try:\n"
+        "        del __sky_saved_input, __sky_input_lines, __sky_input\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+
+
+def maybe_collect_pyreplab_stdin_lines(code: str) -> Tuple[bool, Optional[List[str]]]:
+    if not python_code_uses_input(code):
+        return False, None
+    print("stdin: code calls input(); enter one line per prompt, then press Ctrl-D to run")
+    lines: List[str] = []
+    while True:
+        try:
+            lines.append(input("stdin> "))
+        except EOFError:
+            print()
+            return False, lines
+        except KeyboardInterrupt:
+            print()
+            print("stdin: cancelled")
+            return True, None
 
 
 def build_text_tool_result(stdout_text: str) -> Dict[str, Any]:
@@ -4901,6 +4986,49 @@ result = a + b
             self.assertIn("preview>", panel[0])
             self.assertIn("print(x)", panel[0])
 
+        def test_normalize_stream_output_for_display_preserves_leading_spaces(self) -> None:
+            text, is_empty = normalize_stream_output_for_display("   ***\n  **\n")
+            self.assertFalse(is_empty)
+            self.assertEqual(text, "   ***\n  **")
+
+        def test_normalize_stream_output_for_display_marks_exact_empty_output(self) -> None:
+            text, is_empty = normalize_stream_output_for_display("")
+            self.assertTrue(is_empty)
+            self.assertEqual(text, "")
+
+        def test_sanitize_text_for_terminal_replaces_unpaired_surrogate(self) -> None:
+            sanitized = sanitize_text_for_terminal("bad \ud83d tail")
+            self.assertNotIn("\ud83d", sanitized)
+            self.assertTrue(sanitized.startswith("bad "))
+
+        def test_python_code_uses_input_detects_builtin_call(self) -> None:
+            self.assertTrue(python_code_uses_input("name = input('Name: ')\nprint(name)\n"))
+            self.assertFalse(python_code_uses_input("print('Name: ')\n"))
+
+        def test_wrap_pyreplab_code_with_input_lines_feeds_input(self) -> None:
+            import contextlib
+            import io
+
+            namespace: Dict[str, Any] = {}
+            wrapped = wrap_pyreplab_code_with_input_lines(
+                "n = int(input('Add a number: '))\nprint('Current total:', n)\n",
+                ["7"],
+            )
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                exec(compile(wrapped, "<test>", "exec"), namespace)
+            self.assertEqual(stdout_buffer.getvalue(), "Add a number: Current total: 7\n")
+
+        def test_maybe_collect_pyreplab_stdin_lines_reads_until_eof(self) -> None:
+            import contextlib
+            import io
+
+            with mock.patch("builtins.input", side_effect=["3", EOFError]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cancelled, stdin_lines = maybe_collect_pyreplab_stdin_lines("n = input('Add a number: ')\n")
+            self.assertFalse(cancelled)
+            self.assertEqual(stdin_lines, ["3"])
+
         def test_build_live_repl_panel_lines_shows_help_list_for_slash(self) -> None:
             panel = build_live_repl_panel_lines(
                 "/r",
@@ -6132,6 +6260,20 @@ result = a + b
             self.assertEqual(print_mock.call_args_list[1].args[0], "Hello world")
             self.assertEqual(print_mock.call_args_list[2].args[0], "!")
 
+        def test_emit_response_stream_delta_sanitizes_surrogates_before_print(self) -> None:
+            stream_state = {
+                "streamed": False,
+                "ended_with_newline": True,
+                "needs_final_render": False,
+                "last_emitted_text": "",
+            }
+            with mock.patch("builtins.print") as print_mock:
+                emit_response_stream_delta("Hello \ud83d world", stream_state)
+            self.assertEqual(len(print_mock.call_args_list), 2)
+            printed_delta = str(print_mock.call_args_list[1].args[0])
+            self.assertNotIn("\ud83d", printed_delta)
+            self.assertTrue(printed_delta.startswith("Hello "))
+
         def test_emit_response_stream_delta_marks_rewrite_for_final_render(self) -> None:
             stream_state = {
                 "streamed": False,
@@ -6982,6 +7124,7 @@ def execute_pyreplab_code(
     workdir: Path,
     session_dir: Optional[str] = None,
     timeout_s: int = 30,
+    stdin_lines: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     content = str(code or "")
     if not content.strip():
@@ -6992,6 +7135,8 @@ def execute_pyreplab_code(
             "backend": "pyreplab",
             "error": "pyreplab command not configured (set --pyreplab-cmd or PYREPLAB_CMD)",
         }
+    if stdin_lines is not None:
+        content = wrap_pyreplab_code_with_input_lines(content, stdin_lines)
 
     base_cmd = list(pyreplab_cmd)
     resolved_session_dir = str(session_dir or "").strip()
@@ -7102,6 +7247,11 @@ def execute_pyreplab_code(
     if exit_code != 0:
         stderr_preview = stderr_text.strip()
         error_message = stderr_preview or f"pyreplab command failed with exit code {exit_code}"
+        if stdin_lines is None and python_code_uses_input(code) and "EOFError: EOF when reading a line" in error_message:
+            error_message = (
+                "pyreplab input() needs stdin lines. In interactive mode, rerun and provide values at the "
+                "`stdin>` prompt, or switch to `/backend local`."
+            )
 
     return {
         "ok": exit_code == 0,
@@ -7120,6 +7270,7 @@ def execute_cell_with_pyreplab(
     workdir: Path,
     session_dir: Optional[str] = None,
     timeout_s: int = 30,
+    stdin_lines: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     language = normalize_code_language(str(cell.get("language") or ""))
     content = str(cell.get("content") or "")
@@ -7143,6 +7294,7 @@ def execute_cell_with_pyreplab(
         workdir=workdir,
         session_dir=session_dir,
         timeout_s=timeout_s,
+        stdin_lines=stdin_lines,
     )
 
 
@@ -8505,7 +8657,7 @@ def emit_response_stream_delta(
         stream_state["ended_with_newline"] = True
 
     if delta:
-        print(delta, end="", flush=True)
+        print_terminal_text(delta, end="", flush=True)
         stream_state["ended_with_newline"] = delta.endswith("\n")
 
     if needs_final_render:
@@ -9605,10 +9757,10 @@ def run_repl(
             turn_result["rendered_output"] = rendered_output
             if bool(turn_result.get("requires_final_print", True)):
                 if output_mode == "json":
-                    print(rendered_output)
+                    print_terminal_text(rendered_output)
                 else:
                     print("assistant>")
-                    print(colorize_markdown_text_for_terminal(rendered_output))
+                    print_terminal_text(colorize_markdown_text_for_terminal(rendered_output))
         else:
             active_turn_view = None
 
@@ -9794,24 +9946,28 @@ def run_repl(
                 except OSError as exc:
                     print(f"pyreplab passthrough error: cannot read {script_path}: {exc}")
                     continue
+                cancelled, stdin_lines = maybe_collect_pyreplab_stdin_lines(code_text)
+                if cancelled:
+                    continue
                 result = execute_pyreplab_code(
                     code=code_text,
                     pyreplab_cmd=resolved_pyreplab_cmd,
                     workdir=Path.cwd(),
                     session_dir=pyreplab_session_dir,
                     timeout_s=30,
+                    stdin_lines=stdin_lines,
                 )
                 if not result.get("ok"):
                     print(f"pyreplab passthrough error: {result.get('error')}")
                 command = format_command_for_display(result.get("command") or [])
                 exit_code = int(result.get("exit_code", 0))
                 print(f"pyreplab> file={script_path} exit={exit_code} cmd={command}")
-                stdout_text = str(result.get("stdout") or "").strip()
-                stderr_text = str(result.get("stderr") or "").strip()
+                stdout_text, stdout_empty = normalize_stream_output_for_display(result.get("stdout"))
+                stderr_text, stderr_empty = normalize_stream_output_for_display(result.get("stderr"))
                 print("stdout>")
-                print(stdout_text if stdout_text else "(empty)")
+                print(stdout_text if not stdout_empty else "(empty)")
                 print("stderr>")
-                print(stderr_text if stderr_text else "(empty)")
+                print(stderr_text if not stderr_empty else "(empty)")
                 continue
             if lower.startswith("/py "):
                 code_text = line[4:].strip()
@@ -9822,24 +9978,28 @@ def run_repl(
                     print("pyreplab passthrough unavailable")
                     print("hint: --pyreplab-cmd '/path/to/pyreplab' or set PYREPLAB_CMD")
                     continue
+                cancelled, stdin_lines = maybe_collect_pyreplab_stdin_lines(code_text)
+                if cancelled:
+                    continue
                 result = execute_pyreplab_code(
                     code=code_text,
                     pyreplab_cmd=resolved_pyreplab_cmd,
                     workdir=Path.cwd(),
                     session_dir=pyreplab_session_dir,
                     timeout_s=30,
+                    stdin_lines=stdin_lines,
                 )
                 if not result.get("ok"):
                     print(f"pyreplab passthrough error: {result.get('error')}")
                 command = format_command_for_display(result.get("command") or [])
                 exit_code = int(result.get("exit_code", 0))
                 print(f"pyreplab> exit={exit_code} cmd={command}")
-                stdout_text = str(result.get("stdout") or "").strip()
-                stderr_text = str(result.get("stderr") or "").strip()
+                stdout_text, stdout_empty = normalize_stream_output_for_display(result.get("stdout"))
+                stderr_text, stderr_empty = normalize_stream_output_for_display(result.get("stderr"))
                 print("stdout>")
-                print(stdout_text if stdout_text else "(empty)")
+                print(stdout_text if not stdout_empty else "(empty)")
                 print("stderr>")
-                print(stderr_text if stderr_text else "(empty)")
+                print(stderr_text if not stderr_empty else "(empty)")
                 continue
             if lower.startswith("/format "):
                 mode = line.split(None, 1)[1].strip().lower()
@@ -9872,10 +10032,10 @@ def run_repl(
                 rebuild_active_turn_view_from_entry(entry)
                 rendered = str((active_turn_view or {}).get("rendered_output") or "")
                 if output_mode == "json":
-                    print(rendered)
+                    print_terminal_text(rendered)
                 else:
                     print("assistant>")
-                    print(colorize_markdown_text_for_terminal(rendered))
+                    print_terminal_text(colorize_markdown_text_for_terminal(rendered))
                 continue
             if lower == "/history" or lower.startswith("/history "):
                 parts = line.split()
@@ -9997,12 +10157,16 @@ def run_repl(
                 print_cell_content(cell)
                 language = normalize_code_language(str(cell.get("language") or ""))
                 if run_backend_mode == "pyreplab" and language == "python":
+                    cancelled, stdin_lines = maybe_collect_pyreplab_stdin_lines(str(cell.get("content") or ""))
+                    if cancelled:
+                        continue
                     result = execute_cell_with_pyreplab(
                         cell=cell,
                         pyreplab_cmd=resolved_pyreplab_cmd or [],
                         workdir=Path.cwd(),
                         session_dir=pyreplab_session_dir,
                         timeout_s=timeout_s,
+                        stdin_lines=stdin_lines,
                     )
                 elif run_backend_mode == "pyreplab" and language != "python":
                     print(f"backend: pyreplab supports python only; using local for {language or 'unknown'}")
@@ -10016,12 +10180,12 @@ def run_repl(
                     result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=timeout_s)
                 if not result.get("ok"):
                     print(f"run error: {result.get('error')}")
-                    stderr_text = str(result.get("stderr") or "").strip()
-                    stdout_text = str(result.get("stdout") or "").strip()
-                    if stdout_text:
+                    stderr_text, stderr_empty = normalize_stream_output_for_display(result.get("stderr"))
+                    stdout_text, stdout_empty = normalize_stream_output_for_display(result.get("stdout"))
+                    if not stdout_empty:
                         print("stdout>")
                         print(stdout_text)
-                    if stderr_text:
+                    if not stderr_empty:
                         print("stderr>")
                         print(stderr_text)
                     continue
@@ -10029,12 +10193,12 @@ def run_repl(
                 exit_code = int(result.get("exit_code", 0))
                 backend_used = str(result.get("backend") or run_backend_mode)
                 print(f"run> {cell.get('id')} backend={backend_used} exit={exit_code} cmd={command}")
-                stdout_text = str(result.get("stdout") or "").strip()
-                stderr_text = str(result.get("stderr") or "").strip()
+                stdout_text, stdout_empty = normalize_stream_output_for_display(result.get("stdout"))
+                stderr_text, stderr_empty = normalize_stream_output_for_display(result.get("stderr"))
                 print("stdout>")
-                print(stdout_text if stdout_text else "(empty)")
+                print(stdout_text if not stdout_empty else "(empty)")
                 print("stderr>")
-                print(stderr_text if stderr_text else "(empty)")
+                print(stderr_text if not stderr_empty else "(empty)")
                 continue
             if lower == "/focus" or lower.startswith("/focus "):
                 args, parse_error = split_repl_command_args(line)
@@ -10674,10 +10838,10 @@ def dispatch_prompt(
             should_print = bool(echo_result) and not (streamed_output and not needs_final_render)
         if should_print:
             if output_mode == "json":
-                print(rendered_output)
+                print_terminal_text(rendered_output)
             else:
                 print("assistant>")
-                print(colorize_markdown_text_for_terminal(rendered_output))
+                print_terminal_text(colorize_markdown_text_for_terminal(rendered_output))
         turn_result["requires_final_print"] = not should_print and not (
             streamed_output and output_mode != "json" and not needs_final_render
         )
