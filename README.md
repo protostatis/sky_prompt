@@ -29,6 +29,8 @@ cd sky_prompt
 - launch Chrome to `https://chatgpt.com`
 - tell you the next `sky` command to run
 
+If `pyreplab` install fails, setup still completes and interactive `/run` falls back to `local` until `pyreplab` is installed.
+
 If `uv` is not installed yet:
 
 ```bash

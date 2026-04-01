@@ -6,6 +6,12 @@ WATCH=0
 INTERVAL=1
 PYREPLAB_CMD="${PYREPLAB_CMD:-}"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  STAT_ARGS=(-f '%N:%m')
+else
+  STAT_ARGS=(-c '%n:%Y')
+fi
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/test_loop.sh [--watch] [--interval N] [--pyreplab-cmd PATH]
@@ -69,7 +75,7 @@ project_fingerprint() {
         ! -path './.sky_cells/*' \
         \( -name '*.py' -o -name '*.sh' -o -name 'README.md' -o -name 'pyproject.toml' \) \
         -print0 \
-      | xargs -0 stat -f '%N:%m'
+      | xargs -0 stat "${STAT_ARGS[@]}"
     } | LC_ALL=C sort | shasum | awk '{print $1}'
   )
 }

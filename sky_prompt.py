@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import codeop
 from contextlib import contextmanager
 import difflib
 import errno
@@ -666,6 +668,45 @@ def install_pyreplab_with_uv(
     timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
 ) -> None:
     install_python_tool_with_uv(uv_cmd=uv_cmd, package="pyreplab", timeout_s=timeout_s)
+
+
+def ensure_local_setup_tooling(
+    uv_cmd: Sequence[str],
+    *,
+    unchained_cmd: Optional[str] = None,
+    pyreplab_cmd: Optional[str] = None,
+    timeout_s: int = DEFAULT_LOCAL_SETUP_TIMEOUT,
+) -> Tuple[List[str], Optional[List[str]], bool, List[str]]:
+    resolved_unchained_cmd = resolve_unchained_command(unchained_cmd)
+    resolved_pyreplab_cmd = resolve_pyreplab_command(pyreplab_cmd)
+    installed_now = False
+    warnings: List[str] = []
+
+    if not resolved_unchained_cmd:
+        print("setup: installing unchainedsky-cli with uv")
+        install_unchained_with_uv(uv_cmd, timeout_s=timeout_s)
+        installed_now = True
+        resolved_unchained_cmd = resolve_unchained_command(unchained_cmd)
+    if not resolved_unchained_cmd:
+        raise MCPError(
+            "setup completed but unchained was still not found. "
+            "Try `./sky --unchained-cmd ~/.local/bin/unchained`."
+        )
+
+    if not resolved_pyreplab_cmd:
+        try:
+            print("setup: installing pyreplab with uv")
+            install_pyreplab_with_uv(uv_cmd, timeout_s=timeout_s)
+            installed_now = True
+        except MCPError as exc:
+            warnings.append(f"setup: pyreplab install skipped: {exc}")
+        resolved_pyreplab_cmd = resolve_pyreplab_command(pyreplab_cmd)
+    if not resolved_pyreplab_cmd:
+        warnings.append(
+            "setup: pyreplab unavailable; interactive /run will fall back to local until it is installed."
+        )
+
+    return list(resolved_unchained_cmd), resolved_pyreplab_cmd, installed_now, warnings
 
 
 def launch_chatgpt_with_unchained(
@@ -2169,6 +2210,16 @@ def python_snippet_is_valid(content: str) -> bool:
         return False
 
 
+def python_snippet_is_incomplete(content: str) -> bool:
+    snippet = str(content or "").strip("\n")
+    if not snippet:
+        return False
+    try:
+        return codeop.compile_command(snippet, "<inferred-python>", "exec") is None
+    except (OverflowError, SyntaxError, ValueError):
+        return False
+
+
 def trim_trailing_heading_comment_lines(lines: List[str]) -> None:
     while lines:
         stripped = str(lines[-1] or "").strip()
@@ -2418,7 +2469,7 @@ def looks_like_python_code_line(raw_line: str) -> bool:
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*(?:[\+\-\*/%@]?=)", stripped):
         return True
     if re.match(
-        r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\]|\.[A-Za-z_][A-Za-z0-9_]*)+\s*(?:[\+\-\*/%@]?=)",
+        r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]+\]|\.[A-Za-z_][A-Za-z0-9_]*)+\s*(?:[\+\-\*/%@]?=)",
         stripped,
     ):
         return True
@@ -2448,6 +2499,30 @@ def looks_like_python_continuation_line(raw_line: str) -> bool:
     if re.match(r"^(?:['\"][^'\"]+['\"]|[A-Za-z_][A-Za-z0-9_]*)\s*:\s*.+,?$", stripped):
         return True
     if stripped in {"pass", "break", "continue"}:
+        return True
+    return False
+
+
+def looks_like_incomplete_python_continuation_line(
+    raw_line: str,
+    previous_lines: Sequence[str],
+) -> bool:
+    stripped = str(raw_line or "").strip()
+    if not stripped:
+        return False
+    if parse_language_label_line(stripped) or is_output_label_line(stripped):
+        return False
+    if re.match(r"^#{2,6}\s+\S", stripped):
+        return False
+    if not python_snippet_is_incomplete("\n".join(str(line or "") for line in previous_lines)):
+        return False
+    if looks_like_python_continuation_line(stripped):
+        return True
+    if raw_line[:1].isspace():
+        return True
+    if stripped.startswith(("'", '"', "(", "[", "{")):
+        return True
+    if re.match(r"^[+\-*/%@]", stripped):
         return True
     return False
 
@@ -2493,7 +2568,13 @@ def extract_python_blocks_from_text(text: str, start_index: int) -> List[Dict[st
         strong_markers = 0
         while i < len(lines):
             current = lines[i]
-            if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
+            if looks_like_python_code_line(current) or (
+                collected
+                and (
+                    looks_like_python_continuation_line(current)
+                    or looks_like_incomplete_python_continuation_line(current, collected)
+                )
+            ):
                 collected.append(current.rstrip())
                 trimmed = current.strip()
                 if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed or "print" in trimmed:
@@ -2573,7 +2654,13 @@ def extract_labeled_code_and_output_blocks_from_text(
 
             match_language = False
             if language == "python":
-                if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
+                if looks_like_python_code_line(current) or (
+                    collected
+                    and (
+                        looks_like_python_continuation_line(current)
+                        or looks_like_incomplete_python_continuation_line(current, collected)
+                    )
+                ):
                     match_language = True
             elif language == "bash":
                 if looks_like_shell_command_line(current):
@@ -2756,7 +2843,11 @@ def extract_response_items_from_text(
                 matched = False
                 if language == "python":
                     matched = looks_like_python_code_line(current) or (
-                        collected and looks_like_python_continuation_line(current)
+                        collected
+                        and (
+                            looks_like_python_continuation_line(current)
+                            or looks_like_incomplete_python_continuation_line(current, collected)
+                        )
                     )
                 elif language == "bash":
                     matched = looks_like_shell_command_line(current)
@@ -2897,7 +2988,13 @@ def extract_response_items_from_text(
             strong_markers = 0
             while i < len(lines):
                 current = lines[i]
-                if looks_like_python_code_line(current) or (collected and looks_like_python_continuation_line(current)):
+                if looks_like_python_code_line(current) or (
+                    collected
+                    and (
+                        looks_like_python_continuation_line(current)
+                        or looks_like_incomplete_python_continuation_line(current, collected)
+                    )
+                ):
                     collected.append(current.rstrip())
                     trimmed = current.strip()
                     if re.match(r"^(from|import|def|class)\b", trimmed) or "=" in trimmed or "print" in trimmed:
@@ -3056,7 +3153,11 @@ def rewrite_labeled_sections_as_fenced_markdown(text: str) -> str:
                 render_line = current.rstrip()
                 if language == "python":
                     matched = looks_like_python_code_line(current) or (
-                        collected and looks_like_python_continuation_line(current)
+                        collected
+                        and (
+                            looks_like_python_continuation_line(current)
+                            or looks_like_incomplete_python_continuation_line(current, collected)
+                        )
                     )
                 elif language == "bash":
                     matched = looks_like_shell_command_line(current)
@@ -3760,6 +3861,116 @@ ascii_candles (weekly_data)
             self.assertIn("weekly_data = get_weekly_data (ticker)", content)
             self.assertTrue(bool(block.get("syntax_valid")))
 
+        def test_mixed_fenced_and_labeled_nlp_walkthrough_keeps_all_python_blocks(self) -> None:
+            sample = """Here’s a simple, practical NLP algorithm you can actually build and run. I’ll keep it minimal but real.
+## 🧠 Example: Basic Sentiment Classifier (from scratch)
+This is a classic NLP pipeline:
+- Clean text
+- Convert to numbers
+- Train a simple model
+- Predict sentiment
+## ⚙️ Step-by-step algorithm
+### 1. Preprocess text
+- Lowercase
+- Remove punctuation
+- Tokenize (split into words)
+
+```python
+import re
+
+def preprocess (text):
+    text = text.lower ()
+    text = re.sub (r'[^a-z\\s]', '', text)
+    tokens = text.split ()
+    return tokens
+```
+### 2. Build vocabulary
+Map each word → index
+
+```python
+def build_vocab (dataset):
+    vocab = {}
+    idx = 0
+    for text in dataset:
+        for word in preprocess (text):
+            if word not in vocab:
+                vocab[word] = idx
+                idx += 1
+    return vocab
+```
+### 3. Convert text → vector (Bag of Words)
+
+Python
+import numpy as np
+
+def vectorize (text, vocab):
+    vec = np.zeros (len (vocab))
+    for word in preprocess (text):
+        if word in vocab:
+            vec[vocab[word]] += 1
+    return vec
+
+### 4. Train a simple model (Naive Bayes)
+
+Python
+class NaiveBayes:
+    def fit (self, X, y):
+        self.classes = np.unique (y)
+        self.mean = {}
+        self.var = {}
+        self.priors = {}
+
+        for c in self.classes:
+            X_c = X[y == c]
+            self.mean[c] = X_c.mean (axis=0)
+            self.var[c] = X_c.var (axis=0) + 1e-6
+            self.priors[c] = X_c.shape[0] / X.shape[0]
+
+    def predict (self, X):
+        return [self._predict (x) for x in X]
+
+    def _predict (self, x):
+        posteriors = []
+
+        for c in self.classes:
+            prior = np.log (self.priors[c])
+            likelihood = np.sum (
+                -0.5 * np.log (2 * np.pi * self.var[c]) -
+                ((x - self.mean[c]) ** 2) / (2 * self.var[c])
+            )
+            posteriors.append (prior + likelihood)
+
+        return self.classes[np.argmax (posteriors)]
+
+### 5. Train + test
+
+Python
+texts = [
+    "I love this product",
+    "This is amazing",
+    "I hate this",
+    "This is terrible"
+]
+
+labels = np.array ([1, 1, 0, 0])  # 1 = positive, 0 = negative
+
+vocab = build_vocab (texts)
+
+X = np.array ([vectorize (t, vocab) for t in texts])
+
+model = NaiveBayes ()
+model.fit (X, labels)
+
+test = vectorize ("I love this", vocab)
+print (model.predict ([test]))
+"""
+            artifacts = build_response_artifacts(sample)
+            self.assertEqual(len(artifacts.get("code_blocks", [])), 5)
+            contents = [str(block.get("content") or "") for block in artifacts["code_blocks"]]
+            self.assertTrue(any("vec[vocab[word]] += 1" in content for content in contents))
+            self.assertTrue(any("class NaiveBayes:" in content for content in contents))
+            self.assertTrue(any('print (model.predict ([test]))' in content for content in contents))
+
         def test_fenced_python_merges_indented_tail(self) -> None:
             sample = """```python
 result = []
@@ -4437,6 +4648,33 @@ result = a + b
                 ["uv", "tool", "install", "--force", "--python", "3.10", "pyreplab"],
             )
 
+        def test_ensure_local_setup_tooling_allows_missing_pyreplab(self) -> None:
+            module_name = ensure_local_setup_tooling.__module__
+            with mock.patch("builtins.print"):
+                with mock.patch(f"{module_name}.resolve_unchained_command", side_effect=[None, ["unchained"]]):
+                    with mock.patch(f"{module_name}.resolve_pyreplab_command", side_effect=[None, None]):
+                        with mock.patch(f"{module_name}.install_unchained_with_uv") as install_unchained_mock:
+                            with mock.patch(
+                                f"{module_name}.install_pyreplab_with_uv",
+                                side_effect=MCPError("uv tool install failed: missing wheel"),
+                            ) as install_pyreplab_mock:
+                                (
+                                    resolved_unchained,
+                                    resolved_pyreplab,
+                                    installed_now,
+                                    warnings,
+                                ) = ensure_local_setup_tooling(
+                                    ["uv"],
+                                    timeout_s=30,
+                                )
+            install_unchained_mock.assert_called_once()
+            install_pyreplab_mock.assert_called_once()
+            self.assertEqual(resolved_unchained, ["unchained"])
+            self.assertIsNone(resolved_pyreplab)
+            self.assertTrue(installed_now)
+            self.assertTrue(any("pyreplab install skipped" in warning for warning in warnings))
+            self.assertTrue(any("fall back to local" in warning for warning in warnings))
+
         def test_launch_chatgpt_with_unchained_builds_launch_command(self) -> None:
             with mock.patch("subprocess.run") as run_mock:
                 run_mock.return_value = mock.Mock(returncode=0, stdout="Chrome started\n", stderr="")
@@ -4683,7 +4921,7 @@ result = a + b
             self.assertEqual(line, "> ...tuvwxyz")
             self.assertEqual(cursor_col, len(line))
 
-        def test_normalize_repl_pasted_text_collapses_multiline_traceback(self) -> None:
+        def test_normalize_repl_pasted_text_preserves_multiline_traceback(self) -> None:
             raw = (
                 "run error: boom\r\n"
                 "Traceback (most recent call last):\r\n"
@@ -4692,10 +4930,19 @@ result = a + b
             )
             normalized = normalize_repl_pasted_text(raw)
             self.assertIn("run error: boom", normalized)
-            self.assertIn("\\n Traceback (most recent call last):", normalized)
-            self.assertIn("\\n ValueError: bad value", normalized)
+            self.assertIn("\nTraceback (most recent call last):", normalized)
+            self.assertIn("\nValueError: bad value", normalized)
             self.assertNotIn("\r", normalized)
-            self.assertNotIn("\n", normalized)
+
+        def test_format_repl_input_line_displays_newlines_as_escaped_markers(self) -> None:
+            line, cursor_col = format_repl_input_line(
+                "> ",
+                "first line\nsecond line",
+                cursor=len("first line\nsecond line"),
+                width=80,
+            )
+            self.assertEqual(line, "> first line\\nsecond line")
+            self.assertEqual(cursor_col, len(line))
 
         def test_read_bracketed_paste_stops_at_terminator(self) -> None:
             payload = "first line\nsecond line"
@@ -6381,26 +6628,60 @@ def format_repl_input_line(
 ) -> Tuple[str, int]:
     prompt_text = str(prompt or "")
     content = str(buffer or "")
+    display_content, display_offsets = render_repl_buffer_for_display(content)
     available = max(8, int(width) - len(prompt_text))
-    if len(content) <= available:
-        return prompt_text + content, len(prompt_text) + min(len(content), max(0, cursor))
-
     safe_cursor = max(0, min(len(content), int(cursor)))
+    display_cursor = display_offsets[safe_cursor]
+    if len(display_content) <= available:
+        return prompt_text + display_content, len(prompt_text) + min(len(display_content), display_cursor)
+
     if prefer_start:
         window_start = 0
     else:
-        window_start = min(max(0, safe_cursor - available + 1), max(0, len(content) - available))
-    window_end = min(len(content), window_start + available)
+        window_start = min(max(0, display_cursor - available + 1), max(0, len(display_content) - available))
+        window_start = snap_repl_display_offset(display_offsets, window_start)
+    window_end = min(len(display_content), window_start + available)
+    snapped_end = snap_repl_display_offset(display_offsets, window_end)
+    if snapped_end > window_start:
+        window_end = snapped_end
     prefix = "..." if window_start > 0 else ""
-    suffix = "..." if window_end < len(content) else ""
-    visible = content[window_start:window_end]
+    suffix = "..." if window_end < len(display_content) else ""
+    visible = display_content[window_start:window_end]
     if prefix:
         visible = prefix + visible[3:]
     if suffix and len(visible) >= 3:
         visible = visible[:-3] + suffix
-    cursor_col = len(prompt_text) + max(0, safe_cursor - window_start)
+    cursor_col = len(prompt_text) + max(0, display_cursor - window_start)
     cursor_col = min(len(prompt_text) + len(visible), cursor_col)
     return prompt_text + visible, cursor_col
+
+
+def render_repl_buffer_for_display(text: str) -> Tuple[str, List[int]]:
+    raw = str(text or "")
+    rendered_parts: List[str] = []
+    offsets: List[int] = [0]
+    for char in raw:
+        if char == "\n":
+            token = "\\n"
+        elif char == "\r":
+            token = "\\r"
+        elif char == "\t":
+            token = "    "
+        else:
+            token = char
+        rendered_parts.append(token)
+        offsets.append(offsets[-1] + len(token))
+    return "".join(rendered_parts), offsets
+
+
+def snap_repl_display_offset(offsets: Sequence[int], target: int) -> int:
+    if not offsets:
+        return 0
+    safe_target = max(0, min(int(target), int(offsets[-1])))
+    index = bisect.bisect_right(list(offsets), safe_target) - 1
+    if index < 0:
+        return 0
+    return int(offsets[index])
 
 
 def truncate_repl_panel_line(text: str, width: int) -> str:
@@ -6435,17 +6716,14 @@ def normalize_repl_pasted_text(raw_text: str) -> str:
     text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text:
         return ""
-    text = text.replace("\t", "    ")
-    if "\n" not in text:
-        return text
-    parts = text.split("\n")
-    while parts and not parts[0].strip():
-        parts.pop(0)
-    while parts and not parts[-1].strip():
-        parts.pop()
-    if not parts:
+    lines = text.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
         return ""
-    return " \\n ".join(parts)
+    return "\n".join(line.replace("\t", "    ") for line in lines)
 
 
 def read_bracketed_paste(fd: int) -> str:
@@ -9206,34 +9484,22 @@ def main() -> int:
 
     if args.setup:
         uv_cmd = resolve_uv_command()
-        resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
-        resolved_pyreplab_cmd = resolve_pyreplab_command(args.pyreplab_cmd)
-        installed_now = False
+        (
+            resolved_unchained_cmd,
+            resolved_pyreplab_cmd,
+            installed_now,
+            setup_warnings,
+        ) = ensure_local_setup_tooling(
+            uv_cmd,
+            unchained_cmd=args.unchained_cmd,
+            pyreplab_cmd=args.pyreplab_cmd,
+            timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT,
+        )
         alias_dir = Path(args.alias_dir).expanduser()
         target_script = Path(__file__).resolve()
         alias_path: Optional[Path] = None
         alias_created = False
         alias_error: Optional[str] = None
-        if not resolved_unchained_cmd:
-            print("setup: installing unchainedsky-cli with uv")
-            install_unchained_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
-            installed_now = True
-            resolved_unchained_cmd = resolve_unchained_command(args.unchained_cmd)
-        if not resolved_pyreplab_cmd:
-            print("setup: installing pyreplab with uv")
-            install_pyreplab_with_uv(uv_cmd, timeout_s=DEFAULT_LOCAL_SETUP_TIMEOUT)
-            installed_now = True
-            resolved_pyreplab_cmd = resolve_pyreplab_command(args.pyreplab_cmd)
-        if not resolved_unchained_cmd:
-            raise MCPError(
-                "setup completed but unchained was still not found. "
-                "Try `./sky --unchained-cmd ~/.local/bin/unchained`."
-            )
-        if not resolved_pyreplab_cmd:
-            raise MCPError(
-                "setup completed but pyreplab was still not found. "
-                "Try `./sky --pyreplab-cmd ~/.local/bin/pyreplab`."
-            )
         try:
             alias_path, alias_created = install_alias_launcher(
                 alias_name="sky",
@@ -9244,7 +9510,10 @@ def main() -> int:
         except MCPError as exc:
             alias_error = str(exc)
         print("setup: using " + " ".join(resolved_unchained_cmd))
-        print("setup: using " + " ".join(resolved_pyreplab_cmd))
+        if resolved_pyreplab_cmd:
+            print("setup: using " + " ".join(resolved_pyreplab_cmd))
+        for warning in setup_warnings:
+            print(warning)
         if alias_path is not None:
             status_label = "installed" if alias_created else "already installed"
             print(f"setup: {status_label} sky launcher at {alias_path}")
