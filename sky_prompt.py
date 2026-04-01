@@ -4277,12 +4277,53 @@ result = a + b
             self.assertIn("@1", suggestions)
             self.assertIn("@2", suggestions)
 
+        def test_repl_completion_candidates_default_run_slot_prefers_handles(self) -> None:
+            refs = [
+                {"handle": "@1", "cell_id": "py1", "language": "python"},
+                {"handle": "@2", "cell_id": "py2", "language": "python"},
+            ]
+            context = repl_completion_candidates(
+                "/run ",
+                len("/run "),
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertIsNotNone(context)
+            suggestions = list((context or {}).get("suggestions") or [])
+            self.assertEqual(suggestions, ["@1", "@2"])
+
         def test_apply_repl_completion_state_cycles_run_ref_slot(self) -> None:
             refs = [
                 {"handle": "@1", "cell_id": "py1", "language": "python"},
                 {"handle": "@2", "cell_id": "py2", "language": "python"},
             ]
             buffer = "/run @"
+            cursor = len(buffer)
+            state = None
+            buffer, cursor, state = apply_repl_completion_state(
+                buffer,
+                cursor,
+                state,
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertEqual(buffer, "/run @1 ")
+            buffer, cursor, state = apply_repl_completion_state(
+                buffer,
+                cursor,
+                state,
+                current_cell_id="py1",
+                action_refs=refs,
+            )
+            self.assertEqual(buffer, "/run @2 ")
+
+        def test_apply_repl_completion_state_cycles_run_handles_from_blank_slot(self) -> None:
+            refs = [
+                {"handle": "@1", "cell_id": "py1", "language": "python"},
+                {"handle": "@2", "cell_id": "py2", "language": "python"},
+                {"handle": "@3", "cell_id": "py3", "language": "python"},
+            ]
+            buffer = "/run "
             cursor = len(buffer)
             state = None
             buffer, cursor, state = apply_repl_completion_state(
@@ -6428,6 +6469,18 @@ def repl_ref_completion_items(action_refs: Sequence[Dict[str, Any]]) -> List[Tup
     return items
 
 
+def repl_ref_handle_suggestions(action_refs: Sequence[Dict[str, Any]]) -> List[str]:
+    handles: List[str] = []
+    seen: set = set()
+    for ref in action_refs:
+        handle = str(ref.get("handle") or "").strip()
+        if not handle or handle in seen:
+            continue
+        handles.append(handle)
+        seen.add(handle)
+    return handles
+
+
 def format_repl_ref_suggestion_lines(
     action_refs: Sequence[Dict[str, Any]],
     current_cell_id: Optional[str] = None,
@@ -6656,8 +6709,10 @@ def repl_completion_candidates(
     first_lower = first.lower()
     ref_items = repl_ref_completion_items(action_refs)
     ref_suggestions = [value for value, _ in ref_items]
+    ref_handle_suggestions = repl_ref_handle_suggestions(action_refs)
     if current_cell_id and current_cell_id not in ref_suggestions:
         ref_suggestions.append(current_cell_id)
+    default_run_suggestions = list(ref_handle_suggestions or ref_suggestions)
 
     if first_lower in {"/run", "/show", "/edit", "/focus"}:
         if len(tokens) > 2:
@@ -6675,7 +6730,7 @@ def repl_completion_candidates(
                 include_exact_cycle=bool(trailing_space or prefix in ref_suggestions),
             )
         else:
-            suggestions = list(ref_suggestions)
+            suggestions = list(default_run_suggestions if first_lower == "/run" else ref_suggestions)
         return {
             "start": start,
             "end": end,
@@ -6907,11 +6962,14 @@ def read_live_repl_input(
     last_block_lines = 1
     last_panel_hidden = False
     completion_state: Optional[Dict[str, Any]] = None
+    completion_panel_hidden = False
     history_view_from_start = False
 
     def reset_completion_state() -> None:
         nonlocal completion_state
+        nonlocal completion_panel_hidden
         completion_state = None
+        completion_panel_hidden = False
 
     def insert_text(text: str) -> None:
         nonlocal buffer
@@ -6944,7 +7002,8 @@ def read_live_repl_input(
             prefer_start=history_view_from_start,
         )
         panel_lines: List[str] = []
-        if not panel_hidden and callable(panel_builder):
+        effective_panel_hidden = bool(panel_hidden or completion_panel_hidden)
+        if not effective_panel_hidden and callable(panel_builder):
             try:
                 raw_panel_lines = list(panel_builder(buffer, cursor) or [])
             except Exception:
@@ -6966,7 +7025,7 @@ def read_live_repl_input(
             sys.stdout.write(f"\x1b[{cursor_col}C")
         sys.stdout.flush()
         last_block_lines = 1 + len(panel_lines)
-        last_panel_hidden = panel_hidden
+        last_panel_hidden = effective_panel_hidden
 
     def finalize_line() -> None:
         move_to_input_origin()
@@ -6974,17 +7033,31 @@ def read_live_repl_input(
         sys.stdout.write(f"{prompt}{buffer}\r\n")
         sys.stdout.flush()
 
-    def apply_completion() -> None:
+    def show_panel() -> None:
+        nonlocal completion_panel_hidden
+        completion_panel_hidden = False
+
+    def apply_completion() -> bool:
         nonlocal buffer
         nonlocal cursor
         nonlocal completion_state
-        buffer, cursor, completion_state = apply_repl_completion_state(
+        nonlocal completion_panel_hidden
+        next_buffer, next_cursor, next_state = apply_repl_completion_state(
             buffer,
             cursor,
             completion_state,
             current_cell_id=current_cell_id,
             action_refs=list(action_refs or []),
         )
+        changed = (
+            next_buffer != buffer
+            or next_cursor != cursor
+            or next_state != completion_state
+        )
+        buffer, cursor, completion_state = next_buffer, next_cursor, next_state
+        if changed:
+            completion_panel_hidden = True
+        return changed
 
     try:
         tty.setraw(fd)
@@ -7027,10 +7100,12 @@ def read_live_repl_input(
                 render(panel_hidden=False)
                 continue
             if ch == "\x01":
+                show_panel()
                 cursor = 0
                 render(panel_hidden=False)
                 continue
             if ch == "\x05":
+                show_panel()
                 cursor = len(buffer)
                 render(panel_hidden=False)
                 continue
@@ -7070,26 +7145,31 @@ def read_live_repl_input(
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[C", "\x1bOC"}:
+                    show_panel()
                     history_view_from_start = False
                     cursor = min(len(buffer), cursor + 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[D", "\x1bOD"}:
+                    show_panel()
                     history_view_from_start = False
                     cursor = max(0, cursor - 1)
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[H", "\x1bOH"}:
+                    show_panel()
                     history_view_from_start = False
                     cursor = 0
                     render(panel_hidden=False)
                     continue
                 if sequence in {"\x1b[F", "\x1bOF"}:
+                    show_panel()
                     history_view_from_start = False
                     cursor = len(buffer)
                     render(panel_hidden=False)
                     continue
                 if sequence == "\x1b[3~":
+                    show_panel()
                     if cursor < len(buffer):
                         buffer = buffer[:cursor] + buffer[cursor + 1 :]
                         history_view_from_start = False
