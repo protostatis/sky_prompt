@@ -5052,8 +5052,50 @@ result = a + b
                 shutil.rmtree(shim_dir, ignore_errors=True)
 
             self.assertIn("-m pip", pip_content)
+            self.assertIn("UV_PYTHON", pip_content)
+            self.assertIn("uv pip", pip_content)
             self.assertIn("python3", python_content)
             self.assertIn("python with spaces/bin/python3", pip_content)
+
+        def test_create_local_python_tool_shims_pip_falls_back_to_uv(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                fake_python = fake_bin / "python3.10"
+                fake_uv = fake_bin / "uv"
+                fake_python.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "printf 'PY:%s\\n' \"$*\"\n",
+                    encoding="utf-8",
+                )
+                fake_uv.write_text(
+                    "#!/bin/sh\n"
+                    "printf 'UV_PYTHON=%s\\n' \"$UV_PYTHON\"\n"
+                    "printf 'UV_ARGS=%s\\n' \"$*\"\n",
+                    encoding="utf-8",
+                )
+                fake_python.chmod(0o755)
+                fake_uv.chmod(0o755)
+                shim_dir = create_local_python_tool_shims(str(fake_python))
+                try:
+                    env = os.environ.copy()
+                    env["PATH"] = f"{shim_dir}{os.pathsep}{fake_bin}"
+                    completed = subprocess.run(
+                        [str(shim_dir / "pip"), "install", "yfinance"],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        check=False,
+                    )
+                finally:
+                    shutil.rmtree(shim_dir, ignore_errors=True)
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn(f"UV_PYTHON={fake_python}", completed.stdout)
+            self.assertIn("UV_ARGS=pip install yfinance", completed.stdout)
 
         def test_execute_cell_locally_bash_uses_python_shims_when_path_missing(self) -> None:
             cell = {
@@ -5066,6 +5108,27 @@ result = a + b
             self.assertTrue(bool(result.get("ok")), msg=json.dumps(result))
             self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
             self.assertIn("BASH_OK", str(result.get("stdout") or ""))
+
+        def test_execute_cell_locally_bash_uses_overridden_python_shim(self) -> None:
+            fake_python = Path(tempfile.mkdtemp(prefix="sky-fake-python-")) / "python3.10"
+            fake_python.write_text("#!/bin/sh\necho OVERRIDE_PY\n", encoding="utf-8")
+            fake_python.chmod(0o755)
+            cell = {
+                "id": "sh2",
+                "language": "bash",
+                "content": "python3 -c \"print('LOCAL_PY')\"",
+            }
+            try:
+                result = execute_cell_locally(
+                    cell,
+                    timeout_s=10,
+                    python_cmd_override=str(fake_python),
+                )
+            finally:
+                shutil.rmtree(fake_python.parent, ignore_errors=True)
+            self.assertTrue(bool(result.get("ok")), msg=json.dumps(result))
+            self.assertEqual(int(result.get("exit_code", -1)), 0, msg=json.dumps(result))
+            self.assertIn("OVERRIDE_PY", str(result.get("stdout") or ""))
 
         def test_execute_cell_locally_keyboard_interrupt_returns_cancelled(self) -> None:
             cell = {
@@ -5596,6 +5659,24 @@ result = a + b
                             resolved = resolve_pyreplab_command()
 
             self.assertIsNone(resolved)
+
+        def test_build_pyreplab_env_prefixes_wrapper_bin_dir(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                pyreplab_path = bin_dir / "pyreplab"
+                python3_path = bin_dir / "python3"
+                pyreplab_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                python3_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                pyreplab_path.chmod(0o755)
+                python3_path.chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=False):
+                    env = build_pyreplab_env([str(pyreplab_path)], session_dir="/tmp/demo", timeout_s=12)
+            self.assertEqual(env.get("PYREPLAB_DIR"), "/tmp/demo")
+            self.assertEqual(env.get("PYREPLAB_TIMEOUT"), "12")
+            first_path_entry = str(env.get("PATH") or "").split(os.pathsep)[0]
+            self.assertEqual(Path(first_path_entry).resolve(), bin_dir.resolve())
 
         def test_start_pyreplab_session_empty_command(self) -> None:
             result = start_pyreplab_session([], Path.cwd(), timeout_s=1)
@@ -6574,11 +6655,23 @@ def resolve_local_python_command() -> str:
 def create_local_python_tool_shims(python_cmd: str) -> Path:
     shim_dir = Path(tempfile.mkdtemp(prefix="sky_prompt_shims_"))
     quoted_python = shlex.quote(str(python_cmd))
+    pip_wrapper = (
+        "#!/bin/sh\n"
+        f"if {quoted_python} -m pip --version >/dev/null 2>&1; then\n"
+        f"  exec {quoted_python} -m pip \"$@\"\n"
+        "fi\n"
+        "if command -v uv >/dev/null 2>&1; then\n"
+        f"  export UV_PYTHON={quoted_python}\n"
+        "  exec uv pip \"$@\"\n"
+        "fi\n"
+        "echo \"pip is unavailable for this Python interpreter and uv is not installed\" >&2\n"
+        "exit 1\n"
+    )
     wrappers = {
         "python": f"#!/bin/sh\nexec {quoted_python} \"$@\"\n",
         "python3": f"#!/bin/sh\nexec {quoted_python} \"$@\"\n",
-        "pip": f"#!/bin/sh\nexec {quoted_python} -m pip \"$@\"\n",
-        "pip3": f"#!/bin/sh\nexec {quoted_python} -m pip \"$@\"\n",
+        "pip": pip_wrapper,
+        "pip3": pip_wrapper,
     }
     for name, body in wrappers.items():
         path = shim_dir / name
@@ -6600,6 +6693,7 @@ def execute_cell_locally(
     cell: Dict[str, Any],
     workdir: Optional[Path] = None,
     timeout_s: int = 30,
+    python_cmd_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     language = normalize_code_language(str(cell.get("language") or ""))
     content = str(cell.get("content") or "")
@@ -6609,7 +6703,7 @@ def execute_cell_locally(
     script_path: Optional[Path] = None
     shim_dir: Optional[Path] = None
     input_text: Optional[str] = None
-    python_cmd = resolve_local_python_command()
+    python_cmd = str(python_cmd_override or "").strip() or resolve_local_python_command()
 
     if language == "python":
         runner_cmd = [python_cmd, "-"]
@@ -6723,6 +6817,74 @@ def resolve_pyreplab_command(explicit_command: Optional[str] = None) -> Optional
     return None
 
 
+def pyreplab_wrapper_bin_dir(pyreplab_cmd: Sequence[str]) -> Optional[Path]:
+    if not pyreplab_cmd:
+        return None
+    first = str(pyreplab_cmd[0] or "").strip()
+    if not first:
+        return None
+    resolved_path: Optional[Path] = None
+    if "/" in first or "\\" in first:
+        candidate = Path(first).expanduser()
+        if candidate.exists():
+            try:
+                resolved_path = candidate.resolve()
+            except OSError:
+                resolved_path = candidate
+    else:
+        discovered = shutil.which(first)
+        if discovered:
+            resolved_path = Path(discovered)
+    if resolved_path is None or resolved_path.name != "pyreplab":
+        return None
+    bin_dir = resolved_path.parent
+    for python_name in ("python3", "python"):
+        python_path = bin_dir / python_name
+        try:
+            if python_path.is_file() and os.access(str(python_path), os.X_OK):
+                return bin_dir
+        except OSError:
+            continue
+    return None
+
+
+def build_pyreplab_env(
+    pyreplab_cmd: Sequence[str],
+    *,
+    session_dir: Optional[str] = None,
+    timeout_s: Optional[int] = None,
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    bin_dir = pyreplab_wrapper_bin_dir(pyreplab_cmd)
+    if bin_dir is not None:
+        existing_path = str(env.get("PATH") or "")
+        env["PATH"] = str(bin_dir) + (os.pathsep + existing_path if existing_path else "")
+    if session_dir:
+        env["PYREPLAB_DIR"] = str(session_dir)
+    if timeout_s is not None:
+        env["PYREPLAB_TIMEOUT"] = str(max(1, int(timeout_s)))
+    return env
+
+
+def resolve_pyreplab_python_command(pyreplab_cmd: Sequence[str]) -> Optional[str]:
+    bin_dir = pyreplab_wrapper_bin_dir(pyreplab_cmd)
+    if bin_dir is not None:
+        for python_name in ("python3", "python"):
+            python_path = bin_dir / python_name
+            try:
+                if python_path.is_file() and os.access(str(python_path), os.X_OK):
+                    return str(python_path)
+            except OSError:
+                continue
+    if pyreplab_cmd:
+        first = str(pyreplab_cmd[0] or "").strip()
+        if first:
+            basename = Path(first).name.lower()
+            if basename.startswith("python"):
+                return first
+    return None
+
+
 def start_pyreplab_session(
     pyreplab_cmd: Sequence[str],
     workdir: Path,
@@ -6731,9 +6893,7 @@ def start_pyreplab_session(
 ) -> Dict[str, Any]:
     if not pyreplab_cmd:
         return {"ok": False, "error": "pyreplab command is empty"}
-    env = os.environ.copy()
-    if session_dir:
-        env["PYREPLAB_DIR"] = str(session_dir)
+    env = build_pyreplab_env(pyreplab_cmd, session_dir=session_dir)
     command = list(pyreplab_cmd) + ["start", "--workdir", str(workdir)]
     try:
         proc = subprocess.run(
@@ -6762,9 +6922,7 @@ def stop_pyreplab_session(
 ) -> Dict[str, Any]:
     if not pyreplab_cmd:
         return {"ok": False, "error": "pyreplab command is empty"}
-    env = os.environ.copy()
-    if session_dir:
-        env["PYREPLAB_DIR"] = str(session_dir)
+    env = build_pyreplab_env(pyreplab_cmd, session_dir=session_dir)
     command = list(pyreplab_cmd) + ["stop"]
     try:
         proc = subprocess.run(
@@ -6799,6 +6957,7 @@ def resolve_pyreplab_session_dir(
     if not pyreplab_cmd:
         return None
     command = list(pyreplab_cmd) + ["dir", "--workdir", str(workdir)]
+    env = build_pyreplab_env(pyreplab_cmd)
     try:
         proc = subprocess.run(
             command,
@@ -6806,6 +6965,7 @@ def resolve_pyreplab_session_dir(
             text=True,
             timeout=max(3, int(timeout_s)),
             cwd=str(workdir),
+            env=env,
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -6835,10 +6995,11 @@ def execute_pyreplab_code(
 
     base_cmd = list(pyreplab_cmd)
     resolved_session_dir = str(session_dir or "").strip()
-    env = os.environ.copy()
-    env["PYREPLAB_TIMEOUT"] = str(max(1, int(timeout_s)))
-    if resolved_session_dir:
-        env["PYREPLAB_DIR"] = str(resolved_session_dir)
+    env = build_pyreplab_env(
+        base_cmd,
+        session_dir=resolved_session_dir,
+        timeout_s=timeout_s,
+    )
 
     warmup = start_pyreplab_session(
         pyreplab_cmd=base_cmd,
@@ -9845,7 +10006,12 @@ def run_repl(
                     )
                 elif run_backend_mode == "pyreplab" and language != "python":
                     print(f"backend: pyreplab supports python only; using local for {language or 'unknown'}")
-                    result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=timeout_s)
+                    result = execute_cell_locally(
+                        cell,
+                        workdir=Path.cwd(),
+                        timeout_s=timeout_s,
+                        python_cmd_override=resolve_pyreplab_python_command(resolved_pyreplab_cmd or []),
+                    )
                 else:
                     result = execute_cell_locally(cell, workdir=Path.cwd(), timeout_s=timeout_s)
                 if not result.get("ok"):
