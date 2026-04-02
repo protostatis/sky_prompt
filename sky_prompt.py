@@ -46,6 +46,7 @@ DEFAULT_AGENT_DISCOVERY_POLL_SECONDS = 2.0
 DEFAULT_RENDER_STABLE_POLLS = 3
 DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
+DEFAULT_COMPOSER_READY_TIMEOUT = 12.0
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
@@ -279,7 +280,7 @@ class MCPClient:
             "params": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "sky-prompt-cli", "version": "0.2.0"},
+                "clientInfo": {"name": "sky-prompt-cli", "version": "0.2.1"},
             },
         }
         response = self._rpc_request(payload, include_session=False, allow_empty=False)
@@ -2604,11 +2605,11 @@ def read_assistant_probe(
     return probe
 
 
-def read_visible_input_text(
+def read_visible_input_state(
     client: MCPClient,
     agent_id: str,
     js_tools: Sequence[str],
-) -> str:
+) -> Dict[str, Any]:
     try:
         _, _, state_text, state = call_js_expression(
             client=client,
@@ -2618,13 +2619,48 @@ def read_visible_input_text(
             label="input state probe",
         )
     except MCPError:
-        return ""
+        return {}
 
     if state is None:
         state = parse_dispatch_status_text(state_text)
     if not isinstance(state, dict):
-        return ""
+        return {}
+    return state
+
+
+def read_visible_input_text(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> str:
+    state = read_visible_input_state(
+        client=client,
+        agent_id=agent_id,
+        js_tools=js_tools,
+    )
     return str(state.get("text_after") or "")
+
+
+def wait_for_visible_input_state(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+    timeout_s: float = DEFAULT_COMPOSER_READY_TIMEOUT,
+    poll_interval_s: float = 0.1,
+) -> Dict[str, Any]:
+    deadline = time.time() + max(0.0, float(timeout_s))
+    last_state: Dict[str, Any] = {}
+    while True:
+        last_state = read_visible_input_state(
+            client=client,
+            agent_id=agent_id,
+            js_tools=js_tools,
+        )
+        if bool(last_state.get("ok")):
+            return last_state
+        if time.time() >= deadline:
+            return last_state
+        time.sleep(max(0.05, float(poll_interval_s)))
 
 
 def read_visible_send_button_state(
@@ -6314,6 +6350,26 @@ result = a + b
             self.assertEqual(read_mock.call_count, 2)
             sleep_mock.assert_called_once()
 
+        def test_wait_for_visible_input_state_retries_until_visible(self) -> None:
+            with mock.patch(
+                __name__ + ".read_visible_input_state",
+                side_effect=[
+                    {"ok": False, "text_after": ""},
+                    {"ok": True, "text_after": "", "focused": True},
+                ],
+            ) as read_mock:
+                with mock.patch(__name__ + ".time.sleep") as sleep_mock:
+                    state = wait_for_visible_input_state(
+                        client=mock.Mock(),
+                        agent_id="agent-test",
+                        js_tools=["js_eval"],
+                        timeout_s=0.2,
+                        poll_interval_s=0.01,
+                    )
+            self.assertTrue(state.get("ok"))
+            self.assertEqual(read_mock.call_count, 2)
+            sleep_mock.assert_called_once()
+
         def test_probe_indicates_submit_when_composer_cleared(self) -> None:
             self.assertTrue(
                 probe_indicates_submit(
@@ -6352,39 +6408,41 @@ result = a + b
 
         def test_dispatch_prompt_prefers_native_submit_when_click_tools_exist(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
-            with mock.patch(__name__ + ".read_assistant_probe", return_value={}) as probe_mock:
-                with mock.patch(__name__ + ".install_live_response_observer", return_value=True):
-                    with mock.patch(__name__ + ".prepare_live_response_observer", return_value={"ok": True}):
-                        with mock.patch(
-                            __name__ + ".cdp_fallback_submit",
-                            return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
-                        ) as native_submit_mock:
-                            with mock.patch(__name__ + ".call_js_expression") as call_js_mock:
-                                with mock.patch(
-                                    __name__ + ".wait_for_assistant_response",
-                                    return_value=(None, True, False, True),
-                                ):
+            with mock.patch(__name__ + ".wait_for_visible_input_state", return_value={"ok": True}) as ready_mock:
+                with mock.patch(__name__ + ".read_assistant_probe", return_value={}) as probe_mock:
+                    with mock.patch(__name__ + ".install_live_response_observer", return_value=True):
+                        with mock.patch(__name__ + ".prepare_live_response_observer", return_value={"ok": True}):
+                            with mock.patch(
+                                __name__ + ".cdp_fallback_submit",
+                                return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
+                            ) as native_submit_mock:
+                                with mock.patch(__name__ + ".call_js_expression") as call_js_mock:
                                     with mock.patch(
-                                        __name__ + ".capture_final_assistant_text",
-                                        return_value=(None, None),
+                                        __name__ + ".wait_for_assistant_response",
+                                        return_value=(None, True, False, True),
                                     ):
                                         with mock.patch(
-                                            __name__ + ".summarize_missing_assistant_response",
-                                            return_value="assistant> (timed out waiting after fallback submit)",
+                                            __name__ + ".capture_final_assistant_text",
+                                            return_value=(None, None),
                                         ):
-                                            with mock.patch("builtins.print"):
-                                                dispatch_prompt(
-                                                    client=client,
-                                                    agent_id="agent-test",
-                                                    prompt="hello",
-                                                    js_tools=["js_eval"],
-                                                    click_tools=["cdp_click"],
-                                                    type_tools=["cdp_type"],
-                                                    ddm_tools=["ddm"],
-                                                    submit=True,
-                                                    layout_text="",
-                                                    wait_for_response=True,
-                                                )
+                                            with mock.patch(
+                                                __name__ + ".summarize_missing_assistant_response",
+                                                return_value="assistant> (timed out waiting after fallback submit)",
+                                            ):
+                                                with mock.patch("builtins.print"):
+                                                    dispatch_prompt(
+                                                        client=client,
+                                                        agent_id="agent-test",
+                                                        prompt="hello",
+                                                        js_tools=["js_eval"],
+                                                        click_tools=["cdp_click"],
+                                                        type_tools=["cdp_type"],
+                                                        ddm_tools=["ddm"],
+                                                        submit=True,
+                                                        layout_text="",
+                                                        wait_for_response=True,
+                                                    )
+            ready_mock.assert_called_once()
             native_submit_mock.assert_called_once()
             call_js_mock.assert_not_called()
             self.assertGreaterEqual(probe_mock.call_count, 2)
@@ -10617,6 +10675,13 @@ def dispatch_prompt(
     poll_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     final_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     with foreground_browser_context(submit_focus_mode):
+        input_ready_state = wait_for_visible_input_state(
+            client=client,
+            agent_id=agent_id,
+            js_tools=js_tools,
+        )
+        if show_dispatch_details and not bool(input_ready_state.get("ok")):
+            print(f"[composer-ready] {json.dumps(input_ready_state)}")
         if wait_for_response and submit:
             baseline_probe = read_assistant_probe(
                 client=client,
