@@ -5744,6 +5744,33 @@ result = a + b
             self.assertEqual(run_single_prompt_mock.call_args.kwargs.get("prompt"), prompt)
             self.assertTrue(bool(run_single_prompt_mock.call_args.kwargs.get("submit")))
 
+        def test_main_prompt_dash_reads_literal_prompt_from_stdin(self) -> None:
+            module_name = main.__module__
+            fake_client = mock.Mock()
+            fake_client.initialize.return_value = None
+            fake_client.list_tools.return_value = ["navigate", "js_eval", "cdp_click", "cdp_type", "ddm"]
+            fake_client.did_auto_launch = False
+            prompt = (
+                "Task: Find cheapest laptop under $1000 on Amazon\n"
+                "Available tools: NAVIGATE <url>, TYPE <text>, CLICK <label>, ENTER, READ, SCROLL up/down\n"
+                "What's your first action?"
+            )
+            with mock.patch.object(sys, "argv", ["sky", "-p", "-"]):
+                with mock.patch(f"{module_name}.read_prompt_from_stdin", return_value=prompt):
+                    with mock.patch(f"{module_name}.resolve_unchained_command", return_value=["unchained"]):
+                        with mock.patch(f"{module_name}.LocalCLIClient", return_value=fake_client):
+                            with mock.patch(f"{module_name}.run_single_prompt") as run_single_prompt_mock:
+                                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(run_single_prompt_mock.call_args.kwargs.get("prompt"), prompt)
+
+        def test_resolve_prompt_text_prefers_stdin_for_dash_explicit_prompt(self) -> None:
+            prompt = "price cap is $1000\nnext line"
+            self.assertEqual(
+                resolve_prompt_text("-", "ignored", prompt),
+                prompt,
+            )
+
         def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
             client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
             with mock.patch("subprocess.run") as run_mock:
@@ -9105,6 +9132,18 @@ def read_prompt_from_stdin() -> str:
     return sys.stdin.read().strip()
 
 
+def resolve_prompt_text(
+    explicit_prompt_arg: Optional[str],
+    cli_prompt: str,
+    stdin_prompt: str,
+) -> str:
+    explicit_raw = str(explicit_prompt_arg or "")
+    explicit_prompt = explicit_raw.strip()
+    if explicit_prompt == "-":
+        return str(stdin_prompt or "").strip()
+    return explicit_prompt or str(cli_prompt or "").strip() or str(stdin_prompt or "").strip()
+
+
 def parse_env_file(path: Path) -> Dict[str, str]:
     values: Dict[str, str] = {}
     if not path.is_file():
@@ -11047,7 +11086,7 @@ def main() -> int:
         "-p",
         "--prompt",
         "-prompt",
-        help="Explicit prompt text. If omitted, positional args or stdin are used.",
+        help="Explicit prompt text. Use '-' to read the prompt literally from stdin. If omitted, positional args or stdin are used.",
     )
     parser.add_argument(
         "--url",
@@ -11283,9 +11322,8 @@ def main() -> int:
         return 0
 
     cli_prompt = " ".join(args.prompt_args).strip()
-    explicit_prompt = (args.prompt or "").strip()
     stdin_prompt = read_prompt_from_stdin()
-    merged_prompt = explicit_prompt or cli_prompt or stdin_prompt
+    merged_prompt = resolve_prompt_text(args.prompt, cli_prompt, stdin_prompt)
 
     transport = str(args.transport or DEFAULT_TRANSPORT).strip().lower()
     resolved_agent_id = ""
