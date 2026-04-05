@@ -82,6 +82,35 @@ sky -p "Explain MCP in one paragraph"
 sky -i
 ```
 
+## Tab-Isolated Orchestrator
+
+Use `scripts/orchestrator.py` when ChatGPT should stay on one tab while browser
+tools execute on another. The script prepares two aliases on the same
+`unchained` port:
+
+- `sky-chat` for `sky -p`
+- `sky-tools` for `mcporter` tool calls
+
+Prepare or refresh the aliases only:
+
+```bash
+python3 scripts/orchestrator.py --prepare-tabs-only
+```
+
+Run the full loop:
+
+```bash
+python3 scripts/orchestrator.py "find the cheapest laptop under 1000 on Amazon"
+```
+
+Useful flags:
+
+```bash
+python3 scripts/orchestrator.py --incognito "compare hotel prices in Chicago"
+python3 scripts/orchestrator.py --chat-tab-alias agent-chat --tool-tab-alias agent-tools "audit signup flow"
+python3 scripts/orchestrator.py --skip-tab-setup "reuse existing aliases"
+```
+
 ## Local Browser Flow
 
 The default transport is:
