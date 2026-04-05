@@ -144,9 +144,14 @@ class UnchainedTabManager:
         return [item for item in payload if isinstance(item, dict)]
 
     def list_aliases(self) -> Dict[str, str]:
-        payload = self._run_json(["alias", "list"])
-        if payload is None:
+        proc = self._run(["alias", "list"], json_output=True)
+        payload_text = str(proc.stdout or "").strip()
+        if not payload_text or payload_text == "No aliases set.":
             return {}
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise CommandError("Unchained returned invalid JSON for alias list") from exc
         if not isinstance(payload, dict):
             raise CommandError(f"Unexpected alias payload: {payload}")
         return {

@@ -15,6 +15,18 @@ SPEC.loader.exec_module(orchestrator)
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_list_aliases_returns_empty_map_when_unchained_reports_no_aliases(self) -> None:
+        manager = orchestrator.UnchainedTabManager(["unchained"], port=9222)
+        with mock.patch.object(
+            manager,
+            "_run",
+            return_value=mock.Mock(stdout="No aliases set.\n", stderr="", returncode=0),
+        ) as run_mock:
+            aliases = manager.list_aliases()
+
+        self.assertEqual(aliases, {})
+        run_mock.assert_called_once_with(["alias", "list"], json_output=True)
+
     def test_tool_executor_routes_commands_to_tool_tab_alias(self) -> None:
         executor = orchestrator.ToolExecutor(["npx", "mcporter"], tool_tab_alias="sky-tools")
 
