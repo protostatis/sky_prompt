@@ -751,6 +751,36 @@ class LocalCLIClient:
         return stdout_text
 
 
+def activate_local_browser_tab_focus(
+    client: MCPClient,
+) -> Dict[str, Any]:
+    if not isinstance(client, LocalCLIClient):
+        return {"ok": False, "skipped": "unsupported_client"}
+
+    result: Dict[str, Any] = {
+        "ok": False,
+        "tab": str(client.tab or ""),
+        "page_bring_to_front": False,
+        "focus_emulation": False,
+    }
+    commands = [
+        ("page_bring_to_front", ["cdp", "Page.bringToFront"]),
+        (
+            "focus_emulation",
+            ["cdp", "Emulation.setFocusEmulationEnabled", json.dumps({"enabled": True}, separators=(",", ":"))],
+        ),
+    ]
+    for key, argv in commands:
+        try:
+            client._run(argv)
+        except MCPError as exc:
+            result[f"{key}_error"] = str(exc)
+        else:
+            result[key] = True
+            result["ok"] = True
+    return result
+
+
 def install_python_tool_with_uv(
     uv_cmd: Sequence[str],
     package: str,
@@ -5816,6 +5846,19 @@ result = a + b
             self.assertEqual(command[-1], "press_enter")
             self.assertIn("Pressed Enter", extract_text(result))
 
+        def test_activate_local_browser_tab_focus_uses_raw_cdp_commands(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9222, tab="sky-chat", timeout=5)
+            with mock.patch.object(client, "_run", return_value="{}") as run_mock:
+                result = activate_local_browser_tab_focus(client)
+            self.assertTrue(bool(result.get("ok")))
+            self.assertEqual(
+                [call.args[0] for call in run_mock.call_args_list],
+                [
+                    ["cdp", "Page.bringToFront"],
+                    ["cdp", "Emulation.setFocusEmulationEnabled", '{"enabled":true}'],
+                ],
+            )
+
         def test_local_cli_client_initialize_requires_running_browser(self) -> None:
             client = LocalCLIClient(["unchained"], port=9222, tab="auto", timeout=5)
             with mock.patch("subprocess.run") as run_mock:
@@ -6123,12 +6166,19 @@ result = a + b
 
         def test_browser_foreground_mode_defaults_by_platform(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
-                self.assertEqual(browser_foreground_mode({}), "submit")
-                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
-                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                    self.assertEqual(browser_foreground_mode({}), "submit")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
             with mock.patch.object(sys, "platform", "linux"):
                 self.assertEqual(browser_foreground_mode({}), "off")
                 self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
+
+        def test_browser_foreground_mode_disables_focus_when_not_terminal_driven(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=False):
+                    self.assertEqual(browser_foreground_mode({}), "off")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
 
         def test_browser_window_parking_disabled_by_default_on_darwin(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
@@ -6158,13 +6208,14 @@ result = a + b
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
                     with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
-                        with mock.patch.dict(
-                            os.environ,
-                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                            clear=False,
-                        ):
-                            with foreground_browser_context("hold"):
-                                pass
+                        with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                            with mock.patch.dict(
+                                os.environ,
+                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                clear=False,
+                            ):
+                                with foreground_browser_context("hold"):
+                                    pass
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6173,13 +6224,14 @@ result = a + b
         def test_foreground_browser_context_hold_does_not_restore_when_browser_already_frontmost(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("hold"):
-                            pass
+                    with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("hold"):
+                                pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_foreground_browser_context_hold_parks_window_offscreen_when_focus_is_stolen(self) -> None:
@@ -6188,13 +6240,14 @@ result = a + b
                     with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=True):
                         with mock.patch(__name__ + ".front_window_bounds", return_value=(100, 50, 500, 450)):
                             with mock.patch(__name__ + ".set_front_window_bounds", return_value=True) as bounds_mock:
-                                with mock.patch.dict(
-                                    os.environ,
-                                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                                    clear=False,
-                                ):
-                                    with foreground_browser_context("hold"):
-                                        pass
+                                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                                    with mock.patch.dict(
+                                        os.environ,
+                                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                        clear=False,
+                                    ):
+                                        with foreground_browser_context("hold"):
+                                            pass
             self.assertEqual(
                 bounds_mock.call_args_list,
                 [
@@ -6210,13 +6263,14 @@ result = a + b
         def test_foreground_browser_context_pulse_scope_does_not_activate_apps(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("pulse"):
-                            pass
+                    with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("pulse"):
+                                pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_foreground_browser_context_is_noop_off_darwin(self) -> None:
@@ -6226,25 +6280,34 @@ result = a + b
                         pass
             self.assertEqual(activate_mock.call_args_list, [])
 
+        def test_foreground_browser_context_is_noop_when_not_terminal_driven(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=False):
+                    with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                        with foreground_browser_context("hold"):
+                            pass
+            self.assertEqual(activate_mock.call_args_list, [])
+
         def test_call_js_expression_pulses_browser_in_pulse_context(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
             fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
                     with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
-                        with mock.patch.dict(
-                            os.environ,
-                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                            clear=False,
-                        ):
-                            with foreground_browser_context("pulse"):
-                                call_js_expression(
-                                    client=client,
-                                    js_tools=["js_eval"],
-                                    agent_id="agent-test",
-                                    expression="1 + 1",
-                                    label="js test",
-                                )
+                        with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                            with mock.patch.dict(
+                                os.environ,
+                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                clear=False,
+                            ):
+                                with foreground_browser_context("pulse"):
+                                    call_js_expression(
+                                        client=client,
+                                        js_tools=["js_eval"],
+                                        agent_id="agent-test",
+                                        expression="1 + 1",
+                                        label="js test",
+                                    )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6257,19 +6320,20 @@ result = a + b
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
                     with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
                         with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
-                            with mock.patch.dict(
-                                os.environ,
-                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                                clear=False,
-                            ):
-                                with foreground_browser_context("hold"):
-                                    call_js_expression(
-                                        client=client,
-                                        js_tools=["js_eval"],
-                                        agent_id="agent-test",
-                                        expression="1 + 1",
-                                        label="js test",
-                                    )
+                            with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                                with mock.patch.dict(
+                                    os.environ,
+                                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                    clear=False,
+                                ):
+                                    with foreground_browser_context("hold"):
+                                        call_js_expression(
+                                            client=client,
+                                            js_tools=["js_eval"],
+                                            agent_id="agent-test",
+                                            expression="1 + 1",
+                                            label="js test",
+                                        )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6643,6 +6707,44 @@ result = a + b
             native_submit_mock.assert_called_once()
             call_js_mock.assert_not_called()
             self.assertGreaterEqual(probe_mock.call_count, 2)
+
+        def test_dispatch_prompt_activates_local_tab_focus_before_submit(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9222, tab="sky-chat", timeout=5)
+            with mock.patch(__name__ + ".activate_local_browser_tab_focus", return_value={"ok": True}) as focus_mock:
+                with mock.patch(__name__ + ".wait_for_visible_input_state", return_value={"ok": True}):
+                    with mock.patch(__name__ + ".read_assistant_probe", return_value={}):
+                        with mock.patch(__name__ + ".install_live_response_observer", return_value=True):
+                            with mock.patch(__name__ + ".prepare_live_response_observer", return_value={"ok": True}):
+                                with mock.patch(
+                                    __name__ + ".cdp_fallback_submit",
+                                    return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
+                                ):
+                                    with mock.patch(
+                                        __name__ + ".wait_for_assistant_response",
+                                        return_value=(None, True, False, True),
+                                    ):
+                                        with mock.patch(
+                                            __name__ + ".capture_final_assistant_text",
+                                            return_value=(None, None),
+                                        ):
+                                            with mock.patch(
+                                                __name__ + ".summarize_missing_assistant_response",
+                                                return_value="assistant> (timed out waiting after fallback submit)",
+                                            ):
+                                                with mock.patch("builtins.print"):
+                                                    dispatch_prompt(
+                                                        client=client,
+                                                        agent_id="agent-test",
+                                                        prompt="hello",
+                                                        js_tools=["js_eval"],
+                                                        click_tools=["cdp_click"],
+                                                        type_tools=["cdp_type"],
+                                                        ddm_tools=["ddm"],
+                                                        submit=True,
+                                                        layout_text="",
+                                                        wait_for_response=True,
+                                                    )
+            focus_mock.assert_called_once_with(client)
 
         def test_dispatch_prompt_raises_when_composer_not_ready(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
@@ -8618,11 +8720,38 @@ def read_live_repl_input(
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
+def cli_session_is_foreground_driven(
+    stdin: Optional[Any] = None,
+    stdout: Optional[Any] = None,
+) -> bool:
+    input_stream = stdin if stdin is not None else sys.stdin
+    output_stream = stdout if stdout is not None else sys.stdout
+    try:
+        if not bool(input_stream.isatty()) or not bool(output_stream.isatty()):
+            return False
+    except Exception:
+        return False
+    if os.name != "posix" or not hasattr(os, "tcgetpgrp"):
+        return True
+    for stream in (input_stream, output_stream):
+        try:
+            fd = int(stream.fileno())
+        except Exception:
+            continue
+        try:
+            return int(os.tcgetpgrp(fd)) == int(os.getpgrp())
+        except OSError:
+            continue
+    return True
+
+
 def browser_foreground_mode(env: Optional[Mapping[str, str]] = None) -> str:
     values = env or os.environ
     default_mode = "submit" if sys.platform == "darwin" else "off"
     raw = str(values.get("SKY_FOREGROUND_BROWSER", default_mode) or "").strip().lower()
     if sys.platform != "darwin":
+        return "off"
+    if not cli_session_is_foreground_driven():
         return "off"
     if raw in {"0", "false", "off", "no", "none"}:
         return "off"
@@ -8799,7 +8928,7 @@ def foreground_browser_context(mode: str) -> Iterable[None]:
     resolved_mode = str(mode or "off").strip().lower()
     if resolved_mode not in {"off", "hold", "pulse"}:
         resolved_mode = "off"
-    if resolved_mode == "off" or sys.platform != "darwin":
+    if resolved_mode == "off" or sys.platform != "darwin" or not cli_session_is_foreground_driven():
         yield
         return
     browser_app = browser_application_name_from_env()
@@ -11000,6 +11129,9 @@ def dispatch_prompt(
     poll_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     final_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     with foreground_browser_context(submit_focus_mode):
+        local_focus_state = activate_local_browser_tab_focus(client) if submit else {"ok": False, "skipped": "no_submit"}
+        if submit and show_dispatch_details:
+            print(f"[tab-focus] {json.dumps(local_focus_state)}")
         input_ready_state = wait_for_visible_input_state(
             client=client,
             agent_id=agent_id,
