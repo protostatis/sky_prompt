@@ -24,6 +24,7 @@ import tempfile
 import textwrap
 import time
 import urllib.error
+from urllib.parse import urlparse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -750,6 +751,36 @@ class LocalCLIClient:
         return stdout_text
 
 
+def activate_local_browser_tab_focus(
+    client: MCPClient,
+) -> Dict[str, Any]:
+    if not isinstance(client, LocalCLIClient):
+        return {"ok": False, "skipped": "unsupported_client"}
+
+    result: Dict[str, Any] = {
+        "ok": False,
+        "tab": str(client.tab or ""),
+        "page_bring_to_front": False,
+        "focus_emulation": False,
+    }
+    commands = [
+        ("page_bring_to_front", ["cdp", "Page.bringToFront"]),
+        (
+            "focus_emulation",
+            ["cdp", "Emulation.setFocusEmulationEnabled", json.dumps({"enabled": True}, separators=(",", ":"))],
+        ),
+    ]
+    for key, argv in commands:
+        try:
+            client._run(argv)
+        except MCPError as exc:
+            result[f"{key}_error"] = str(exc)
+        else:
+            result[key] = True
+            result["ok"] = True
+    return result
+
+
 def install_python_tool_with_uv(
     uv_cmd: Sequence[str],
     package: str,
@@ -1048,7 +1079,9 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
   function currentInputText(el) {{
     if (!el) return "";
     if ("value" in el) return String(el.value || "");
-    return String(el.innerText || el.textContent || "");
+    const isContentEditable = String(el.getAttribute("contenteditable") || "").toLowerCase() === "true";
+    if (isContentEditable) return String(el.innerText || el.textContent || "");
+    return String(el.textContent || "");
   }}
 
   function setTextValue(el, text) {{
@@ -1261,6 +1294,8 @@ def build_input_state_expression() -> str:
   function currentInputText(el) {
     if (!el) return "";
     if ("value" in el) return String(el.value || "");
+    const isContentEditable = String(el.getAttribute("contenteditable") || "").toLowerCase() === "true";
+    if (isContentEditable) return String(el.innerText || el.textContent || "");
     return String(el.textContent || "");
   }
 
@@ -1282,10 +1317,13 @@ def build_input_state_expression() -> str:
   if (!input) {
     return JSON.stringify({ ok: false, text_after: "" });
   }
+  const rect = input.getBoundingClientRect();
   return JSON.stringify({
     ok: true,
     text_after: currentInputText(input),
-    focused: document.activeElement === input
+    focused: document.activeElement === input,
+    x: Math.round(rect.left + rect.width / 2),
+    y: Math.round(rect.top + rect.height / 2)
   });
 })()
 """.strip()
@@ -1479,6 +1517,8 @@ def build_live_response_observer_install_expression() -> str:
   function currentInputText(el) {
     if (!el) return "";
     if ("value" in el) return String(el.value || "");
+    const isContentEditable = String(el.getAttribute("contenteditable") || "").toLowerCase() === "true";
+    if (isContentEditable) return String(el.innerText || el.textContent || "");
     return String(el.textContent || "");
   }
 
@@ -1664,6 +1704,9 @@ def build_live_response_observer_install_expression() -> str:
       const bodyText = String(body || "").toLowerCase();
       if (!urlText && !bodyText) return false;
       if (/(telemetry|analytics|segment|sentry|statsig|featuregates|track|log)/.test(urlText)) {
+        return false;
+      }
+      if (/(conversation\/prepare|generate_autocompletions)/.test(urlText)) {
         return false;
       }
       if (/(backend-api|conversation|messages|response|responses|prompt|chat)/.test(urlText)) {
@@ -1937,6 +1980,8 @@ def build_assistant_probe_expression() -> str:
   function currentInputText(el) {
     if (!el) return "";
     if ("value" in el) return String(el.value || "");
+    const isContentEditable = String(el.getAttribute("contenteditable") || "").toLowerCase() === "true";
+    if (isContentEditable) return String(el.innerText || el.textContent || "");
     return String(el.textContent || "");
   }
 
@@ -2655,6 +2700,22 @@ def wait_for_visible_input_state(
         if time.time() >= deadline:
             return last_state
         time.sleep(max(0.05, float(poll_interval_s)))
+
+
+def describe_composer_not_ready(state: Optional[Mapping[str, Any]]) -> str:
+    payload = dict(state or {})
+    error = str(payload.get("error") or "").strip()
+    focused = payload.get("focused")
+    if error == "no_visible_chat_input":
+        return (
+            "Composer not ready on the selected tab. Ensure the tab is on the ChatGPT "
+            "chat screen and that you are logged in."
+        )
+    if error:
+        return f"Composer not ready on the selected tab ({error})."
+    if focused is False:
+        return "Composer probe found an input, but it was not focusable on the selected tab."
+    return "Composer not ready on the selected tab."
 
 
 def read_visible_send_button_state(
@@ -5771,6 +5832,37 @@ result = a + b
                 prompt,
             )
 
+        def test_urls_share_origin_matches_chatgpt_conversation(self) -> None:
+            self.assertTrue(urls_share_origin("https://chatgpt.com/c/abc123", "https://chatgpt.com"))
+            self.assertFalse(urls_share_origin("https://example.com", "https://chatgpt.com"))
+
+        def test_run_single_prompt_reuses_current_chatgpt_page(self) -> None:
+            client = mock.Mock()
+            with mock.patch(
+                __name__ + ".read_current_page_identity",
+                return_value={"href": "https://chatgpt.com/c/abc123", "title": "ChatGPT"},
+            ):
+                with mock.patch(__name__ + ".navigate_current_page") as navigate_mock:
+                    with mock.patch(__name__ + ".dispatch_prompt") as dispatch_mock:
+                        run_single_prompt(
+                            client=client,
+                            agent_id="agent-test",
+                            url="https://chatgpt.com",
+                            prompt="hello",
+                            navigate_tools=["navigate"],
+                            js_tools=["js_eval"],
+                            click_tools=["cdp_click"],
+                            type_tools=["cdp_type"],
+                            ddm_tools=["ddm"],
+                            submit=True,
+                            output_format="plain",
+                            wait_timeout_s=10,
+                            poll_interval_s=0.5,
+                            debug=False,
+                        )
+            navigate_mock.assert_not_called()
+            self.assertEqual(dispatch_mock.call_args.kwargs.get("layout_text"), "")
+
         def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
             client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
             with mock.patch("subprocess.run") as run_mock:
@@ -5780,6 +5872,19 @@ result = a + b
             self.assertEqual(command[:5], ["unchained", "--port", "9333", "--tab", "chatgpt"])
             self.assertEqual(command[-1], "press_enter")
             self.assertIn("Pressed Enter", extract_text(result))
+
+        def test_activate_local_browser_tab_focus_uses_raw_cdp_commands(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9222, tab="sky-chat", timeout=5)
+            with mock.patch.object(client, "_run", return_value="{}") as run_mock:
+                result = activate_local_browser_tab_focus(client)
+            self.assertTrue(bool(result.get("ok")))
+            self.assertEqual(
+                [call.args[0] for call in run_mock.call_args_list],
+                [
+                    ["cdp", "Page.bringToFront"],
+                    ["cdp", "Emulation.setFocusEmulationEnabled", '{"enabled":true}'],
+                ],
+            )
 
         def test_local_cli_client_initialize_requires_running_browser(self) -> None:
             client = LocalCLIClient(["unchained"], port=9222, tab="auto", timeout=5)
@@ -6088,12 +6193,19 @@ result = a + b
 
         def test_browser_foreground_mode_defaults_by_platform(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
-                self.assertEqual(browser_foreground_mode({}), "submit")
-                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
-                self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                    self.assertEqual(browser_foreground_mode({}), "submit")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "0"}), "off")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "poll")
             with mock.patch.object(sys, "platform", "linux"):
                 self.assertEqual(browser_foreground_mode({}), "off")
                 self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
+
+        def test_browser_foreground_mode_disables_focus_when_not_terminal_driven(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=False):
+                    self.assertEqual(browser_foreground_mode({}), "off")
+                    self.assertEqual(browser_foreground_mode({"SKY_FOREGROUND_BROWSER": "1"}), "off")
 
         def test_browser_window_parking_disabled_by_default_on_darwin(self) -> None:
             with mock.patch.object(sys, "platform", "darwin"):
@@ -6123,13 +6235,14 @@ result = a + b
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
                     with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
-                        with mock.patch.dict(
-                            os.environ,
-                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                            clear=False,
-                        ):
-                            with foreground_browser_context("hold"):
-                                pass
+                        with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                            with mock.patch.dict(
+                                os.environ,
+                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                clear=False,
+                            ):
+                                with foreground_browser_context("hold"):
+                                    pass
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6138,13 +6251,14 @@ result = a + b
         def test_foreground_browser_context_hold_does_not_restore_when_browser_already_frontmost(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("hold"):
-                            pass
+                    with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("hold"):
+                                pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_foreground_browser_context_hold_parks_window_offscreen_when_focus_is_stolen(self) -> None:
@@ -6153,13 +6267,14 @@ result = a + b
                     with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=True):
                         with mock.patch(__name__ + ".front_window_bounds", return_value=(100, 50, 500, 450)):
                             with mock.patch(__name__ + ".set_front_window_bounds", return_value=True) as bounds_mock:
-                                with mock.patch.dict(
-                                    os.environ,
-                                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                                    clear=False,
-                                ):
-                                    with foreground_browser_context("hold"):
-                                        pass
+                                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                                    with mock.patch.dict(
+                                        os.environ,
+                                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                        clear=False,
+                                    ):
+                                        with foreground_browser_context("hold"):
+                                            pass
             self.assertEqual(
                 bounds_mock.call_args_list,
                 [
@@ -6175,13 +6290,14 @@ result = a + b
         def test_foreground_browser_context_pulse_scope_does_not_activate_apps(self) -> None:
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Google Chrome"):
-                    with mock.patch.dict(
-                        os.environ,
-                        {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                        clear=False,
-                    ):
-                        with foreground_browser_context("pulse"):
-                            pass
+                    with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                        with mock.patch.dict(
+                            os.environ,
+                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                            clear=False,
+                        ):
+                            with foreground_browser_context("pulse"):
+                                pass
             self.assertEqual(activate_mock.call_args_list, [])
 
         def test_foreground_browser_context_is_noop_off_darwin(self) -> None:
@@ -6191,25 +6307,34 @@ result = a + b
                         pass
             self.assertEqual(activate_mock.call_args_list, [])
 
+        def test_foreground_browser_context_is_noop_when_not_terminal_driven(self) -> None:
+            with mock.patch.object(sys, "platform", "darwin"):
+                with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=False):
+                    with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
+                        with foreground_browser_context("hold"):
+                            pass
+            self.assertEqual(activate_mock.call_args_list, [])
+
         def test_call_js_expression_pulses_browser_in_pulse_context(self) -> None:
             client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
             fake_result = {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
             with mock.patch(__name__ + ".activate_application", return_value=True) as activate_mock:
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
                     with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
-                        with mock.patch.dict(
-                            os.environ,
-                            {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                            clear=False,
-                        ):
-                            with foreground_browser_context("pulse"):
-                                call_js_expression(
-                                    client=client,
-                                    js_tools=["js_eval"],
-                                    agent_id="agent-test",
-                                    expression="1 + 1",
-                                    label="js test",
-                                )
+                        with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                            with mock.patch.dict(
+                                os.environ,
+                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                clear=False,
+                            ):
+                                with foreground_browser_context("pulse"):
+                                    call_js_expression(
+                                        client=client,
+                                        js_tools=["js_eval"],
+                                        agent_id="agent-test",
+                                        expression="1 + 1",
+                                        label="js test",
+                                    )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6222,19 +6347,20 @@ result = a + b
                 with mock.patch(__name__ + ".call_tool_variants", return_value=("js_eval", fake_result)):
                     with mock.patch(__name__ + ".current_frontmost_application_name", return_value="Terminal"):
                         with mock.patch(__name__ + ".browser_window_parking_enabled", return_value=False):
-                            with mock.patch.dict(
-                                os.environ,
-                                {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
-                                clear=False,
-                            ):
-                                with foreground_browser_context("hold"):
-                                    call_js_expression(
-                                        client=client,
-                                        js_tools=["js_eval"],
-                                        agent_id="agent-test",
-                                        expression="1 + 1",
-                                        label="js test",
-                                    )
+                            with mock.patch(__name__ + ".cli_session_is_foreground_driven", return_value=True):
+                                with mock.patch.dict(
+                                    os.environ,
+                                    {"TERM_PROGRAM": "Apple_Terminal", "SKY_BROWSER_APP": "Google Chrome"},
+                                    clear=False,
+                                ):
+                                    with foreground_browser_context("hold"):
+                                        call_js_expression(
+                                            client=client,
+                                            js_tools=["js_eval"],
+                                            agent_id="agent-test",
+                                            expression="1 + 1",
+                                            label="js test",
+                                        )
             self.assertEqual(
                 activate_mock.call_args_list,
                 [mock.call("Google Chrome"), mock.call("Terminal")],
@@ -6468,6 +6594,30 @@ result = a + b
             self.assertEqual(read_mock.call_count, 2)
             sleep_mock.assert_called_once()
 
+        def test_build_input_state_expression_uses_inner_text_and_reports_coords(self) -> None:
+            expression = build_input_state_expression()
+            self.assertIn("el.innerText || el.textContent", expression)
+            self.assertIn("x: Math.round(rect.left + rect.width / 2)", expression)
+
+        def test_extract_point_from_state_requires_positive_coords(self) -> None:
+            self.assertEqual(extract_point_from_state({"x": 12, "y": 34}), (12, 34))
+            self.assertIsNone(extract_point_from_state({"x": 0, "y": 34}))
+            self.assertIsNone(extract_point_from_state({"x": "bad", "y": 34}))
+
+        def test_choose_input_point_prefers_textbox_over_generic_chat_label(self) -> None:
+            point = choose_input_point(
+                [
+                    (">Chat with ChatGPT", 973, 424),
+                    ("div[role=textbox][contenteditable=true]", 973, 472),
+                ]
+            )
+            self.assertEqual(point, (973, 472))
+
+        def test_describe_composer_not_ready_mentions_chatgpt_login_for_missing_input(self) -> None:
+            message = describe_composer_not_ready({"ok": False, "error": "no_visible_chat_input"})
+            self.assertIn("ChatGPT", message)
+            self.assertIn("logged in", message)
+
         def test_probe_indicates_submit_when_composer_cleared(self) -> None:
             self.assertTrue(
                 probe_indicates_submit(
@@ -6501,6 +6651,46 @@ result = a + b
                         "generating": False,
                     },
                     expected_prompt="hello, can you teach me a how to build a neural network in numpy",
+                )
+            )
+
+        def test_observer_probe_confirms_submit_rejects_background_prepare_noise(self) -> None:
+            self.assertFalse(
+                observer_probe_confirms_submit(
+                    baseline_probe={"assistant_count": 1, "latest_hash": "same", "user_count": 1, "latest_user_hash": "u1"},
+                    probe={
+                        "submit_detected": True,
+                        "assistant_count": 1,
+                        "latest_hash": "same",
+                        "user_count": 1,
+                        "latest_user_hash": "u1",
+                        "latest_user_text": "",
+                        "composer_text": "count to 3",
+                        "send_visible": True,
+                        "send_enabled": True,
+                        "generating": False,
+                    },
+                    expected_prompt="count to 3",
+                )
+            )
+
+        def test_observer_probe_confirms_submit_accepts_cleared_composer(self) -> None:
+            self.assertTrue(
+                observer_probe_confirms_submit(
+                    baseline_probe={"assistant_count": 1, "latest_hash": "same", "user_count": 1, "latest_user_hash": "u1"},
+                    probe={
+                        "submit_detected": True,
+                        "assistant_count": 1,
+                        "latest_hash": "same",
+                        "user_count": 1,
+                        "latest_user_hash": "u1",
+                        "latest_user_text": "",
+                        "composer_text": "",
+                        "send_visible": False,
+                        "send_enabled": False,
+                        "generating": False,
+                    },
+                    expected_prompt="count to 3",
                 )
             )
 
@@ -6544,6 +6734,65 @@ result = a + b
             native_submit_mock.assert_called_once()
             call_js_mock.assert_not_called()
             self.assertGreaterEqual(probe_mock.call_count, 2)
+
+        def test_dispatch_prompt_activates_local_tab_focus_before_submit(self) -> None:
+            client = LocalCLIClient(["unchained"], port=9222, tab="sky-chat", timeout=5)
+            with mock.patch(__name__ + ".activate_local_browser_tab_focus", return_value={"ok": True}) as focus_mock:
+                with mock.patch(__name__ + ".wait_for_visible_input_state", return_value={"ok": True}):
+                    with mock.patch(__name__ + ".read_assistant_probe", return_value={}):
+                        with mock.patch(__name__ + ".install_live_response_observer", return_value=True):
+                            with mock.patch(__name__ + ".prepare_live_response_observer", return_value={"ok": True}):
+                                with mock.patch(
+                                    __name__ + ".cdp_fallback_submit",
+                                    return_value={"ok": True, "submitted": True, "mode": "js_fill+cdp_click"},
+                                ):
+                                    with mock.patch(
+                                        __name__ + ".wait_for_assistant_response",
+                                        return_value=(None, True, False, True),
+                                    ):
+                                        with mock.patch(
+                                            __name__ + ".capture_final_assistant_text",
+                                            return_value=(None, None),
+                                        ):
+                                            with mock.patch(
+                                                __name__ + ".summarize_missing_assistant_response",
+                                                return_value="assistant> (timed out waiting after fallback submit)",
+                                            ):
+                                                with mock.patch("builtins.print"):
+                                                    dispatch_prompt(
+                                                        client=client,
+                                                        agent_id="agent-test",
+                                                        prompt="hello",
+                                                        js_tools=["js_eval"],
+                                                        click_tools=["cdp_click"],
+                                                        type_tools=["cdp_type"],
+                                                        ddm_tools=["ddm"],
+                                                        submit=True,
+                                                        layout_text="",
+                                                        wait_for_response=True,
+                                                    )
+            focus_mock.assert_called_once_with(client)
+
+        def test_dispatch_prompt_raises_when_composer_not_ready(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            with mock.patch(
+                __name__ + ".wait_for_visible_input_state",
+                return_value={"ok": False, "error": "no_visible_chat_input"},
+            ):
+                with self.assertRaises(MCPError) as exc:
+                    dispatch_prompt(
+                        client=client,
+                        agent_id="agent-test",
+                        prompt="hello",
+                        js_tools=["js_eval"],
+                        click_tools=["cdp_click"],
+                        type_tools=["cdp_type"],
+                        ddm_tools=["ddm"],
+                        submit=True,
+                        layout_text="",
+                        wait_for_response=True,
+                    )
+            self.assertIn("logged in", str(exc.exception))
 
         def test_summarize_missing_assistant_response_prefers_empty_shell_messages(self) -> None:
             self.assertEqual(
@@ -8498,11 +8747,38 @@ def read_live_repl_input(
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
+def cli_session_is_foreground_driven(
+    stdin: Optional[Any] = None,
+    stdout: Optional[Any] = None,
+) -> bool:
+    input_stream = stdin if stdin is not None else sys.stdin
+    output_stream = stdout if stdout is not None else sys.stdout
+    try:
+        if not bool(input_stream.isatty()) or not bool(output_stream.isatty()):
+            return False
+    except Exception:
+        return False
+    if os.name != "posix" or not hasattr(os, "tcgetpgrp"):
+        return True
+    for stream in (input_stream, output_stream):
+        try:
+            fd = int(stream.fileno())
+        except Exception:
+            continue
+        try:
+            return int(os.tcgetpgrp(fd)) == int(os.getpgrp())
+        except OSError:
+            continue
+    return True
+
+
 def browser_foreground_mode(env: Optional[Mapping[str, str]] = None) -> str:
     values = env or os.environ
     default_mode = "submit" if sys.platform == "darwin" else "off"
     raw = str(values.get("SKY_FOREGROUND_BROWSER", default_mode) or "").strip().lower()
     if sys.platform != "darwin":
+        return "off"
+    if not cli_session_is_foreground_driven():
         return "off"
     if raw in {"0", "false", "off", "no", "none"}:
         return "off"
@@ -8679,7 +8955,7 @@ def foreground_browser_context(mode: str) -> Iterable[None]:
     resolved_mode = str(mode or "off").strip().lower()
     if resolved_mode not in {"off", "hold", "pulse"}:
         resolved_mode = "off"
-    if resolved_mode == "off" or sys.platform != "darwin":
+    if resolved_mode == "off" or sys.platform != "darwin" or not cli_session_is_foreground_driven():
         yield
         return
     browser_app = browser_application_name_from_env()
@@ -8784,6 +9060,20 @@ def probe_indicates_submit(
     return (current_count > baseline_count) or (
         current_hash and baseline_hash and current_hash != baseline_hash
     )
+
+
+def observer_probe_confirms_submit(
+    baseline_probe: Optional[Dict[str, Any]],
+    probe: Optional[Dict[str, Any]],
+    expected_prompt: str,
+) -> bool:
+    if not probe or not bool((probe or {}).get("submit_detected")):
+        return False
+    if probe_has_new_user_turn(baseline_probe, probe, expected_prompt):
+        return True
+    if probe_has_cleared_composer(probe, expected_prompt):
+        return True
+    return bool((probe or {}).get("generating"))
 
 
 def common_prefix_length(left: str, right: str) -> int:
@@ -8929,7 +9219,11 @@ def wait_for_assistant_response(
                     expected_norm[:80] in user_norm or user_norm[:80] in expected_norm
                 ):
                     user_submitted = True
-        if bool(probe.get("submit_detected")):
+        if observer_probe_confirms_submit(
+            baseline_probe=baseline_probe,
+            probe=probe,
+            expected_prompt=expected_prompt,
+        ):
             user_submitted = True
         if not user_submitted and probe_indicates_submit(
             baseline_probe=baseline_probe,
@@ -9066,6 +9360,19 @@ def parse_layout_points(layout_text: str) -> List[Tuple[str, int, int]]:
     return points
 
 
+def extract_point_from_state(state: Optional[Mapping[str, Any]]) -> Optional[Tuple[int, int]]:
+    if not state:
+        return None
+    try:
+        x = int((state or {}).get("x") or 0)
+        y = int((state or {}).get("y") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if x <= 0 or y <= 0:
+        return None
+    return x, y
+
+
 def choose_send_point(points: Sequence[Tuple[str, int, int]]) -> Optional[Tuple[int, int]]:
     ranked: List[Tuple[int, int, int]] = []
     for label, x, y in points:
@@ -9099,24 +9406,28 @@ def choose_input_point(points: Sequence[Tuple[str, int, int]]) -> Optional[Tuple
                 "good response",
                 "bad response",
                 "open conversation options",
+                "open conversation",
                 "previous response",
                 "next response",
                 "send",
                 "cancel",
+                "chat with chatgpt",
+                "start voice",
+                "start dictation",
             )
         ):
             continue
         score = -1
-        if label.startswith(">"):
+        if "textarea" in lower or "textbox" in lower:
             score = 100
         elif "ask anything" in lower:
             score = 95
-        elif "textarea" in lower or "textbox" in lower:
-            score = 90
         elif lower.startswith("message") or "message chatgpt" in lower:
-            score = 85
+            score = 90
         elif "prompt" in lower and "send" not in lower:
             score = 70
+        elif label.startswith(">"):
+            score = 40
         if score >= 0:
             ranked.append((score, x, y))
     if not ranked:
@@ -9803,6 +10114,67 @@ def navigate_current_page(
     return nav_text
 
 
+def read_current_page_identity(
+    client: MCPClient,
+    agent_id: str,
+    js_tools: Sequence[str],
+) -> Dict[str, Any]:
+    if not js_tools:
+        return {}
+    try:
+        _, _, state_text, state = call_js_expression(
+            client=client,
+            js_tools=js_tools,
+            agent_id=agent_id,
+            expression='JSON.stringify({ok:true,href:location.href,title:document.title})',
+            label="page identity",
+        )
+    except MCPError:
+        return {}
+    if state is None:
+        state = parse_dispatch_status_text(state_text)
+    if not isinstance(state, dict):
+        return {}
+    return state
+
+
+def urls_share_origin(current_url: str, desired_url: str) -> bool:
+    current = str(current_url or "").strip()
+    desired = str(desired_url or "").strip()
+    if not current or not desired:
+        return False
+    current_parts = urlparse(current)
+    desired_parts = urlparse(desired)
+    if current_parts.scheme and desired_parts.scheme and current_parts.scheme != desired_parts.scheme:
+        return False
+    if current_parts.netloc and desired_parts.netloc:
+        return current_parts.netloc == desired_parts.netloc
+    return current.startswith(desired) or desired.startswith(current)
+
+
+def prepare_prompt_page(
+    client: MCPClient,
+    agent_id: str,
+    url: str,
+    navigate_tools: Sequence[str],
+    js_tools: Sequence[str],
+    verbose: bool = False,
+) -> str:
+    page_identity = read_current_page_identity(client=client, agent_id=agent_id, js_tools=js_tools)
+    current_href = str((page_identity or {}).get("href") or "").strip()
+    if urls_share_origin(current_href, url):
+        if verbose and current_href:
+            print(f"reuse page: {current_href}")
+        return ""
+    return navigate_current_page(
+        client=client,
+        agent_id=agent_id,
+        url=url,
+        navigate_tools=navigate_tools,
+        verbose=verbose,
+    )
+
+
 def run_single_prompt(
     client: MCPClient,
     agent_id: str,
@@ -9819,8 +10191,13 @@ def run_single_prompt(
     poll_interval_s: float,
     debug: bool,
 ) -> None:
-    nav_layout_text = navigate_current_page(
-        client, agent_id, url, navigate_tools, verbose=debug
+    nav_layout_text = prepare_prompt_page(
+        client=client,
+        agent_id=agent_id,
+        url=url,
+        navigate_tools=navigate_tools,
+        js_tools=js_tools,
+        verbose=debug,
     )
 
     dispatch_prompt(
@@ -9896,8 +10273,13 @@ def run_repl(
     cell_counters: Dict[str, int] = {}
     current_cell_id: Optional[str] = None
     cell_workspace = Path.cwd() / ".sky_cells"
-    current_layout_text = navigate_current_page(
-        client, agent_id, current_url, navigate_tools, verbose=debug
+    current_layout_text = prepare_prompt_page(
+        client=client,
+        agent_id=agent_id,
+        url=current_url,
+        navigate_tools=navigate_tools,
+        js_tools=js_tools,
+        verbose=debug,
     )
     print("interactive mode: /help for commands, /exit to quit, Ctrl-C cancels /run")
     active_action_refs: List[Dict[str, Any]] = []
@@ -10590,7 +10972,16 @@ def cdp_fallback_submit(
             pass
 
     points = parse_layout_points(fresh_layout_text)
-    input_point = choose_input_point(points)
+    dom_input_point: Optional[Tuple[int, int]] = None
+    if js_tools:
+        dom_input_point = extract_point_from_state(
+            read_visible_input_state(
+                client=client,
+                agent_id=agent_id,
+                js_tools=js_tools,
+            )
+        )
+    input_point = dom_input_point or choose_input_point(points)
     send_point = choose_send_point(points)
 
     typed_ok = False
@@ -10664,17 +11055,9 @@ def cdp_fallback_submit(
             require_enabled=True,
         )
         dom_send_point: Optional[Tuple[int, int]] = None
-        try:
-            send_button_enabled = bool(send_button_state.get("enabled"))
-            if bool(send_button_state.get("visible")) and send_button_enabled:
-                dom_send_point = (
-                    int(send_button_state.get("x") or 0),
-                    int(send_button_state.get("y") or 0),
-                )
-                if dom_send_point[0] <= 0 or dom_send_point[1] <= 0:
-                    dom_send_point = None
-        except (TypeError, ValueError):
-            dom_send_point = None
+        send_button_enabled = bool(send_button_state.get("enabled"))
+        if bool(send_button_state.get("visible")) and send_button_enabled:
+            dom_send_point = extract_point_from_state(send_button_state)
         if bool(send_button_state.get("visible")) and not send_button_enabled:
             send_point = None
         if dom_send_point:
@@ -10785,13 +11168,18 @@ def dispatch_prompt(
     poll_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     final_focus_mode = "pulse" if (submit and foreground_mode == "poll") else "off"
     with foreground_browser_context(submit_focus_mode):
+        local_focus_state = activate_local_browser_tab_focus(client) if submit else {"ok": False, "skipped": "no_submit"}
+        if submit and show_dispatch_details:
+            print(f"[tab-focus] {json.dumps(local_focus_state)}")
         input_ready_state = wait_for_visible_input_state(
             client=client,
             agent_id=agent_id,
             js_tools=js_tools,
         )
-        if show_dispatch_details and not bool(input_ready_state.get("ok")):
-            print(f"[composer-ready] {json.dumps(input_ready_state)}")
+        if not bool(input_ready_state.get("ok")):
+            if show_dispatch_details:
+                print(f"[composer-ready] {json.dumps(input_ready_state)}")
+            raise MCPError(describe_composer_not_ready(input_ready_state))
         if wait_for_response and submit:
             baseline_probe = read_assistant_probe(
                 client=client,
