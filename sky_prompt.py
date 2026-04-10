@@ -47,6 +47,7 @@ DEFAULT_RENDER_STABLE_POLLS = 3
 DEFAULT_RENDER_SETTLE_SECONDS = 1.2
 DEFAULT_COMPOSER_SETTLE_SECONDS = 0.8
 DEFAULT_COMPOSER_READY_TIMEOUT = 12.0
+DEFAULT_SEND_BUTTON_ENABLE_TIMEOUT = 4.0
 DEFAULT_ALIAS_DIR = Path.home() / ".local" / "bin"
 DEFAULT_OUTPUT_FORMAT = "markdown"
 DEFAULT_RUN_BACKEND = "pyreplab"
@@ -1178,19 +1179,12 @@ def build_prompt_expression(prompt: str, submit: bool) -> str:
   }}
 
   let submitButton = null;
-  let fallbackSubmitButton = null;
   for (const candidate of submitCandidates) {{
     if (!visible(candidate)) continue;
-    if (!fallbackSubmitButton) {{
-      fallbackSubmitButton = candidate;
-    }}
     if (!isDisabled(candidate)) {{
       submitButton = candidate;
       break;
     }}
-  }}
-  if (!submitButton) {{
-    submitButton = fallbackSubmitButton;
   }}
 
   if (submitButton) {{
@@ -2692,6 +2686,7 @@ def wait_for_visible_send_button_state(
     js_tools: Sequence[str],
     timeout_s: float = DEFAULT_COMPOSER_SETTLE_SECONDS,
     poll_interval_s: float = 0.1,
+    require_enabled: bool = False,
 ) -> Dict[str, Any]:
     deadline = time.time() + max(0.0, float(timeout_s))
     last_state: Dict[str, Any] = {}
@@ -2701,7 +2696,9 @@ def wait_for_visible_send_button_state(
             agent_id=agent_id,
             js_tools=js_tools,
         )
-        if bool(last_state.get("visible")):
+        is_visible = bool(last_state.get("visible"))
+        is_enabled = bool(last_state.get("enabled"))
+        if is_visible and ((not require_enabled) or is_enabled):
             return last_state
         if time.time() >= deadline:
             return last_state
@@ -5729,6 +5726,51 @@ result = a + b
                 ],
             )
 
+        def test_main_incognito_multiline_prompt_runs_one_shot(self) -> None:
+            module_name = main.__module__
+            fake_client = mock.Mock()
+            fake_client.initialize.return_value = None
+            fake_client.list_tools.return_value = ["navigate", "js_eval", "cdp_click", "cdp_type", "ddm"]
+            fake_client.did_auto_launch = False
+            prompt = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6"
+            with mock.patch.object(sys, "argv", ["sky", "--incognito", "-p", prompt]):
+                with mock.patch(f"{module_name}.read_prompt_from_stdin", return_value=""):
+                    with mock.patch(f"{module_name}.resolve_unchained_command", return_value=["unchained"]):
+                        with mock.patch(f"{module_name}.LocalCLIClient", return_value=fake_client) as client_cls:
+                            with mock.patch(f"{module_name}.run_single_prompt") as run_single_prompt_mock:
+                                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(client_cls.call_args.kwargs.get("browser_launch_mode"), "incognito")
+            self.assertEqual(run_single_prompt_mock.call_args.kwargs.get("prompt"), prompt)
+            self.assertTrue(bool(run_single_prompt_mock.call_args.kwargs.get("submit")))
+
+        def test_main_prompt_dash_reads_literal_prompt_from_stdin(self) -> None:
+            module_name = main.__module__
+            fake_client = mock.Mock()
+            fake_client.initialize.return_value = None
+            fake_client.list_tools.return_value = ["navigate", "js_eval", "cdp_click", "cdp_type", "ddm"]
+            fake_client.did_auto_launch = False
+            prompt = (
+                "Task: Find cheapest laptop under $1000 on Amazon\n"
+                "Available tools: NAVIGATE <url>, TYPE <text>, CLICK <label>, ENTER, READ, SCROLL up/down\n"
+                "What's your first action?"
+            )
+            with mock.patch.object(sys, "argv", ["sky", "-p", "-"]):
+                with mock.patch(f"{module_name}.read_prompt_from_stdin", return_value=prompt):
+                    with mock.patch(f"{module_name}.resolve_unchained_command", return_value=["unchained"]):
+                        with mock.patch(f"{module_name}.LocalCLIClient", return_value=fake_client):
+                            with mock.patch(f"{module_name}.run_single_prompt") as run_single_prompt_mock:
+                                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(run_single_prompt_mock.call_args.kwargs.get("prompt"), prompt)
+
+        def test_resolve_prompt_text_prefers_stdin_for_dash_explicit_prompt(self) -> None:
+            prompt = "price cap is $1000\nnext line"
+            self.assertEqual(
+                resolve_prompt_text("-", "ignored", prompt),
+                prompt,
+            )
+
         def test_local_cli_client_type_newline_uses_press_enter(self) -> None:
             client = LocalCLIClient(["unchained"], port=9333, tab="chatgpt", timeout=5)
             with mock.patch("subprocess.run") as run_mock:
@@ -6222,7 +6264,7 @@ result = a + b
             self.assertIn('range.selectNodeContents(el)', expr)
             self.assertIn('inputType: "insertText"', expr)
             self.assertNotIn("range.collapse(false)", expr)
-            self.assertIn("fallbackSubmitButton", expr)
+            self.assertNotIn("fallbackSubmitButton", expr)
             self.assertIn("/(send prompt|send|submit)/", expr)
 
         def test_send_button_state_expression_targets_send_button(self) -> None:
@@ -6349,6 +6391,62 @@ result = a + b
             self.assertTrue(state.get("visible"))
             self.assertEqual(read_mock.call_count, 2)
             sleep_mock.assert_called_once()
+
+        def test_wait_for_visible_send_button_state_waits_for_enabled_when_requested(self) -> None:
+            with mock.patch(
+                __name__ + ".read_visible_send_button_state",
+                side_effect=[
+                    {"ok": True, "visible": True, "enabled": False, "x": 10, "y": 20},
+                    {"ok": True, "visible": True, "enabled": True, "x": 10, "y": 20},
+                ],
+            ) as read_mock:
+                with mock.patch(__name__ + ".time.sleep") as sleep_mock:
+                    state = wait_for_visible_send_button_state(
+                        client=mock.Mock(),
+                        agent_id="agent-test",
+                        js_tools=["js_eval"],
+                        timeout_s=0.2,
+                        poll_interval_s=0.01,
+                        require_enabled=True,
+                    )
+            self.assertTrue(state.get("visible"))
+            self.assertTrue(bool(state.get("enabled")))
+            self.assertEqual(read_mock.call_count, 2)
+            sleep_mock.assert_called_once()
+
+        def test_cdp_fallback_submit_waits_for_enabled_send_button_before_click(self) -> None:
+            with mock.patch(
+                __name__ + ".call_js_expression",
+                return_value=("js_eval", {}, '{"ok": true}', {"ok": True}),
+            ):
+                with mock.patch(
+                    __name__ + ".read_visible_input_text",
+                    side_effect=["hello\nworld", ""],
+                ):
+                    with mock.patch(
+                        __name__ + ".wait_for_visible_send_button_state",
+                        return_value={"ok": True, "visible": True, "enabled": True, "x": 10, "y": 20},
+                    ) as wait_mock:
+                        with mock.patch(
+                            __name__ + ".call_tool_variants",
+                            return_value=("cdp_click", {"content": [{"type": "text", "text": "clicked"}]}),
+                        ):
+                            with mock.patch(__name__ + ".time.sleep"):
+                                result = cdp_fallback_submit(
+                                    client=mock.Mock(),
+                                    agent_id="agent-test",
+                                    prompt="hello\nworld",
+                                    js_tools=["js_eval"],
+                                    click_tools=["cdp_click"],
+                                    type_tools=["cdp_type"],
+                                    ddm_tools=[],
+                                    layout_text="",
+                                    submit=True,
+                                    baseline_probe=None,
+                                )
+            self.assertTrue(bool(result.get("submitted")))
+            self.assertEqual(wait_mock.call_args.kwargs.get("timeout_s"), DEFAULT_SEND_BUTTON_ENABLE_TIMEOUT)
+            self.assertTrue(bool(wait_mock.call_args.kwargs.get("require_enabled")))
 
         def test_wait_for_visible_input_state_retries_until_visible(self) -> None:
             with mock.patch(
@@ -9034,6 +9132,18 @@ def read_prompt_from_stdin() -> str:
     return sys.stdin.read().strip()
 
 
+def resolve_prompt_text(
+    explicit_prompt_arg: Optional[str],
+    cli_prompt: str,
+    stdin_prompt: str,
+) -> str:
+    explicit_raw = str(explicit_prompt_arg or "")
+    explicit_prompt = explicit_raw.strip()
+    if explicit_prompt == "-":
+        return str(stdin_prompt or "").strip()
+    return explicit_prompt or str(cli_prompt or "").strip() or str(stdin_prompt or "").strip()
+
+
 def parse_env_file(path: Path) -> Dict[str, str]:
     values: Dict[str, str] = {}
     if not path.is_file():
@@ -10545,14 +10655,18 @@ def cdp_fallback_submit(
 
     submit_mode = "none"
     if submit:
+        send_button_enabled = False
         send_button_state = wait_for_visible_send_button_state(
             client=client,
             agent_id=agent_id,
             js_tools=js_tools,
+            timeout_s=DEFAULT_SEND_BUTTON_ENABLE_TIMEOUT,
+            require_enabled=True,
         )
         dom_send_point: Optional[Tuple[int, int]] = None
         try:
-            if bool(send_button_state.get("visible")):
+            send_button_enabled = bool(send_button_state.get("enabled"))
+            if bool(send_button_state.get("visible")) and send_button_enabled:
                 dom_send_point = (
                     int(send_button_state.get("x") or 0),
                     int(send_button_state.get("y") or 0),
@@ -10561,17 +10675,13 @@ def cdp_fallback_submit(
                     dom_send_point = None
         except (TypeError, ValueError):
             dom_send_point = None
+        if bool(send_button_state.get("visible")) and not send_button_enabled:
+            send_point = None
         if dom_send_point:
             send_point = dom_send_point
 
         def submit_via_newline(newline_label: str) -> Tuple[str, str]:
-            current_input_text = read_visible_input_text(
-                client=client,
-                agent_id=agent_id,
-                js_tools=js_tools,
-            ).strip()
-            should_refocus = not current_input_text
-            if should_refocus and input_point and click_tools:
+            if input_point and click_tools:
                 try:
                     focus_args = with_agent_variants(
                         [{"x": input_point[0], "y": input_point[1]}],
@@ -10976,7 +11086,7 @@ def main() -> int:
         "-p",
         "--prompt",
         "-prompt",
-        help="Explicit prompt text. If omitted, positional args or stdin are used.",
+        help="Explicit prompt text. Use '-' to read the prompt literally from stdin. If omitted, positional args or stdin are used.",
     )
     parser.add_argument(
         "--url",
@@ -11212,9 +11322,8 @@ def main() -> int:
         return 0
 
     cli_prompt = " ".join(args.prompt_args).strip()
-    explicit_prompt = (args.prompt or "").strip()
     stdin_prompt = read_prompt_from_stdin()
-    merged_prompt = explicit_prompt or cli_prompt or stdin_prompt
+    merged_prompt = resolve_prompt_text(args.prompt, cli_prompt, stdin_prompt)
 
     transport = str(args.transport or DEFAULT_TRANSPORT).strip().lower()
     resolved_agent_id = ""
