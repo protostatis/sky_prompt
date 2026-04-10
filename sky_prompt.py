@@ -2657,6 +2657,22 @@ def wait_for_visible_input_state(
         time.sleep(max(0.05, float(poll_interval_s)))
 
 
+def describe_composer_not_ready(state: Optional[Mapping[str, Any]]) -> str:
+    payload = dict(state or {})
+    error = str(payload.get("error") or "").strip()
+    focused = payload.get("focused")
+    if error == "no_visible_chat_input":
+        return (
+            "Composer not ready on the selected tab. Ensure the tab is on the ChatGPT "
+            "chat screen and that you are logged in."
+        )
+    if error:
+        return f"Composer not ready on the selected tab ({error})."
+    if focused is False:
+        return "Composer probe found an input, but it was not focusable on the selected tab."
+    return "Composer not ready on the selected tab."
+
+
 def read_visible_send_button_state(
     client: MCPClient,
     agent_id: str,
@@ -6441,6 +6457,11 @@ result = a + b
             self.assertEqual(read_mock.call_count, 2)
             sleep_mock.assert_called_once()
 
+        def test_describe_composer_not_ready_mentions_chatgpt_login_for_missing_input(self) -> None:
+            message = describe_composer_not_ready({"ok": False, "error": "no_visible_chat_input"})
+            self.assertIn("ChatGPT", message)
+            self.assertIn("logged in", message)
+
         def test_probe_indicates_submit_when_composer_cleared(self) -> None:
             self.assertTrue(
                 probe_indicates_submit(
@@ -6517,6 +6538,27 @@ result = a + b
             native_submit_mock.assert_called_once()
             call_js_mock.assert_not_called()
             self.assertGreaterEqual(probe_mock.call_count, 2)
+
+        def test_dispatch_prompt_raises_when_composer_not_ready(self) -> None:
+            client = MCPClient(endpoint="https://example.invalid/mcp", api_key="test")
+            with mock.patch(
+                __name__ + ".wait_for_visible_input_state",
+                return_value={"ok": False, "error": "no_visible_chat_input"},
+            ):
+                with self.assertRaises(MCPError) as exc:
+                    dispatch_prompt(
+                        client=client,
+                        agent_id="agent-test",
+                        prompt="hello",
+                        js_tools=["js_eval"],
+                        click_tools=["cdp_click"],
+                        type_tools=["cdp_type"],
+                        ddm_tools=["ddm"],
+                        submit=True,
+                        layout_text="",
+                        wait_for_response=True,
+                    )
+            self.assertIn("logged in", str(exc.exception))
 
         def test_summarize_missing_assistant_response_prefers_empty_shell_messages(self) -> None:
             self.assertEqual(
@@ -10751,8 +10793,10 @@ def dispatch_prompt(
             agent_id=agent_id,
             js_tools=js_tools,
         )
-        if show_dispatch_details and not bool(input_ready_state.get("ok")):
-            print(f"[composer-ready] {json.dumps(input_ready_state)}")
+        if not bool(input_ready_state.get("ok")):
+            if show_dispatch_details:
+                print(f"[composer-ready] {json.dumps(input_ready_state)}")
+            raise MCPError(describe_composer_not_ready(input_ready_state))
         if wait_for_response and submit:
             baseline_probe = read_assistant_probe(
                 client=client,
