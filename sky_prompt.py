@@ -282,7 +282,7 @@ class MCPClient:
             "params": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "sky-prompt-cli", "version": "0.2.1"},
+                "clientInfo": {"name": "sky-prompt-cli", "version": "0.2.2"},
             },
         }
         response = self._rpc_request(payload, include_session=False, allow_empty=False)
